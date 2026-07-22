@@ -25,6 +25,7 @@ router.post('/request-otp', async (req, res) => {
     await sendOtp(phone, code);
   } catch (e) {
     console.error('OTP send failed (non-blocking):', e.message);
+    console.log('=== OTP for', phone, ':', code, '===');
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
