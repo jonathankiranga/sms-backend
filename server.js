@@ -5,6 +5,7 @@ const cors = require('cors');
 
 const attendanceRoutes = require('./routes/attendance');
 const teacherRoutes = require('./routes/teachers');
+const schoolHeadRoutes = require('./routes/schoolHead');
 const parentRoutes = require('./routes/parents');
 const paymentRoutes = require('./routes/payments');
 const adRoutes = require('./routes/ads');
@@ -35,6 +36,7 @@ app.use((req, res, next) => {
 
 app.use('/api/attendance', attendanceRoutes);
 app.use('/api/teachers', teacherRoutes);
+app.use('/api/school-head', schoolHeadRoutes);
 app.use('/api/parents', parentRoutes);
 app.use('/v1/payments', paymentRoutes);
 app.use('/api/ads', adRoutes);

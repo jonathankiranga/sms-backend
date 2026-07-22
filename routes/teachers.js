@@ -7,7 +7,7 @@ router.post('/request-otp', async (req, res) => {
   if (!phone) return res.status(400).json({ error: 'Phone number required' });
 
   const [teacher] = await req.db.execute(
-    'SELECT teacher_id, school_id FROM teachers WHERE phone = ?',
+    'SELECT teacher_id, school_id, role FROM teachers WHERE phone = ?',
     [phone]
   );
   if (teacher.length === 0) return res.status(404).json({ error: 'No teacher found with this phone' });
@@ -44,11 +44,11 @@ router.post('/verify-otp', async (req, res) => {
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
 
   const [teacher] = await req.db.execute(
-    'SELECT teacher_id, school_id FROM teachers WHERE phone = ?',
+    'SELECT teacher_id, school_id, role FROM teachers WHERE phone = ?',
     [rows[0].phone]
   );
 
-  res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, verified: true });
+  res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, role: teacher[0].role, verified: true });
 });
 
 module.exports = router;
