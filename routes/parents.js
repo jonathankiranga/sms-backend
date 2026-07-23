@@ -74,25 +74,36 @@ router.post('/upgrade', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 
+  // Get premium price from settings
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+  const price = parseInt(setting[0]?.setting_value || '100');
+
   const txnRef = 'UPG' + Date.now().toString(36).toUpperCase();
 
-  // Check if M-Pesa credentials are configured for real STK push
+  // Try real M-Pesa STK push if credentials are configured
   if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE) {
     try {
       const mpesa = require('../services/mpesa');
-      const token = await mpesa.getAccessToken();
-      // In production, initiate STK push here
-      console.log(`[MPESA] STK push to ${phone} for KSh 100 ref ${txnRef}`);
-      return res.json({ transaction_ref: txnRef, status: 'pending', message: 'M-Pesa STK push sent to your phone' });
+      const result = await mpesa.stkPush(phone, price, txnRef, 'Education APP Premium');
+      if (result.ResponseCode === '0') {
+        console.log(`[MPESA] STK push sent to ${phone} for KSh ${price} ref ${txnRef}`);
+        return res.json({
+          transaction_ref: txnRef,
+          checkout_request_id: result.CheckoutRequestID,
+          status: 'pending',
+          message: `M-Pesa STK push sent to your phone. Enter PIN to pay KSh ${price}.`
+        });
+      }
+      console.error('[MPESA] STK push failed:', result);
     } catch (err) {
-      console.error('[MPESA] STK push failed, falling back to simulated:', err.message);
+      console.error('[MPESA] STK push error, falling back to simulated:', err.message);
     }
   }
 
-  // Simulated upgrade — mark premium immediately
+  // Simulated upgrade — mark premium immediately (used when M-Pesa not configured)
   const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
   const expiresAt = new Date();
-  expiresAt.setMonth(expiresAt.getMonth() + 4); // ~1 term
+  expiresAt.setMonth(expiresAt.getMonth() + 4);
 
   if (existing.length > 0) {
     await req.db.execute(
@@ -106,8 +117,8 @@ router.post('/upgrade', async (req, res) => {
     );
   }
 
-  console.log(`[PREMIUM] ${phone} upgraded — expires ${expiresAt.toISOString()}`);
-  res.json({ transaction_ref: txnRef, status: 'confirmed', message: 'Premium activated for this term' });
+  console.log(`[PREMIUM] ${phone} upgraded (simulated) — expires ${expiresAt.toISOString()}`);
+  res.json({ transaction_ref: txnRef, status: 'confirmed', message: `Premium activated for KSh ${price}/term` });
 });
 
 // GET /api/parents/premium-status/:phone

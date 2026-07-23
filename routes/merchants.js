@@ -6,6 +6,14 @@ const router = express.Router();
 router.post('/register', async (req, res) => {
   const { business_name, phone, email } = req.body;
   if (!business_name || !phone) return res.status(400).json({ error: 'Business name and phone required' });
+
+  // Must be a premium parent
+  const [parentCheck] = await req.db.execute(
+    "SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
+    [phone]
+  );
+  if (parentCheck.length === 0) return res.status(403).json({ error: 'Only premium parents can register as merchants. Upgrade first.' });
+
   const [existing] = await req.db.execute('SELECT merchant_id FROM merchants WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
   const mid = 'MER' + Date.now().toString(36).toUpperCase();
@@ -56,16 +64,40 @@ router.get('/campaigns', async (req, res) => {
 router.post('/campaigns', async (req, res) => {
   const { merchant_id, message, target_school_id, days } = req.body;
   if (!merchant_id || !message || !target_school_id || !days) return res.status(400).json({ error: 'Missing fields' });
-  const [m] = await req.db.execute('SELECT business_name FROM merchants WHERE merchant_id = ?', [merchant_id]);
+  const [m] = await req.db.execute('SELECT business_name, phone FROM merchants WHERE merchant_id = ?', [merchant_id]);
   if (m.length === 0) return res.status(404).json({ error: 'Merchant not found' });
   const duration = Math.min(Math.max(parseInt(days) || 7, 1), 90);
   const startDate = new Date().toISOString().slice(0, 10);
   const endDate = new Date(Date.now() + duration * 86400000).toISOString().slice(0, 10);
-  await req.db.execute(
+  // Get campaign price from settings
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", ['merchant_' + duration + '_day']);
+  const price = parseInt(setting[0]?.setting_value || '0');
+
+  // If M-Pesa is configured and price > 0, create as Pending (requires payment)
+  const status = (process.env.MPESA_CONSUMER_KEY && price > 0) ? 'Pending' : 'Active';
+
+  const [result] = await req.db.execute(
     'INSERT INTO marketplace_campaigns (target_school_id, merchant_name, message, banner_image_url, target_link, status, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [target_school_id, m[0].business_name, message, '', '#', 'Active', startDate, endDate]
+    [target_school_id, m[0].business_name, message, '', '#', status, startDate, endDate]
   );
-  res.json({ message: 'Campaign created', days: duration });
+  const campaignId = result.insertId;
+
+  // If payment required, initiate STK push
+  if (status === 'Pending') {
+    try {
+      const mpesa = require('../services/mpesa');
+      const txnRef = 'CAM' + campaignId;
+      const pushResult = await mpesa.stkPush(m[0].phone || req.body.phone, price, txnRef, 'Education APP Advert');
+      if (pushResult.ResponseCode === '0') {
+        return res.json({ message: 'Campaign created. Pay via M-Pesa to activate.', campaign_id: campaignId, checkout_request_id: pushResult.CheckoutRequestID, amount: price, status: 'pending' });
+      }
+    } catch (err) {
+      console.error('[MERCHANT] STK push failed:', err.message);
+    }
+    return res.json({ message: 'Campaign created. Payment required to activate.', campaign_id: campaignId, amount: price, status: 'pending' });
+  }
+
+  res.json({ message: 'Campaign created', campaign_id: campaignId, days: duration });
 });
 
 // GET /api/merchants/schools — list schools for targeting

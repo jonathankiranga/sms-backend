@@ -176,9 +176,52 @@ router.delete('/fees/:id', async (req, res) => {
   res.json({ deleted: true });
 });
 
+// SETTINGS
+router.get('/settings', async (req, res) => {
+  const [rows] = await req.db.execute('SELECT setting_key, setting_value FROM app_settings ORDER BY setting_key');
+  const settings = {};
+  for (const r of rows) settings[r.setting_key] = r.setting_value;
+  res.json({ settings });
+});
+
+router.post('/settings', async (req, res) => {
+  const { settings } = req.body;
+  if (!settings || typeof settings !== 'object') return res.status(400).json({ error: 'settings object required' });
+  for (const [key, value] of Object.entries(settings)) {
+    await req.db.execute(
+      'INSERT INTO app_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?',
+      [key, String(value), String(value)]
+    );
+  }
+  res.json({ updated: true });
+});
+
+// REVENUE
+router.get('/revenue', async (req, res) => {
+  const [totals] = await req.db.execute(
+    "SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payment_ledger"
+  );
+  const [monthly] = await req.db.execute(
+    "SELECT DATE_FORMAT(logged_at, '%Y-%m') AS month, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payment_ledger GROUP BY month ORDER BY month DESC LIMIT 12"
+  );
+  const [byMethod] = await req.db.execute(
+    "SELECT payment_method, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payment_ledger GROUP BY payment_method"
+  );
+  const [premium] = await req.db.execute(
+    "SELECT COUNT(*) AS count FROM parent_profiles WHERE is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())"
+  );
+  res.json({
+    totals: { amount: totals[0]?.total || 0, transactions: totals[0]?.count || 0 },
+    monthly: monthly || [],
+    byMethod: byMethod || [],
+    premiumParents: premium[0]?.count || 0
+  });
+});
+
 // Stats (for dashboard)
 router.get('/_stats', async (req, res) => {
   async function cnt(table) { try { const [[r]] = await req.db.execute(`SELECT COUNT(*) AS c FROM \`${table}\``); return r.c; } catch { return '—'; } }
+  const [revenue] = await req.db.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM payment_ledger");
   res.json({
     schools: await cnt('schools'),
     teachers: await cnt('teachers'),
@@ -187,7 +230,8 @@ router.get('/_stats', async (req, res) => {
     attendance: await cnt('attendance_logs'),
     payments: await cnt('payment_ledger'),
     assessments: await cnt('assessments'),
-    campaigns: await cnt('marketplace_campaigns')
+    campaigns: await cnt('marketplace_campaigns'),
+    revenue: revenue[0]?.total || 0
   });
 });
 

@@ -64,6 +64,13 @@ tbody tr:hover{background:var(--hover)}
 .badge-optional{background:#FEF3C7;color:#D97706}
 .text-muted{color:var(--text2)}
 .pagination{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;font-size:12px;color:var(--text2);border-top:1px solid var(--border)}
+.msg{font-size:12px;padding:8px 12px;border-radius:6px;margin-bottom:12px;display:none}
+.msg.success{display:block;background:#E8F5E9;color:#2E7D32}
+.msg.error{display:block;background:#FFEBEE;color:#C62828}
+.settings-form label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px;margin-top:14px}
+.settings-form label:first-of-type{margin-top:0}
+.settings-form input[type=number]{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none}
+.settings-form input[type=number]:focus{border-color:var(--purple)}
 
 .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.4);z-index:100;align-items:center;justify-content:center}
 .modal-overlay.show{display:flex}
@@ -123,6 +130,8 @@ tbody tr:hover{background:var(--hover)}
       <div class="nav-item" data-section="students"><span class="icon">&#x1F393;</span> <span>Students</span></div>
       <div class="nav-item" data-section="teachers"><span class="icon">&#x1F469;&#x200D;&#x1F3EB;</span> <span>Teachers</span></div>
       <div class="nav-item" data-section="fees"><span class="icon">&#x1F4B0;</span> <span>Fees</span></div>
+      <div class="nav-item" data-section="revenue"><span class="icon">&#x1F4B5;</span> <span>Revenue</span></div>
+      <div class="nav-item" data-section="settings"><span class="icon">&#x2699;&#xFE0F;</span> <span>Settings</span></div>
       <div class="nav-item" data-section="help"><span class="icon">&#x2753;</span> <span>Help</span></div>
     </div>
     <button class="logout" onclick="logout()">&#x1F6AA; Sign Out</button>
@@ -219,6 +228,8 @@ function loadSection(name) {
     students: ['Students', 'Manage students'],
     teachers: ['Teachers', 'Manage teachers'],
     fees: ['Fee Structures', 'Manage fee items'],
+    revenue: ['Revenue', 'Payments & earnings'],
+    settings: ['Settings', 'Pricing & configuration'],
     help: ['Help & Guide', 'How to use the Education APP']
   };
   var t = titles[name] || ['', ''];
@@ -740,6 +751,82 @@ function renderHelp() {
         '</div>' +
       '</div>' +
     '</div>';
+}
+
+// === REVENUE ===
+function renderRevenue() {
+  var el = document.getElementById('content');
+  el.innerHTML = '<div style="text-align:center;padding:40px">Loading...</div>';
+  api('/revenue').then(function(d) {
+    el.innerHTML =
+      '<div class="stats">' +
+        '<div class="stat-card"><div class="num">KSh ' + (d.totals.amount || 0).toLocaleString() + '</div><div class="label">Total Revenue</div></div>' +
+        '<div class="stat-card"><div class="num">' + d.totals.transactions + '</div><div class="label">Transactions</div></div>' +
+        '<div class="stat-card"><div class="num">' + d.premiumParents + '</div><div class="label">Active Premium Parents</div></div>' +
+      '</div>' +
+      '<div class="card" style="padding:20px;background:var(--card);border-radius:var(--radius);box-shadow:0 1px 3px rgba(0,0,0,0.06)">' +
+        '<h3 style="font-size:14px;font-weight:700;margin-bottom:14px">Monthly Revenue</h3>' +
+        (d.monthly.length === 0 ? '<p class="text-muted" style="text-align:center;padding:20px">No payments yet</p>' :
+        '<div class="table-wrap"><table><thead><tr><th>Month</th><th>Amount</th><th>Transactions</th></tr></thead><tbody>' +
+        d.monthly.map(function(m) {
+          return '<tr><td>' + m.month + '</td><td><b>KSh ' + Number(m.total).toLocaleString() + '</b></td><td>' + m.count + '</td></tr>';
+        }).join('') +
+        '</tbody></table></div>') +
+        '<h3 style="font-size:14px;font-weight:700;margin:20px 0 14px">By Payment Method</h3>' +
+        (d.byMethod.length === 0 ? '<p class="text-muted">No data</p>' :
+        '<div class="table-wrap"><table><thead><tr><th>Method</th><th>Amount</th><th>Count</th></tr></thead><tbody>' +
+        d.byMethod.map(function(m) {
+          return '<tr><td>' + (m.payment_method || 'Unknown') + '</td><td><b>KSh ' + Number(m.total).toLocaleString() + '</b></td><td>' + m.count + '</td></tr>';
+        }).join('') +
+        '</tbody></table></div>') +
+      '</div>';
+  }).catch(function() {
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--red)">Failed to load revenue data</div>';
+  });
+}
+
+// === SETTINGS ===
+function renderSettings() {
+  var el = document.getElementById('content');
+  el.innerHTML = '<div style="text-align:center;padding:40px">Loading...</div>';
+  api('/settings').then(function(d) {
+    var s = d.settings || {};
+    el.innerHTML =
+      '<div class="card" style="padding:24px;background:var(--card);border-radius:var(--radius);box-shadow:0 1px 3px rgba(0,0,0,0.06);max-width:500px">' +
+        '<h3 style="font-size:15px;font-weight:700;margin-bottom:4px">Pricing Settings</h3>' +
+        '<p style="font-size:12px;color:var(--text2);margin-bottom:20px">Configure premium and merchant pricing (KSh)</p>' +
+        '<div id="settings-msg" class="msg"></div>' +
+        '<div class="settings-form">' +
+          '<label>Premium (per term)</label>' +
+          '<input id="s-premium_price" type="number" value="' + (s.premium_price || '100') + '" />' +
+          '<label>Merchant 7 days</label>' +
+          '<input id="s-merchant_7_day" type="number" value="' + (s.merchant_7_day || '200') + '" />' +
+          '<label>Merchant 14 days</label>' +
+          '<input id="s-merchant_14_day" type="number" value="' + (s.merchant_14_day || '350') + '" />' +
+          '<label>Merchant 30 days</label>' +
+          '<input id="s-merchant_30_day" type="number" value="' + (s.merchant_30_day || '500') + '" />' +
+          '<label>Merchant 90 days</label>' +
+          '<input id="s-merchant_90_day" type="number" value="' + (s.merchant_90_day || '1200') + '" />' +
+          '<button onclick="saveSettings()" class="btn-add" style="margin-top:18px;width:100%;justify-content:center">Save Settings</button>' +
+        '</div>' +
+      '</div>';
+  }).catch(function() {
+    el.innerHTML = '<div style="text-align:center;padding:40px;color:var(--red)">Failed to load settings</div>';
+  });
+}
+
+function saveSettings() {
+  var keys = ['premium_price', 'merchant_7_day', 'merchant_14_day', 'merchant_30_day', 'merchant_90_day'];
+  var settings = {};
+  keys.forEach(function(k) {
+    var el = document.getElementById('s-' + k);
+    if (el) settings[k] = el.value;
+  });
+  api('/settings', { method: 'POST', body: JSON.stringify({ settings: settings }) }).then(function() {
+    showMsg('settings-msg', 'Settings saved', true);
+  }).catch(function() {
+    showMsg('settings-msg', 'Failed to save', false);
+  });
 }
 
 // Utils
