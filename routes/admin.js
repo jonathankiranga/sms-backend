@@ -8,27 +8,38 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+async function countTable(db, table) {
+  try {
+    const [[r]] = await db.execute(`SELECT COUNT(*) AS cnt FROM \`${table}\``);
+    return r.cnt;
+  } catch { return '—'; }
+}
+
 router.use(requireAdmin);
 
 router.get('/', async (req, res) => {
   try {
-    const [[{ cnt: schoolCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM schools');
-    const [[{ cnt: teacherCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM teachers');
-    const [[{ cnt: studentCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM students');
-    const [[{ cnt: parentCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM parent_profiles');
-    const [[{ cnt: attendCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM attendance_logs');
-    const [[{ cnt: paymentCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM payment_ledger');
-    const [[{ cnt: assessmentCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM assessments');
-    const [[{ cnt: campaignCount }]] = await req.db.execute('SELECT COUNT(*) AS cnt FROM marketplace_campaigns');
+    const [schoolCount, teacherCount, studentCount, parentCount,
+           attendCount, paymentCount, assessmentCount, campaignCount] = await Promise.all([
+      countTable(req.db, 'schools'),
+      countTable(req.db, 'teachers'),
+      countTable(req.db, 'students'),
+      countTable(req.db, 'parent_profiles'),
+      countTable(req.db, 'attendance_logs'),
+      countTable(req.db, 'payment_ledger'),
+      countTable(req.db, 'assessments'),
+      countTable(req.db, 'marketplace_campaigns')
+    ]);
 
-    const [schools] = await req.db.execute('SELECT school_id, school_name, county FROM schools ORDER BY school_name LIMIT 20');
-    const [recentSync] = await req.db.execute('SELECT * FROM sync_log ORDER BY synced_at DESC LIMIT 10');
+    let schools = [];
+    try {
+      [schools] = await req.db.execute('SELECT school_id, school_name, region FROM schools ORDER BY school_name LIMIT 20');
+    } catch { schools = []; }
 
-    const rows = {
-      schoolCount, teacherCount, studentCount, parentCount,
-      attendCount, paymentCount, assessmentCount, campaignCount,
-      schools, recentSync
-    };
+    let recentSync = [];
+    try {
+      [recentSync] = await req.db.execute('SELECT * FROM sync_log ORDER BY synced_at DESC LIMIT 10');
+    } catch { recentSync = []; }
 
     let html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Shule SMS Admin</title><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -48,7 +59,7 @@ tr:last-child td{border-bottom:none}
 .env-box{background:#1E293B;color:#E2E8F0;padding:16px;border-radius:10px;font-size:12px;font-family:monospace;margin-bottom:32px}
 .env-box .ok{color:#10B981}.env-box .miss{color:#EF4444}
 </style></head><body>
-<h1>🏫 Shule SMS Admin</h1>
+<h1>Shule SMS Admin</h1>
 <div class="cards">
   <div class="card"><div class="num">${schoolCount}</div><div class="label">Schools</div></div>
   <div class="card"><div class="num">${teacherCount}</div><div class="label">Teachers</div></div>
@@ -61,8 +72,8 @@ tr:last-child td{border-bottom:none}
 </div>
 
 <h2>Schools (${schoolCount})</h2>
-<table><thead><tr><th>School ID</th><th>School Name</th><th>County</th></tr></thead><tbody>
-${schools.map(s => `<tr><td>${s.school_id}</td><td>${s.school_name}</td><td>${s.county || '—'}</td></tr>`).join('')}
+<table><thead><tr><th>School ID</th><th>School Name</th><th>Region</th></tr></thead><tbody>
+${schools.length ? schools.map(s => `<tr><td>${s.school_id}</td><td>${s.school_name}</td><td>${s.region || '—'}</td></tr>`).join('') : '<tr><td colspan="3" style="color:#94A3B8;text-align:center">No data or table missing</td></tr>'}
 </tbody></table>
 
 <h2>Recent Sync Activity</h2>
@@ -72,12 +83,12 @@ ${recentSync.length ? recentSync.map(s => `<tr><td>${s.sync_id}</td><td>${s.sync
 
 <h2>Environment Variables</h2>
 <div class="env-box">
-DB_HOST: <span class="ok">✓ SET</span><br>
-DB_USER: <span class="ok">✓ SET</span><br>
-DB_NAME: <span class="ok">✓ SET</span><br>
-PORT: <span class="ok">✓ ${process.env.PORT || '3000'}</span><br>
-WA_ACCESS_TOKEN: ${process.env.META_ACCESS_TOKEN ? '<span class="ok">✓ SET</span>' : '<span class="miss">✗ MISSING</span>'}<br>
-WA_PHONE_ID: ${process.env.PHONE_NUMBER_ID ? '<span class="ok">✓ SET</span>' : '<span class="miss">✗ MISSING</span>'}<br>
+DB_HOST: <span class="ok">SET</span><br>
+DB_USER: <span class="ok">SET</span><br>
+DB_NAME: <span class="ok">SET</span><br>
+PORT: <span class="ok">${process.env.PORT || '3000'}</span><br>
+WA_ACCESS_TOKEN: ${process.env.META_ACCESS_TOKEN ? '<span class="ok">SET</span>' : '<span class="miss">MISSING</span>'}<br>
+WA_PHONE_ID: ${process.env.PHONE_NUMBER_ID ? '<span class="ok">SET</span>' : '<span class="miss">MISSING</span>'}<br>
 CORS_ORIGIN: <span class="ok">${process.env.CORS_ORIGIN || '* (default)'}</span><br>
 ADMIN_ENABLED: <span class="ok">${process.env.ADMIN_ENABLED || 'false'}</span>
 </div>`;
