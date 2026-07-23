@@ -123,6 +123,7 @@ tbody tr:hover{background:var(--hover)}
       <div class="nav-item" data-section="students"><span class="icon">&#x1F393;</span> <span>Students</span></div>
       <div class="nav-item" data-section="teachers"><span class="icon">&#x1F469;&#x200D;&#x1F3EB;</span> <span>Teachers</span></div>
       <div class="nav-item" data-section="fees"><span class="icon">&#x1F4B0;</span> <span>Fees</span></div>
+      <div class="nav-item" data-section="help"><span class="icon">&#x2753;</span> <span>Help</span></div>
     </div>
     <button class="logout" onclick="logout()">&#x1F6AA; Sign Out</button>
   </div>
@@ -217,7 +218,8 @@ function loadSection(name) {
     classes: ['Classes', 'Manage classes'],
     students: ['Students', 'Manage students'],
     teachers: ['Teachers', 'Manage teachers'],
-    fees: ['Fee Structures', 'Manage fee items']
+    fees: ['Fee Structures', 'Manage fee items'],
+    help: ['Help & Guide', 'How to use the Education APP']
   };
   var t = titles[name] || ['', ''];
   document.getElementById('section-title').textContent = t[0];
@@ -683,6 +685,61 @@ function deleteFee(id) {
   api('/fees/' + id, { method: 'DELETE' })
     .then(function() { renderFees(); showMsg('fees-msg', 'Deleted', true); })
     .catch(function(e) { showMsg('fees-msg', e.message, false); });
+}
+
+// === HELP ===
+function renderHelp() {
+  var el = document.getElementById('content');
+  el.innerHTML =
+    '<div style="max-width:800px;margin:0 auto;space-y:24px">' +
+      '<div class="card" style="padding:24px;margin-bottom:16px">' +
+        '<h3 style="font-size:15px;font-weight:700;color:#7B4F9B;margin-bottom:12px">Getting Started</h3>' +
+        '<div style="line-height:1.6;font-size:13px;color:#334155">' +
+          '<p><b>Education APP</b> is a school management system by Smarternow Data Venture. Schools use it free. Parents can subscribe to premium WhatsApp alerts for KSh 100/term.</p>' +
+        '</div>' +
+      '</div>' +
+      '<div class="card" style="padding:24px;margin-bottom:16px">' +
+        '<h3 style="font-size:15px;font-weight:700;color:#7B4F9B;margin-bottom:12px">Teachers</h3>' +
+        '<div style="line-height:1.6;font-size:13px;color:#334155">' +
+          '<p><b>Roll Call:</b> Tap Attendance → pick date → tap ✓ Present / ✗ Absent / ⏰ Late / ? Excused per student → tap Sync. Works offline.</p>' +
+          '<p style="margin-top:8px"><b>Exam Scores:</b> Tap Exams → select Class → Learning Area → Strand → Sub-strand → create assessment name → enter scores → app auto-computes EE/ME/AE/BE → Save All.</p>' +
+          '<p style="margin-top:8px"><b>Levels:</b> EE (80%+) = Exceeding, ME (60-79%) = Meeting, AE (40-59%) = Approaching, BE (&lt;40%) = Below Expectations.</p>' +
+          '<p style="margin-top:8px"><b>Reports:</b> Tap Reports → select student + term → printable CBC report card.</p>' +
+        '</div>' +
+      '</div>' +
+      '<div class="card" style="padding:24px;margin-bottom:16px">' +
+        '<h3 style="font-size:15px;font-weight:700;color:#7B4F9B;margin-bottom:12px">Parents</h3>' +
+        '<div style="line-height:1.6;font-size:13px;color:#334155">' +
+          '<p><b>Free:</b> Log in with phone + OTP to view children\'s attendance and class info.</p>' +
+          '<p style="margin-top:8px"><b>Premium (KSh 100/term):</b> Tap Upgrade → M-Pesa → get WhatsApp alerts for: daily absence, 3+ day warnings, assessment results, fee balances, school broadcasts. Covers all children.</p>' +
+        '</div>' +
+      '</div>' +
+      '<div class="card" style="padding:24px;margin-bottom:16px">' +
+        '<h3 style="font-size:15px;font-weight:700;color:#7B4F9B;margin-bottom:12px">School Heads</h3>' +
+        '<div style="line-height:1.6;font-size:13px;color:#334155">' +
+          '<p><b>Teachers:</b> Add/remove teachers from the Teachers section. Cannot remove yourself or another head.</p>' +
+          '<p style="margin-top:8px"><b>Fees:</b> Create fee items (name, amount, term, year), mark optional, assign to classes. Parents see balances.</p>' +
+          '<p style="margin-top:8px"><b>Import Students:</b> Paste CSV (student_id,full_name) into a class.</p>' +
+          '<p style="margin-top:8px"><b>Analytics:</b> View daily attendance bars and summary percentages for 7 or 30 days.</p>' +
+          '<p style="margin-top:8px"><b>Broadcast:</b> Send WhatsApp messages to all premium parents.</p>' +
+        '</div>' +
+      '</div>' +
+      '<div class="card" style="padding:24px;margin-bottom:16px">' +
+        '<h3 style="font-size:15px;font-weight:700;color:#7B4F9B;margin-bottom:12px">Merchants</h3>' +
+        '<div style="line-height:1.6;font-size:13px;color:#334155">' +
+          '<p>Register your business → create ad campaigns → target a school. Ads appear on login screens.</p>' +
+        '</div>' +
+      '</div>' +
+      '<div class="card" style="padding:24px">' +
+        '<h3 style="font-size:15px;font-weight:700;color:#7B4F9B;margin-bottom:12px">Quick Tips</h3>' +
+        '<div style="line-height:1.6;font-size:13px;color:#334155">' +
+          '<p>• Works offline — data syncs when internet is available</p>' +
+          '<p>• Kenyan school calendar: Term 1 (Jan-Apr), Term 2 (May-Aug), Term 3 (Sep-Nov)</p>' +
+          '<p>• Schools always free. Parents pay KSh 100/term for premium WhatsApp alerts</p>' +
+          '<p>• OTPs sent via WhatsApp — keep your number registered with the school</p>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
 }
 
 // Utils
