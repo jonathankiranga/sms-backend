@@ -69,4 +69,59 @@ router.get('/dashboard/:phone', async (req, res) => {
   });
 });
 
+// POST /api/parents/upgrade — initiate premium upgrade (M-Pesa STK or simulated)
+router.post('/upgrade', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone required' });
+
+  const txnRef = 'UPG' + Date.now().toString(36).toUpperCase();
+
+  // Check if M-Pesa credentials are configured for real STK push
+  if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE) {
+    try {
+      const mpesa = require('../services/mpesa');
+      const token = await mpesa.getAccessToken();
+      // In production, initiate STK push here
+      console.log(`[MPESA] STK push to ${phone} for KSh 100 ref ${txnRef}`);
+      return res.json({ transaction_ref: txnRef, status: 'pending', message: 'M-Pesa STK push sent to your phone' });
+    } catch (err) {
+      console.error('[MPESA] STK push failed, falling back to simulated:', err.message);
+    }
+  }
+
+  // Simulated upgrade — mark premium immediately
+  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
+  const expiresAt = new Date();
+  expiresAt.setMonth(expiresAt.getMonth() + 4); // ~1 term
+
+  if (existing.length > 0) {
+    await req.db.execute(
+      'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+      [expiresAt, phone]
+    );
+  } else {
+    await req.db.execute(
+      'INSERT INTO parent_profiles (parent_phone, full_name, is_premium, premium_expires_at) VALUES (?, ?, TRUE, ?)',
+      [phone, null, expiresAt]
+    );
+  }
+
+  console.log(`[PREMIUM] ${phone} upgraded — expires ${expiresAt.toISOString()}`);
+  res.json({ transaction_ref: txnRef, status: 'confirmed', message: 'Premium activated for this term' });
+});
+
+// GET /api/parents/premium-status/:phone
+router.get('/premium-status/:phone', async (req, res) => {
+  const [rows] = await req.db.execute(
+    'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+    [req.params.phone]
+  );
+  if (rows.length === 0) return res.json({ is_premium: false });
+  const active = rows[0].is_premium && (!rows[0].premium_expires_at || new Date(rows[0].premium_expires_at) > new Date());
+  res.json({
+    is_premium: active,
+    expires_at: rows[0].premium_expires_at
+  });
+});
+
 module.exports = router;

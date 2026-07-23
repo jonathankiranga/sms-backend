@@ -51,7 +51,38 @@ async function sendAbsenceAlert(parentPhone, studentName, schoolName, date) {
 }
 
 async function sendOtp(phone, code) {
-  return sendTemplate(phone, process.env.WHATSAPP_TEMPLATE_OTP || 'otp_verification', [code]);
+  const result = await sendTemplate(phone, process.env.WHATSAPP_TEMPLATE_OTP || 'otp_verification', [code]);
+  return result;
 }
 
-module.exports = { sendAbsenceAlert, sendOtp, sendTemplate };
+// SMS fallback — used when WhatsApp fails
+async function sendSms(phone, message) {
+  const provider = process.env.SMS_PROVIDER || 'log';
+  if (provider === 'log') {
+    console.log(`[SMS] To ${phone}: ${message}`);
+    return { provider: 'log', status: 'logged' };
+  }
+  // Example: Africa's Talking (not primary — only if user configures)
+  if (provider === 'africastalking') {
+    const axios = require('axios');
+    try {
+      const resp = await axios.post('https://api.africastalking.com/version1/messaging', null, {
+        params: {
+          username: process.env.AT_USERNAME || 'sandbox',
+          to: phone,
+          message: message,
+          from: process.env.AT_SENDER_ID || ''
+        },
+        headers: { 'ApiKey': process.env.AT_API_KEY || '', 'Accept': 'application/json' }
+      });
+      console.log(`[SMS] Sent to ${phone}: ${resp.data?.SMSMessageData?.Recipients?.[0]?.status}`);
+      return resp.data;
+    } catch (err) {
+      console.error(`[SMS] Failed to send to ${phone}: ${err.message}`);
+      return { error: err.message };
+    }
+  }
+  return { provider: 'none', status: 'unsupported' };
+}
+
+module.exports = { sendAbsenceAlert, sendOtp, sendTemplate, sendSms };

@@ -39,4 +39,41 @@ router.delete('/:schoolId/teachers/:teacherId', async (req, res) => {
   res.json({ deleted: true });
 });
 
+// CSV Import Students — school head can bulk-import into a class
+router.post('/:schoolId/students/import', async (req, res) => {
+  const { class_id, csv } = req.body;
+  if (!class_id || !csv) return res.status(400).json({ error: 'class_id and csv required' });
+  const lines = csv.trim().split('\n');
+  let imported = 0, errors = 0;
+  for (const line of lines) {
+    const parts = line.split(',');
+    if (parts.length < 2) { errors++; continue; }
+    const student_id = parts[0].trim();
+    const full_name = parts.slice(1).join(',').trim();
+    if (!student_id || !full_name) { errors++; continue; }
+    try {
+      await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id) VALUES (?, ?, ?, ?)',
+        [student_id, full_name, class_id, req.params.schoolId]);
+      imported++;
+    } catch { errors++; }
+  }
+  res.json({ imported, errors });
+});
+
+// Analytics — attendance summary per class for school head
+router.get('/:schoolId/analytics/attendance', async (req, res) => {
+  const { days } = req.query;
+  const period = parseInt(days) || 30;
+  const [rows] = await req.db.execute(
+    `SELECT a.attendance_date, a.status, COUNT(*) AS cnt
+     FROM attendance_logs a
+     JOIN students s ON a.student_id = s.student_id
+     WHERE s.school_id = ? AND a.attendance_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+     GROUP BY a.attendance_date, a.status
+     ORDER BY a.attendance_date`,
+    [req.params.schoolId, period]
+  );
+  res.json({ analytics: rows });
+});
+
 module.exports = router;

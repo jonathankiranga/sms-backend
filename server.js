@@ -15,6 +15,7 @@ const paymentRoutes = require('./routes/payments');
 const adRoutes = require('./routes/ads');
 const adminRoutes = require('./routes/admin');
 const adminApiRoutes = require('./routes/admin-api');
+const webpushRoutes = require('./routes/webpush');
 
 const app = express();
 app.use(cors({
@@ -52,6 +53,7 @@ app.use('/api/merchants', merchantRoutes);
 app.use('/api/fees', feeRoutes);
 app.use('/admin/api', adminApiRoutes);
 app.use('/admin', adminRoutes);
+app.use('/api/webpush', webpushRoutes);
 
 app.get('/health', async (req, res) => {
   try {
