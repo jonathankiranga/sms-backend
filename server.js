@@ -14,11 +14,12 @@ const feeRoutes = require('./routes/fees');
 const paymentRoutes = require('./routes/payments');
 const adRoutes = require('./routes/ads');
 const adminRoutes = require('./routes/admin');
+const adminApiRoutes = require('./routes/admin-api');
 
 const app = express();
 app.use(cors({
   origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
-  methods: ['GET', 'POST']
+  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH']
 }));
 app.use(express.json());
 
@@ -49,6 +50,7 @@ app.use('/api/assessments', assessmentRoutes);
 app.use('/api/schools', schoolRoutes);
 app.use('/api/merchants', merchantRoutes);
 app.use('/api/fees', feeRoutes);
+app.use('/admin/api', adminApiRoutes);
 app.use('/admin', adminRoutes);
 
 app.get('/health', async (req, res) => {
