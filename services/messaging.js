@@ -55,6 +55,30 @@ async function sendOtp(phone, code) {
   return result;
 }
 
+async function sendAssessmentAlert(parentPhone, studentName, subject, score, level) {
+  return sendTemplate(parentPhone, process.env.WHATSAPP_TEMPLATE_ASSESSMENT || 'assessment_result', [
+    studentName, subject, score.toString(), level
+  ]);
+}
+
+async function sendFeeReminder(parentPhone, studentName, amount, balance) {
+  return sendTemplate(parentPhone, process.env.WHATSAPP_TEMPLATE_FEE || 'fee_reminder', [
+    studentName, amount, balance
+  ]);
+}
+
+async function sendConsecutiveAbsenceAlert(parentPhone, studentName, consecutiveDays, schoolName) {
+  return sendTemplate(parentPhone, process.env.WHATSAPP_TEMPLATE_CONSEC_ABSENCE || 'consecutive_absence', [
+    studentName, consecutiveDays.toString(), schoolName
+  ]);
+}
+
+async function sendBroadcast(parentPhone, schoolName, message) {
+  return sendTemplate(parentPhone, process.env.WHATSAPP_TEMPLATE_BROADCAST || 'school_broadcast', [
+    schoolName, message
+  ]);
+}
+
 // SMS fallback — used when WhatsApp fails
 async function sendSms(phone, message) {
   const provider = process.env.SMS_PROVIDER || 'log';
@@ -62,9 +86,7 @@ async function sendSms(phone, message) {
     console.log(`[SMS] To ${phone}: ${message}`);
     return { provider: 'log', status: 'logged' };
   }
-  // Example: Africa's Talking (not primary — only if user configures)
   if (provider === 'africastalking') {
-    const axios = require('axios');
     try {
       const resp = await axios.post('https://api.africastalking.com/version1/messaging', null, {
         params: {
@@ -85,4 +107,8 @@ async function sendSms(phone, message) {
   return { provider: 'none', status: 'unsupported' };
 }
 
-module.exports = { sendAbsenceAlert, sendOtp, sendTemplate, sendSms };
+module.exports = {
+  sendAbsenceAlert, sendOtp, sendTemplate, sendSms,
+  sendAssessmentAlert, sendFeeReminder,
+  sendConsecutiveAbsenceAlert, sendBroadcast
+};

@@ -124,4 +124,51 @@ router.get('/premium-status/:phone', async (req, res) => {
   });
 });
 
+// POST /api/parents/fee-reminder — send fee balance to parent's WhatsApp
+router.post('/fee-reminder', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone required' });
+
+  const [children] = await req.db.execute(
+    `SELECT s.student_id, s.full_name FROM students s
+     JOIN student_parent_map m ON s.student_id = m.student_id
+     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
+    [phone]
+  );
+
+  const [parent] = await req.db.execute(
+    'SELECT is_premium FROM parent_profiles WHERE parent_phone = ?',
+    [phone]
+  );
+
+  if (!parent[0]?.is_premium) return res.json({ sent: 0, message: 'Premium required for fee reminders' });
+
+  const { sendFeeReminder } = require('../services/messaging');
+  let sent = 0;
+  for (const child of children) {
+    // Get current term fee total
+    const [fees] = await req.db.execute(
+      `SELECT COALESCE(SUM(f.amount), 0) AS total
+       FROM fee_structures f
+       WHERE f.school_id = (SELECT school_id FROM students WHERE student_id = ?)
+         AND f.term = (SELECT CONCAT('Term ', CEIL(MONTH(CURDATE())/4)) FROM DUAL)`,
+      [child.student_id]
+    );
+    // Get amount paid
+    const [paid] = await req.db.execute(
+      `SELECT COALESCE(SUM(amount), 0) AS paid FROM payment_ledger WHERE student_reference = ?`,
+      [child.student_id]
+    );
+    const total = fees[0]?.total || 0;
+    const balance = total - paid[0].paid;
+    try {
+      await sendFeeReminder(phone, child.full_name, total.toString(), Math.max(0, balance).toString());
+      sent++;
+    } catch (e) {
+      console.error('[WA] Fee reminder failed:', e.message);
+    }
+  }
+  res.json({ sent, total: children.length });
+});
+
 module.exports = router;

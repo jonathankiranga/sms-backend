@@ -76,4 +76,72 @@ router.get('/:schoolId/analytics/attendance', async (req, res) => {
   res.json({ analytics: rows });
 });
 
+// Broadcast WhatsApp message to all premium parents in the school
+router.post('/:schoolId/broadcast', async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: 'Message required' });
+  const [parents] = await req.db.execute(
+    `SELECT DISTINCT p.parent_phone, s.school_name
+     FROM parent_profiles p
+     JOIN student_parent_map m ON p.parent_phone = m.parent_phone
+     JOIN students st ON m.student_id = st.student_id
+     JOIN schools s ON st.school_id = s.school_id
+     WHERE st.school_id = ? AND p.is_premium = TRUE AND (p.premium_expires_at IS NULL OR p.premium_expires_at >= NOW())`,
+    [req.params.schoolId]
+  );
+  if (parents.length === 0) return res.json({ sent: 0, message: 'No premium parents found' });
+  const { sendBroadcast } = require('../services/messaging');
+  let sent = 0;
+  for (const p of parents) {
+    try {
+      await sendBroadcast(p.parent_phone, p.school_name, message);
+      sent++;
+    } catch (e) {
+      console.error(`[BROADCAST] Failed to ${p.parent_phone}: ${e.message}`);
+    }
+  }
+  res.json({ sent, total: parents.length });
+});
+
+// Fee reminder — trigger WhatsApp fee reminder for a parent
+router.post('/:schoolId/fee-reminder/:studentId', async (req, res) => {
+  const [student] = await req.db.execute(
+    `SELECT s.full_name FROM students s WHERE s.student_id = ? AND s.school_id = ?`,
+    [req.params.studentId, req.params.schoolId]
+  );
+  if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
+
+  // Get total fee for the current term
+  const [fees] = await req.db.execute(
+    `SELECT SUM(f.amount) AS total FROM fee_structures f
+     WHERE f.school_id = ? AND f.term = (SELECT CONCAT('Term ', CEIL(MONTH(CURDATE())/4)) FROM DUAL)`,
+    [req.params.schoolId]
+  );
+  // Get amount paid
+  const [paid] = await req.db.execute(
+    `SELECT COALESCE(SUM(amount), 0) AS paid FROM payment_ledger WHERE student_reference = ?`,
+    [req.params.studentId]
+  );
+  const total = fees[0]?.total || 0;
+  const balance = total - paid[0].paid;
+
+  const [parentRows] = await req.db.execute(
+    `SELECT p.parent_phone FROM student_parent_map m
+     JOIN parent_profiles p ON m.parent_phone = p.parent_phone
+     WHERE m.student_id = ? AND p.is_premium = TRUE`,
+    [req.params.studentId]
+  );
+
+  if (parentRows.length > 0) {
+    const { sendFeeReminder } = require('../services/messaging');
+    for (const p of parentRows) {
+      sendFeeReminder(p.parent_phone, student[0].full_name, total.toString(), Math.max(0, balance).toString())
+        .catch(e => console.error('[WA] Fee reminder failed:', e.message));
+    }
+    res.json({ sent: parentRows.length, student: student[0].full_name, balance: Math.max(0, balance) });
+  } else {
+    res.json({ sent: 0, message: 'No premium parent linked' });
+  }
+});
+
 module.exports = router;

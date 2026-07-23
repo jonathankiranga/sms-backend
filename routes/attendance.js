@@ -52,6 +52,40 @@ router.post('/sync', async (req, res) => {
     );
 
     await connection.commit();
+
+    // Check consecutive absences for premium parents
+    try {
+      const { sendConsecutiveAbsenceAlert } = require('../services/messaging');
+      for (const r of records) {
+        if (r.status !== 'Absent') continue;
+        const [absCnt] = await connection.execute(
+          `SELECT COUNT(*) AS cnt FROM attendance_logs
+           WHERE student_id = ? AND status = 'Absent'
+             AND attendance_date >= DATE_SUB(?, INTERVAL 5 DAY)
+             AND attendance_date <= ?`,
+          [r.student_id, attendance_date, attendance_date]
+        );
+        if (absCnt[0].cnt >= 3) {
+          const [parentRows] = await connection.execute(
+            `SELECT p.parent_phone, s.full_name AS student_name, sch.school_name
+             FROM students s
+             JOIN schools sch ON s.school_id = sch.school_id
+             JOIN student_parent_map m ON s.student_id = m.student_id
+             JOIN parent_profiles p ON m.parent_phone = p.parent_phone
+             WHERE s.student_id = ? AND p.is_premium = TRUE AND (p.premium_expires_at IS NULL OR p.premium_expires_at >= NOW())
+             LIMIT 1`,
+            [r.student_id]
+          );
+          for (const p of parentRows) {
+            sendConsecutiveAbsenceAlert(p.parent_phone, p.student_name, absCnt[0].cnt, p.school_name)
+              .catch(e => console.error('[WA] Consecutive absence alert failed:', e.message));
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[ATTENDANCE] Consecutive absence check error:', e.message);
+    }
+
     res.json({ synced: records.length, date: attendance_date });
   } catch (err) {
     await connection.rollback();

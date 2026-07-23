@@ -87,6 +87,42 @@ router.post('/results', async (req, res) => {
       );
     }
     await conn.commit();
+
+    // Notify premium parents of assessment results
+    try {
+      const [assessInfo] = await req.db.execute(
+        `SELECT a.assessment_name, a.max_score, la.area_name
+         FROM assessments a
+         JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
+         JOIN strands s ON ss.strand_id = s.strand_id
+         JOIN learning_areas la ON s.area_id = la.area_id
+         WHERE a.assessment_id = ?`, [assessment_id]
+      );
+      if (assessInfo.length > 0) {
+        const { sendAssessmentAlert } = require('../services/messaging');
+        for (const r of results) {
+          const [studentInfo] = await req.db.execute('SELECT full_name FROM students WHERE student_id = ?', [r.student_id]);
+          const studentName = studentInfo[0]?.full_name || 'Student';
+          const [parents] = await req.db.execute(
+            `SELECT p.parent_phone FROM student_parent_map m
+             JOIN parent_profiles p ON m.parent_phone = p.parent_phone
+             WHERE m.student_id = ? AND p.is_premium = TRUE AND (p.premium_expires_at IS NULL OR p.premium_expires_at >= NOW())`,
+            [r.student_id]
+          );
+          for (const parent of parents) {
+            const pct = r.score / (r.max_score || assessInfo[0].max_score || 100);
+            let level = 'BE';
+            if (pct >= 0.8) level = 'EE';
+            else if (pct >= 0.6) level = 'ME';
+            else if (pct >= 0.4) level = 'AE';
+            sendAssessmentAlert(parent.parent_phone, studentName, assessInfo[0].area_name, r.score.toString(), level).catch(e => console.error('[WA] Assessment alert failed:', e.message));
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[NOTIFY] Assessment results alert error:', e.message);
+    }
+
     res.json({ saved: results.length });
   } catch (err) {
     await conn.rollback();
