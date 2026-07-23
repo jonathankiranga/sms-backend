@@ -16,10 +16,12 @@ const adRoutes = require('./routes/ads');
 const adminRoutes = require('./routes/admin');
 const adminApiRoutes = require('./routes/admin-api');
 const webpushRoutes = require('./routes/webpush');
+const migrateRoutes = require('./routes/migrate');
 
 const app = express();
+const defaultOrigins = 'https://sms-frontend.vercel.app,https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,http://localhost:5173,http://localhost:3000';
 app.use(cors({
-  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
+  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : defaultOrigins.split(','),
   methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH']
 }));
 app.use(express.json());
@@ -54,6 +56,7 @@ app.use('/api/fees', feeRoutes);
 app.use('/admin/api', adminApiRoutes);
 app.use('/admin', adminRoutes);
 app.use('/api/webpush', webpushRoutes);
+app.use('/api/migrate', migrateRoutes);
 
 app.get('/health', async (req, res) => {
   try {
