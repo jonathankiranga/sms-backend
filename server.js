@@ -7,6 +7,9 @@ const attendanceRoutes = require('./routes/attendance');
 const teacherRoutes = require('./routes/teachers');
 const schoolHeadRoutes = require('./routes/schoolHead');
 const parentRoutes = require('./routes/parents');
+const assessmentRoutes = require('./routes/assessments');
+const schoolRoutes = require('./routes/schools');
+const merchantRoutes = require('./routes/merchants');
 const paymentRoutes = require('./routes/payments');
 const adRoutes = require('./routes/ads');
 
@@ -40,6 +43,9 @@ app.use('/api/school-head', schoolHeadRoutes);
 app.use('/api/parents', parentRoutes);
 app.use('/v1/payments', paymentRoutes);
 app.use('/api/ads', adRoutes);
+app.use('/api/assessments', assessmentRoutes);
+app.use('/api/schools', schoolRoutes);
+app.use('/api/merchants', merchantRoutes);
 
 app.get('/health', async (req, res) => {
   try {
