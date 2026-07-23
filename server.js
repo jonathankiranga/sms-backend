@@ -19,7 +19,7 @@ const webpushRoutes = require('./routes/webpush');
 const migrateRoutes = require('./routes/migrate');
 
 const app = express();
-const defaultOrigins = 'https://sms-frontend.vercel.app,https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,http://localhost:5173,http://localhost:3000';
+const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,http://localhost:5173,http://localhost:3000';
 app.use(cors({
   origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : defaultOrigins.split(','),
   methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH']
