@@ -17,10 +17,11 @@ router.post('/run', async (req, res) => {
   for (const file of files) {
     const sqlPath = path.join(scriptsDir, file);
     const sql = fs.readFileSync(sqlPath, 'utf8');
-    const statements = sql
+    const clean = sql.replace(/^--.*$/gm, '').trim();
+    const statements = clean
       .split(';')
       .map(s => s.trim())
-      .filter(s => s.length > 0 && !s.startsWith('--'));
+      .filter(s => s.length > 0);
 
     const fileResults = { file, statements: [] };
 
