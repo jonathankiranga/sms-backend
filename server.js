@@ -10,8 +10,10 @@ const parentRoutes = require('./routes/parents');
 const assessmentRoutes = require('./routes/assessments');
 const schoolRoutes = require('./routes/schools');
 const merchantRoutes = require('./routes/merchants');
+const feeRoutes = require('./routes/fees');
 const paymentRoutes = require('./routes/payments');
 const adRoutes = require('./routes/ads');
+const adminRoutes = require('./routes/admin');
 
 const app = express();
 app.use(cors({
@@ -46,6 +48,8 @@ app.use('/api/ads', adRoutes);
 app.use('/api/assessments', assessmentRoutes);
 app.use('/api/schools', schoolRoutes);
 app.use('/api/merchants', merchantRoutes);
+app.use('/api/fees', feeRoutes);
+app.use('/admin', adminRoutes);
 
 app.get('/health', async (req, res) => {
   try {
