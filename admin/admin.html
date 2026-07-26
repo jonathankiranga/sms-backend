@@ -114,9 +114,16 @@ tbody tr:hover{background:var(--hover)}
   <div class="box">
     <h1>Education APP</h1>
     <p>Admin Panel</p>
-    <input type="password" id="admin-password" placeholder="Admin password" autofocus>
-    <button onclick="login()">Sign In</button>
-    <div id="login-error">Invalid password</div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button id="google-signin" onclick="startGoogle()" style="flex:1;padding:12px;background:#DB4437;color:#fff;border:none;border-radius:8px;font-weight:600;cursor:pointer">Sign in with Google</button>
+      <button id="use-password" onclick="showPassword()" style="padding:12px;background:#fff;color:#7B4F9B;border:1px solid #E2E8F0;border-radius:8px;cursor:pointer">Password</button>
+    </div>
+    <div id="pw-box" style="display:block">
+      <input type="password" id="admin-password" placeholder="Admin password">
+      <button onclick="login()" style="margin-top:8px">Sign In</button>
+      <div id="login-error" style="display:none">Invalid password</div>
+      <div style="font-size:12px;color:#64748B;margin-top:8px">If no Google credentials are configured, the Google sign-in will auto-login as the default admin (jonathankiranga@gmail.com) for development/testing only.</div>
+    </div>
   </div>
 </div>
 
@@ -131,7 +138,9 @@ tbody tr:hover{background:var(--hover)}
       <div class="nav-item" data-section="teachers"><span class="icon">&#x1F469;&#x200D;&#x1F3EB;</span> <span>Teachers</span></div>
       <div class="nav-item" data-section="fees"><span class="icon">&#x1F4B0;</span> <span>Fees</span></div>
       <div class="nav-item" data-section="revenue"><span class="icon">&#x1F4B5;</span> <span>Revenue</span></div>
+      <div class="nav-item" data-section="sales"><span class="icon">&#x1F91D;</span> <span>Sales CRM</span></div>
       <div class="nav-item" data-section="settings"><span class="icon">&#x2699;&#xFE0F;</span> <span>Settings</span></div>
+      <div class="nav-item" data-section="reportsettings"><span class="icon">&#x1F4C4;</span> <span>Report Settings</span></div>
       <div class="nav-item" data-section="help"><span class="icon">&#x2753;</span> <span>Help</span></div>
     </div>
     <button class="logout" onclick="logout()">&#x1F6AA; Sign Out</button>
@@ -163,10 +172,44 @@ tbody tr:hover{background:var(--hover)}
 
 <script>
 var ADMIN_KEY = sessionStorage.getItem('admin_key') || '';
+var ADMIN_OAUTH_EMAIL = sessionStorage.getItem('admin_oauth_email') || '';
 var API_BASE = '/admin/api';
 
 function getHeaders() {
-  return { 'Content-Type': 'application/json', 'x-admin-key': ADMIN_KEY };
+  const headers = { 'Content-Type': 'application/json' };
+  if (ADMIN_KEY) headers['x-admin-key'] = ADMIN_KEY;
+  if (ADMIN_OAUTH_EMAIL) headers['x-admin-oauth-email'] = ADMIN_OAUTH_EMAIL;
+  return headers;
+}
+
+// On load, capture admin_email from query params (set by OAuth callback)
+(function() {
+  const params = new URLSearchParams(window.location.search);
+  const ae = params.get('admin_email');
+  const err = params.get('error');
+  const dev = params.get('dev');
+  if (err) {
+    // show a short message about OAuth error
+    document.getElementById('login-error').style.display = 'block';
+    document.getElementById('login-error').textContent = 'OAuth error: ' + err;
+  }
+  if (ae) {
+    sessionStorage.setItem('admin_oauth_email', ae);
+    ADMIN_OAUTH_EMAIL = ae;
+    // Auto-open admin UI
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    loadSection('dashboard');
+  }
+})();
+
+function showPassword() {
+  document.getElementById('pw-box').style.display = 'block';
+}
+
+function startGoogle() {
+  // Redirect to backend OAuth start
+  window.location.href = '/admin/auth/google';
 }
 
 function api(path, opts) {
@@ -229,7 +272,9 @@ function loadSection(name) {
     teachers: ['Teachers', 'Manage teachers'],
     fees: ['Fee Structures', 'Manage fee items'],
     revenue: ['Revenue', 'Payments & earnings'],
+    sales: ['Sales CRM', 'Sales representatives and revenue by rep'],
     settings: ['Settings', 'Pricing & configuration'],
+    'reportsettings': ['Report Settings', 'Configure per-school report layout & content'],
     help: ['Help & Guide', 'How to use the Education APP']
   };
   var t = titles[name] || ['', ''];
@@ -326,20 +371,31 @@ function renderSchoolsTable(filter) {
 }
 
 function showAddSchool() {
-  openModal('Add School',
-    '<label>School ID (9 chars)</label><input id="f-school-id" placeholder="SCH001001" maxlength="9">' +
-    '<label>School Name</label><input id="f-school-name" placeholder="Muthaiga Primary">' +
-    '<label>Region (optional)</label><input id="f-school-region" placeholder="Nairobi">',
-    function() {
-      var school_id = document.getElementById('f-school-id').value.trim();
-      var school_name = document.getElementById('f-school-name').value.trim();
-      var region = document.getElementById('f-school-region').value.trim();
-      if (!school_id || !school_name) { alert('School ID and Name required'); return; }
-      api('/schools', { method: 'POST', body: JSON.stringify({ school_id: school_id, school_name: school_name, region: region }) })
-        .then(function() { closeModal(); renderSchools(); showMsg('schools-msg', 'School created', true); })
-        .catch(function(e) { showMsg('schools-msg', e.message, false); });
-    }
-  );
+  // Fetch sales reps to populate the dropdown
+  function fetchSalesRepsForModal(cb) {
+    api('/sales-reps').then(function(r) { cb(r.sales_reps || []); }).catch(function() { cb([]); });
+  }
+
+  fetchSalesRepsForModal(function(salesReps) {
+    var repOpts = salesReps.length ? salesReps.map(function(s) { return '<option value="' + s.rep_id + '">' + s.full_name + (s.phone ? ' (' + s.phone + ')' : '') + '</option>'; }).join('') : '<option value="">No sales reps</option>';
+    openModal('Add School',
+      '<label>School ID (9 chars)</label><input id="f-school-id" placeholder="SCH001001" maxlength="9">' +
+      '<label>School Name</label><input id="f-school-name" placeholder="Muthaiga Primary">' +
+      '<label>Region (optional)</label><input id="f-school-region" placeholder="Nairobi">' +
+      '<label>Sales representative</label><select id="f-school-sales-rep">' + repOpts + '</select>',
+      function() {
+        var school_id = document.getElementById('f-school-id').value.trim();
+        var school_name = document.getElementById('f-school-name').value.trim();
+        var region = document.getElementById('f-school-region').value.trim();
+        var sales_rep = document.getElementById('f-school-sales-rep').value;
+        if (!school_id || !school_name) { alert('School ID and Name required'); return; }
+        if (!sales_rep) { alert('Select a sales representative'); return; }
+        api('/schools', { method: 'POST', body: JSON.stringify({ school_id: school_id, school_name: school_name, region: region, sales_rep_id: sales_rep }) })
+          .then(function() { closeModal(); renderSchools(); showMsg('schools-msg', 'School created', true); })
+          .catch(function(e) { showMsg('schools-msg', e.message, false); });
+      }
+    );
+  });
 }
 
 function deleteSchool(id) {
@@ -384,7 +440,6 @@ function renderClassesTable(filter) {
           schoolOpts.map(function(s) { return '<option value="' + s.id + '"' + (classSchoolFilter === s.id ? ' selected' : '') + '>' + s.name + '</option>'; }).join('') +
         '</select>' +
       '</div>' +
-      '<button class="btn-add" onclick="showAddClass()">+ Add Class</button>' +
     '</div>' +
     (rows.length ? '<div class="table-wrap"><table><thead><tr><th>Class</th><th>School</th><th>Year</th><th></th></tr></thead><tbody>' +
       rows.map(function(c) { return '<tr><td><b>' + c.class_name + '</b></td><td>' + c.school_name + '</td><td>' + c.academic_year + '</td><td><button class="btn-del" onclick="deleteClass(' + c.class_id + ')">Delete</button></td></tr>'; }).join('') +
@@ -462,16 +517,24 @@ function renderStudentsTable(filter) {
         '</select>' +
       '</div>' +
       '<div style="display:flex;gap:8px">' +
-        '<button class="btn-add btn-add-sm" onclick="showImportStudents()">Import CSV</button>' +
-        '<button class="btn-add" onclick="showAddStudent()">+ Add Student</button>' +
+        '<button class="btn-add btn-add-sm" onclick="showPreviewPromotion()">Preview Promotion</button>' +
+        '<button class="btn-add btn-add-sm" onclick="confirmPromotionPrompt()" style="background:#10B981">Promote Selected</button>' +
       '</div>' +
     '</div>' +
-    (rows.length ? '<div class="table-wrap"><table><thead><tr><th>Student ID</th><th>Name</th><th>Class</th><th>School</th><th>Status</th><th></th></tr></thead><tbody>' +
+    (rows.length ? '<div class="table-wrap"><table><thead><tr><th><input type="checkbox" id="promo-select-all" onclick="toggleSelectAll(this)"></th><th>Student ID</th><th>Name</th><th>Class</th><th>School</th><th>Status</th><th></th></tr></thead><tbody>' +
       rows.map(function(st) {
         var statusBadge = st.enrollment_status === 'Active'
           ? '<span class="badge" style="background:#E8F5E9;color:#2E7D32">Active</span>'
           : '<span class="badge" style="background:#FFF3E0;color:#E65100">' + st.enrollment_status + '</span>';
-        return '<tr><td style="font-family:monospace;font-size:12px">' + st.student_id + '</td><td><b>' + st.full_name + '</b></td><td>' + (st.class_name || '&mdash;') + '</td><td class="text-muted">' + (st.school_name || '&mdash;') + '</td><td>' + statusBadge + '</td><td><button class="btn-del" onclick="deleteStudent(\'' + st.student_id + '\')">Delete</button></td></tr>';
+        return '<tr>' +
+          '<td><input type="checkbox" class="promo-select" data-id="' + st.student_id + '"></td>' +
+          '<td style="font-family:monospace;font-size:12px">' + st.student_id + '</td>' +
+          '<td><b>' + st.full_name + '</b></td>' +
+          '<td>' + (st.class_name || '&mdash;') + '</td>' +
+          '<td class="text-muted">' + (st.school_name || '&mdash;') + '</td>' +
+          '<td>' + statusBadge + '</td>' +
+          '<td><button class="btn-del" onclick="deleteStudent(\'' + st.student_id + '\')">Delete</button></td>' +
+        '</tr>';
       }).join('') +
     '</tbody></table><div class="pagination"><span>' + rows.length + ' student' + (rows.length !== 1 ? 's' : '') + '</span></div></div>' : '<div class="empty">No students match</div>');
 }
@@ -541,6 +604,66 @@ function updateImportClasses() {
     : '<option value="">No classes</option>';
 }
 
+// Promotion helpers
+function getSelectedStudentIds() {
+  var nodes = document.querySelectorAll('.promo-select:checked');
+  var ids = [];
+  nodes.forEach(function(n) { ids.push(n.getAttribute('data-id')); });
+  return ids;
+}
+
+function toggleSelectAll(chk) {
+  var checked = chk.checked;
+  document.querySelectorAll('.promo-select').forEach(function(n) { n.checked = checked; });
+}
+
+function showPreviewPromotion() {
+  var ids = getSelectedStudentIds();
+  if (!ids.length) { alert('Select students to preview promotion'); return; }
+  api('/promote', { method: 'POST', body: JSON.stringify({ student_ids: ids, preview: true }) })
+    .then(function(r) {
+      var rows = r.preview || [];
+      var missing = r.missing || [];
+      var html = '<div style="max-height:60vh;overflow:auto">';
+      if (missing.length) html += '<div class="msg error">Warning: ' + missing.length + ' selected student(s) not found</div>';
+      html += '<table style="width:100%;border-collapse:collapse;margin-top:8px"><thead><tr><th style="text-align:left;padding:6px">Student ID</th><th style="text-align:left;padding:6px">Name</th><th style="text-align:left;padding:6px">From</th><th style="text-align:left;padding:6px">To</th><th style="text-align:left;padding:6px">Action</th></tr></thead><tbody>';
+      rows.forEach(function(rw) {
+        html += '<tr><td style="padding:6px;font-family:monospace">' + rw.student_id + '</td><td style="padding:6px">' + rw.full_name + '</td><td style="padding:6px">' + (rw.from_class_name || '') + '</td><td style="padding:6px">' + (rw.to_class_name || '&mdash;') + '</td><td style="padding:6px">' + rw.action + '</td></tr>';
+      });
+      html += '</tbody></table>';
+      html += '<div style="margin-top:12px">Performed by (teacher id): <input id="promo-performed-by" placeholder="TCH..." style="margin-left:8px;padding:6px;border:1px solid #E2E8F0;border-radius:6px"></div>';
+      html += '<div style="font-size:12px;color:#666;margin-top:8px">Note: Graduations are recorded by inserting a promotion_history row; students.enrollment_status is not modified.</div>';
+      html += '</div>';
+      openModal('Promotion Preview', html, function() {
+        // onSave -> commit promotion
+        var performed_by = document.getElementById('promo-performed-by').value.trim() || null;
+        modalState.onSave = null; // prevent double-run
+        // call commit
+        api('/promote', { method: 'POST', body: JSON.stringify({ student_ids: ids, performed_by: performed_by }) })
+          .then(function(resp) {
+            closeModal();
+            renderStudents();
+            showMsg('students-msg', 'Promoted: ' + (resp.promoted || 0) + ', Graduated: ' + (resp.graduated || 0), true);
+          }).catch(function(e) {
+            showMsg('students-msg', e.message || 'Failed', false);
+          });
+      });
+    }).catch(function(e) { showMsg('students-msg', e.message, false); });
+}
+
+function confirmPromotionPrompt() {
+  var ids = getSelectedStudentIds();
+  if (!ids.length) { alert('Select students to promote'); return; }
+  if (!confirm('Promote ' + ids.length + ' students? Use Preview to review before committing. Proceed?')) return;
+  // quick commit without preview
+  var performed_by = prompt('Performed by (teacher id, optional):', '');
+  api('/promote', { method: 'POST', body: JSON.stringify({ student_ids: ids, performed_by: performed_by || null }) })
+    .then(function(resp) {
+      renderStudents();
+      showMsg('students-msg', 'Promoted: ' + (resp.promoted || 0) + ', Graduated: ' + (resp.graduated || 0), true);
+    }).catch(function(e) { showMsg('students-msg', e.message || 'Failed', false); });
+}
+
 function deleteStudent(id) {
   if (!confirm('Delete student ' + id + '?')) return;
   api('/students/' + id, { method: 'DELETE' })
@@ -550,6 +673,28 @@ function deleteStudent(id) {
 
 // === TEACHERS ===
 var teachersData = [];
+
+// === SALES CRM ===
+var salesRepsData = [];
+function renderSales() {
+  var el = document.getElementById('content');
+  el.innerHTML = '<div style="text-align:center;padding:40px">Loading...</div>';
+  Promise.all([api('/sales-reps'), api('/revenue/sales-reps')]).then(function(results) {
+    var reps = results[0].sales_reps || [];
+    var rev = results[1].sales_rep_revenue || [];
+    var revMap = {};
+    rev.forEach(function(r) { revMap[r.rep_id] = r; });
+    salesRepsData = reps;
+    var html = '<div style="font-size:14px;font-weight:600;margin-bottom:10px;color:#334155">Sales Representatives</div>' +
+      (reps.length ? '<div class="table-wrap"><table><thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Schools</th><th>Revenue</th></tr></thead><tbody>' +
+        reps.map(function(s) {
+          var r = revMap[s.rep_id] || { schools_count: 0, revenue: 0 };
+          return '<tr><td>' + s.full_name + '</td><td>' + (s.phone || '&mdash;') + '</td><td>' + (s.email || '&mdash;') + '</td><td>' + (r.schools_count || 0) + '</td><td>' + (r.revenue || 0) + '</td></tr>';
+        }).join('') + '</tbody></table></div>' : '<div class="empty">No sales representatives</div>');
+    el.innerHTML = html;
+  }).catch(function(e) { el.innerHTML = '<div class="msg error">Failed to load: ' + e.message + '</div>'; });
+}
+
 
 function renderTeachers() {
   var el = document.getElementById('content');
@@ -827,6 +972,249 @@ function saveSettings() {
   }).catch(function() {
     showMsg('settings-msg', 'Failed to save', false);
   });
+}
+
+// === REPORT SETTINGS ===
+var reportSettingsCache = {};
+var reportSettingsSchoolId = '';
+
+function renderReportsettings() {
+  var el = document.getElementById('content');
+  el.innerHTML = '<div style="text-align:center;padding:40px">Loading...</div>';
+  api('/schools').then(function(d) {
+    schoolsData = d.schools || [];
+    renderReportSettingsForm();
+  }).catch(function(e) { el.innerHTML = '<div class="msg error">' + e.message + '</div>'; });
+}
+
+function renderReportSettingsForm() {
+  var el = document.getElementById('content');
+  var schoolOpts = schoolsData.length
+    ? '<option value="">— Select School —</option>' + schoolsData.map(function(s) { return '<option value="' + s.school_id + '">' + s.school_name + ' (' + s.school_id + ')</option>'; }).join('')
+    : '<option value="">No schools available</option>';
+
+  el.innerHTML =
+    '<div id="report-msg" class="msg"></div>' +
+    '<div class="card" style="padding:24px;background:var(--card);border-radius:var(--radius);box-shadow:0 1px 3px rgba(0,0,0,0.06)">' +
+      '<div style="margin-bottom:20px">' +
+        '<label style="font-size:12px;font-weight:600;color:var(--text2);display:block;margin-bottom:4px">School</label>' +
+        '<div style="display:flex;gap:10px">' +
+          '<select id="rs-school" style="flex:1;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none" onchange="onSchoolChange()">' + schoolOpts + '</select>' +
+        '</div>' +
+      '</div>' +
+      '<div id="rs-form" style="display:none">' +
+        '<div style="border-top:1px solid var(--border);padding-top:20px">' +
+          '<h3 style="font-size:14px;font-weight:700;margin-bottom:16px">Report Content</h3>' +
+          '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Template Name</label>' +
+          '<input id="rs-template_name" class="rs-input" placeholder="Default Report" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;margin-bottom:12px" />' +
+
+          '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:8px">Visible Sections</label>' +
+          '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px">' +
+            '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="rs-show_teacher_name" checked /> Show Teacher Name</label>' +
+            '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="rs-show_teacher_signature" checked /> Show Teacher Signature</label>' +
+            '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="rs-show_final_remarks" checked /> Show Final Remarks</label>' +
+            '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="rs-show_recommendation" checked /> Show Recommendation</label>' +
+          '</div>' +
+
+          '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Teacher Name</label>' +
+          '<input id="rs-teacher_name" class="rs-input" placeholder="e.g. Jane Mwangi" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;margin-bottom:12px" />' +
+
+          '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Teacher Signature</label>' +
+          '<input id="rs-teacher_signature" class="rs-input" placeholder="Signed: J. Mwangi" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;margin-bottom:12px" />' +
+
+          '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Final Remarks</label>' +
+          '<textarea id="rs-final_remarks" class="rs-input" rows="3" placeholder="Overall performance notes..." style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;resize:vertical;margin-bottom:12px"></textarea>' +
+
+          '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Recommendation</label>' +
+          '<textarea id="rs-recommendation_text" class="rs-input" rows="3" placeholder="Areas for improvement..." style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;resize:vertical;margin-bottom:16px"></textarea>' +
+
+          '<div style="border-top:1px solid var(--border);padding-top:20px;margin-bottom:16px">' +
+            '<h3 style="font-size:14px;font-weight:700;margin-bottom:12px">Section Ordering</h3>' +
+            '<p style="font-size:12px;color:var(--text2);margin-bottom:10px">Toggle sections on/off and reorder with arrows.</p>' +
+            '<div id="rs-section-list"></div>' +
+            '<div class="hint" style="font-size:11px;color:var(--text2);margin-top:6px">Controls which sections appear in the parent PDF and their display order.</div>' +
+          '</div>' +
+
+          '<div style="border-top:1px solid var(--border);padding-top:20px;margin-bottom:16px">' +
+            '<h3 style="font-size:14px;font-weight:700;margin-bottom:12px">Layout & Branding</h3>' +
+
+            '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Logo URL</label>' +
+            '<input id="rs-logo_url" class="rs-input" placeholder="https://example.com/logo.png" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;margin-bottom:12px" />' +
+
+            '<div style="display:flex;gap:12px;margin-bottom:12px">' +
+              '<div style="flex:1"><label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Logo Width (mm)</label><input id="rs-logo_width" type="number" value="50" class="rs-input" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none" /></div>' +
+              '<div style="flex:1"><label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Logo Height (mm)</label><input id="rs-logo_height" type="number" value="50" class="rs-input" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none" /></div>' +
+              '<div style="flex:1"><label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Logo Alignment</label><select id="rs-logo_align" class="rs-input" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;background:#fff"><option value="left">Left</option><option value="center">Center</option><option value="right">Right</option></select></div>' +
+            '</div>' +
+
+            '<label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Report Title</label>' +
+            '<input id="rs-report_title" class="rs-input" placeholder="Education APP - Academic Report" value="Education APP - Academic Report" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none;margin-bottom:12px" />' +
+
+            '<div style="display:flex;gap:12px;margin-bottom:12px">' +
+              '<div style="flex:1"><label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Title Font Size</label><input id="rs-title_font_size" type="number" value="18" class="rs-input" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none" /></div>' +
+              '<div style="flex:1"><label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Section Font Size</label><input id="rs-section_font_size" type="number" value="11" class="rs-input" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none" /></div>' +
+              '<div style="flex:1"><label style="display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:4px">Body Font Size</label><input id="rs-body_font_size" type="number" value="10" class="rs-input" style="width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:6px;font-size:13px;outline:none" /></div>' +
+            '</div>' +
+          '</div>' +
+
+          '<button onclick="saveReportSettings()" class="btn-add" style="width:100%;justify-content:center;padding:12px">Save Report Settings</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+}
+
+function onSchoolChange() {
+  var schoolId = document.getElementById('rs-school').value;
+  if (!schoolId) {
+    document.getElementById('rs-form').style.display = 'none';
+    return;
+  }
+  reportSettingsSchoolId = schoolId;
+  document.getElementById('rs-form').style.display = 'block';
+
+  var msgEl = document.getElementById('report-msg');
+  msgEl.className = 'msg';
+  msgEl.textContent = 'Loading...';
+
+  api('/report-settings?school_id=' + encodeURIComponent(schoolId)).then(function(d) {
+    var s = d.settings || {};
+    msgEl.className = 'msg';
+
+    document.getElementById('rs-template_name').value = s.template_name || '';
+    document.getElementById('rs-show_teacher_name').checked = s.show_teacher_name !== false;
+    document.getElementById('rs-show_teacher_signature').checked = s.show_teacher_signature !== false;
+    document.getElementById('rs-show_final_remarks').checked = s.show_final_remarks !== false;
+    document.getElementById('rs-show_recommendation').checked = s.show_recommendation !== false;
+    document.getElementById('rs-teacher_name').value = s.teacher_name || '';
+    document.getElementById('rs-teacher_signature').value = s.teacher_signature || '';
+    document.getElementById('rs-final_remarks').value = s.final_remarks || '';
+    document.getElementById('rs-recommendation_text').value = s.recommendation_text || '';
+
+    // Parse layout_json
+    var layout = s.layout_json || {};
+    if (typeof layout === 'string') { try { layout = JSON.parse(layout); } catch(e) { layout = {}; } }
+    var sections = Array.isArray(layout.sections) ? layout.sections : ['attendance', 'learning_areas'];
+    renderSectionList(sections);
+    document.getElementById('rs-logo_url').value = layout.logo?.url || '';
+    document.getElementById('rs-logo_width').value = layout.logo?.width || 50;
+    document.getElementById('rs-logo_height').value = layout.logo?.height || 50;
+    document.getElementById('rs-logo_align').value = layout.logo?.align || 'left';
+    document.getElementById('rs-report_title').value = layout.report_title || 'Education APP - Academic Report';
+    document.getElementById('rs-title_font_size').value = layout.styles?.titleFontSize || 18;
+    document.getElementById('rs-section_font_size').value = layout.styles?.sectionFontSize || 11;
+    document.getElementById('rs-body_font_size').value = layout.styles?.bodyFontSize || 10;
+  }).catch(function(e) {
+    msgEl.className = 'msg error';
+    msgEl.textContent = 'Failed to load settings: ' + e.message;
+  });
+}
+
+function getAvailableSections() {
+  return [
+    { id: 'attendance', label: 'Attendance Summary' },
+    { id: 'learning_areas', label: 'Learning Areas' }
+  ];
+}
+
+function renderSectionList(sections) {
+  var container = document.getElementById('rs-section-list');
+  if (!container) return;
+  _currentSections = sections.slice();
+
+  var allSections = getAvailableSections();
+  var html = '<div style="display:flex;flex-direction:column;gap:6px">';
+  sections.forEach(function(sectionId, index) {
+    var info = allSections.find(function(s) { return s.id === sectionId; }) || { id: sectionId, label: sectionId };
+    var upDisabled = index === 0;
+    var downDisabled = index === sections.length - 1;
+    html +=
+      '<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:#F8FAFC;border:1px solid var(--border);border-radius:6px">' +
+        '<span style="cursor:grab;color:var(--text2)">&#x2630;</span>' +
+        '<span style="flex:1;font-size:13px;font-weight:500">' + info.label + '</span>' +
+        '<button onclick="moveSection(' + index + ', -1)" class="btn-add-sm" style="padding:4px 8px;font-size:11px' + (upDisabled ? ';opacity:0.3' : '') + '"' + (upDisabled ? ' disabled' : '') + '>&#x25B2;</button>' +
+        '<button onclick="moveSection(' + index + ', 1)" class="btn-add-sm" style="padding:4px 8px;font-size:11px' + (downDisabled ? ';opacity:0.3' : '') + '"' + (downDisabled ? ' disabled' : '') + '>&#x25BC;</button>' +
+      '</div>';
+  });
+  html += '</div>';
+
+  // Add toggle checkboxes for including/excluding sections
+  html += '<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px">';
+  allSections.forEach(function(s) {
+    var included = sections.indexOf(s.id) >= 0;
+    html +=
+      '<label style="display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;padding:4px 10px;background:' + (included ? '#E8F5E9' : '#F5F5F5') + ';border-radius:4px;border:1px solid ' + (included ? '#A5D6A7' : 'var(--border)') + '">' +
+        '<input type="checkbox" ' + (included ? 'checked' : '') + ' onchange="toggleSection(\'' + s.id + '\')" /> ' + s.label +
+      '</label>';
+  });
+  html += '</div>';
+
+  container.innerHTML = html;
+}
+
+var _currentSections = ['attendance', 'learning_areas'];
+
+function moveSection(index, direction) {
+  var newIndex = index + direction;
+  if (newIndex < 0 || newIndex >= _currentSections.length) return;
+  var temp = _currentSections[index];
+  _currentSections[index] = _currentSections[newIndex];
+  _currentSections[newIndex] = temp;
+  renderSectionList(_currentSections);
+}
+
+function toggleSection(sectionId) {
+  var idx = _currentSections.indexOf(sectionId);
+  if (idx >= 0) {
+    _currentSections.splice(idx, 1);
+  } else {
+    _currentSections.push(sectionId);
+  }
+  renderSectionList(_currentSections);
+}
+
+function saveReportSettings() {
+  var schoolId = reportSettingsSchoolId;
+  if (!schoolId) { showMsg('report-msg', 'Select a school first', false); return; }
+
+  var sections = getCurrentSections();
+
+  var layout = {
+    sections: sections,
+    logo: {
+      url: document.getElementById('rs-logo_url').value.trim(),
+      width: parseInt(document.getElementById('rs-logo_width').value) || 50,
+      height: parseInt(document.getElementById('rs-logo_height').value) || 50,
+      align: document.getElementById('rs-logo_align').value
+    },
+    report_title: document.getElementById('rs-report_title').value.trim() || 'Education APP - Academic Report',
+    styles: {
+      titleFontSize: parseInt(document.getElementById('rs-title_font_size').value) || 18,
+      sectionFontSize: parseInt(document.getElementById('rs-section_font_size').value) || 11,
+      bodyFontSize: parseInt(document.getElementById('rs-body_font_size').value) || 10
+    }
+  };
+
+  var payload = {
+    school_id: schoolId,
+    template_name: document.getElementById('rs-template_name').value.trim() || 'Default Report',
+    show_teacher_name: document.getElementById('rs-show_teacher_name').checked,
+    show_teacher_signature: document.getElementById('rs-show_teacher_signature').checked,
+    show_final_remarks: document.getElementById('rs-show_final_remarks').checked,
+    show_recommendation: document.getElementById('rs-show_recommendation').checked,
+    teacher_name: document.getElementById('rs-teacher_name').value.trim() || null,
+    teacher_signature: document.getElementById('rs-teacher_signature').value.trim() || null,
+    final_remarks: document.getElementById('rs-final_remarks').value.trim() || null,
+    recommendation_text: document.getElementById('rs-recommendation_text').value.trim() || null,
+    layout_json: layout
+  };
+
+  api('/report-settings', { method: 'POST', body: JSON.stringify(payload) })
+    .then(function() {
+      showMsg('report-msg', 'Report settings saved successfully', true);
+    })
+    .catch(function(e) {
+      showMsg('report-msg', 'Failed to save: ' + e.message, false);
+    });
 }
 
 // Utils

@@ -112,4 +112,80 @@ router.post('/callback', async (req, res) => {
   }
 });
 
+// ===== Dynamic per-school M-Pesa routes =====
+
+// POST /v1/payments/:school_id/stkpush — initiate STK push using school's credentials
+router.post('/:school_id/stkpush', async (req, res) => {
+  const { school_id } = req.params;
+  const { phone, amount, reference, description } = req.body;
+  if (!phone || !amount) return res.status(400).json({ error: 'phone and amount required' });
+
+  const [schoolRows] = await req.db.execute(
+    'SELECT mpesa_consumer_key, mpesa_consumer_secret, mpesa_passkey, mpesa_paybill, mpesa_environment, school_id FROM schools WHERE school_id = ?',
+    [school_id]
+  );
+  if (schoolRows.length === 0) return res.status(404).json({ error: 'School not found' });
+
+  const mpesa = require('../services/mpesa');
+  const result = await mpesa.stkPush(phone, amount, reference || `SCH_${school_id}_${Date.now()}`, description || 'School Fee', schoolRows[0]);
+  res.json(result);
+});
+
+// POST /v1/payments/:school_id/callback — Daraja callback per school
+router.post('/:school_id/callback', async (req, res) => {
+  const { school_id } = req.params;
+  try {
+    const { Body } = req.body;
+    if (!Body || !Body.stkCallback) {
+      return res.status(200).json({ ResultCode: 1, ResultDesc: 'Invalid callback' });
+    }
+
+    const { ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
+    if (ResultCode !== 0) {
+      console.log(`[STK][${school_id}] Payment failed:`, ResultDesc);
+      return res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
+    }
+
+    const items = CallbackMetadata?.Item || [];
+    const getVal = (name) => { const item = items.find(i => i.Name === name); return item ? item.Value : null; };
+
+    const phone = (getVal('PhoneNumber') || '').toString();
+    const amount = parseFloat(getVal('Amount') || 0);
+    const receipt = (getVal('MpesaReceiptNumber') || '').toString();
+    const ref = (Body.stkCallback.AccountReference || '').toString();
+
+    console.log(`[STK][${school_id}] ${phone} paid KSh ${amount} — ref ${receipt} (${ref})`);
+
+    await req.db.execute(
+      `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, logged_at)
+       VALUES (?, ?, ?, ?, 'M-Pesa', ?, ?, ?, NOW())`,
+      [receipt, amount, phone, ref, school_id, Body.stkCallback.term || null, Body.stkCallback.year || null]
+    );
+
+    res.status(200).json({ ResultCode: 0, ResultDesc: 'Success' });
+  } catch (err) {
+    console.error(`[STK CALLBACK ERROR][${school_id}]`, err.message);
+    res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
+  }
+});
+
+// POST /v1/payments/:school_id/register — register C2B URLs for this school
+router.post('/:school_id/register', async (req, res) => {
+  const { school_id } = req.params;
+  const [schoolRows] = await req.db.execute(
+    'SELECT mpesa_consumer_key, mpesa_consumer_secret, mpesa_passkey, mpesa_paybill, mpesa_environment, school_id FROM schools WHERE school_id = ?',
+    [school_id]
+  );
+  if (schoolRows.length === 0) return res.status(404).json({ error: 'School not found' });
+
+  const baseUrl = process.env.BASE_URL || 'https://sms-backend-r0tn.onrender.com';
+  const mpesa = require('../services/mpesa');
+  const result = await mpesa.registerC2BUrls(
+    `${baseUrl}/v1/payments/${school_id}/validation`,
+    `${baseUrl}/v1/payments/${school_id}/confirmation`,
+    schoolRows[0]
+  );
+  res.json(result);
+});
+
 module.exports = router;

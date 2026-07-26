@@ -50,9 +50,37 @@ async function sendAbsenceAlert(parentPhone, studentName, schoolName, date) {
   ]);
 }
 
+// OTP sending: prefer Africa's Talking SMS for OTP delivery. Falls back to WhatsApp template if configured and AT not set, or to logging in dev.
 async function sendOtp(phone, code) {
-  const result = await sendTemplate(phone, process.env.WHATSAPP_TEMPLATE_OTP || 'otp_verification', [code]);
-  return result;
+  const msg = process.env.OTP_SMS_TEMPLATE || `Your verification code is ${code}`;
+  // If AT credentials exist, use africastalking via sendSms override
+  if (process.env.AT_API_KEY && process.env.AT_USERNAME) {
+    return await sendSms(phone, msg, 'africastalking');
+  }
+  // If Meta WhatsApp configured, use WhatsApp template as fallback
+  if (process.env.META_ACCESS_TOKEN && process.env.PHONE_NUMBER_ID) {
+    try {
+      const result = await sendTemplate(phone, process.env.WHATSAPP_TEMPLATE_OTP || 'otp_verification', [code]);
+      return result;
+    } catch (e) {
+      console.error('[OTP] WhatsApp send failed, falling back to log:', e.message);
+    }
+  }
+  // last resort: log the OTP
+  console.log(`[OTP] To ${phone}: ${code}`);
+  return { provider: 'log', status: 'logged' };
+}
+
+// Email OTP support — simple fallback logger. If you configure EMAIL_PROVIDER and implement sending logic, replace this.
+async function sendEmailOtp(email, code) {
+  const provider = process.env.EMAIL_PROVIDER || 'log';
+  if (provider === 'log') {
+    console.log(`[EMAIL] To ${email}: Your verification code is ${code}`);
+    return { provider: 'log', status: 'logged' };
+  }
+  // Placeholder: implement real email sending (SMTP, SendGrid, SES...) if desired.
+  console.warn('[EMAIL] sendEmailOtp called but no provider implemented; set EMAIL_PROVIDER and add implementation.');
+  return { provider: 'none' };
 }
 
 async function sendAssessmentAlert(parentPhone, studentName, subject, score, level) {
@@ -80,8 +108,8 @@ async function sendBroadcast(parentPhone, schoolName, message) {
 }
 
 // SMS fallback — used when WhatsApp fails
-async function sendSms(phone, message) {
-  const provider = process.env.SMS_PROVIDER || 'log';
+async function sendSms(phone, message, providerOverride) {
+  const provider = providerOverride || process.env.SMS_PROVIDER || 'log';
   if (provider === 'log') {
     console.log(`[SMS] To ${phone}: ${message}`);
     return { provider: 'log', status: 'logged' };
@@ -108,7 +136,7 @@ async function sendSms(phone, message) {
 }
 
 module.exports = {
-  sendAbsenceAlert, sendOtp, sendTemplate, sendSms,
+  sendAbsenceAlert, sendOtp, sendTemplate, sendSms, sendEmailOtp,
   sendAssessmentAlert, sendFeeReminder,
   sendConsecutiveAbsenceAlert, sendBroadcast
 };

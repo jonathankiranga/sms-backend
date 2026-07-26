@@ -54,7 +54,7 @@ router.post('/verify-otp', async (req, res) => {
 router.get('/campaigns', async (req, res) => {
   const { merchant_id } = req.query;
   const [rows] = await req.db.execute(
-    'SELECT ad_id, merchant_name AS business_name, message, banner_image_url, target_link, status, start_date, end_date FROM marketplace_campaigns WHERE merchant_name IN (SELECT business_name FROM merchants WHERE merchant_id = ?) ORDER BY created_at DESC',
+    'SELECT ad_id, merchant_name AS business_name, merchant_phone, message, banner_image_url, target_link, status, start_date, end_date FROM marketplace_campaigns WHERE merchant_name IN (SELECT business_name FROM merchants WHERE merchant_id = ?) ORDER BY created_at DESC',
     [merchant_id]
   );
   res.json({ campaigns: rows });
@@ -66,10 +66,11 @@ router.post('/campaigns', async (req, res) => {
   if (!merchant_id || !message || !target_school_id || !days) return res.status(400).json({ error: 'Missing fields' });
   const [m] = await req.db.execute('SELECT business_name, phone FROM merchants WHERE merchant_id = ?', [merchant_id]);
   if (m.length === 0) return res.status(404).json({ error: 'Merchant not found' });
-  const duration = Math.min(Math.max(parseInt(days) || 7, 1), 90);
+  // Limit duration to a maximum of 60 days (approximately 2 months)
+  const duration = Math.min(Math.max(parseInt(days) || 7, 1), 60);
   const startDate = new Date().toISOString().slice(0, 10);
   const endDate = new Date(Date.now() + duration * 86400000).toISOString().slice(0, 10);
-  // Get campaign price from settings
+  // Get campaign price from settings (key uses the actual duration)
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", ['merchant_' + duration + '_day']);
   const price = parseInt(setting[0]?.setting_value || '0');
 
@@ -77,8 +78,8 @@ router.post('/campaigns', async (req, res) => {
   const status = (process.env.MPESA_CONSUMER_KEY && price > 0) ? 'Pending' : 'Active';
 
   const [result] = await req.db.execute(
-    'INSERT INTO marketplace_campaigns (target_school_id, merchant_name, message, banner_image_url, target_link, status, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    [target_school_id, m[0].business_name, message, '', '#', status, startDate, endDate]
+    'INSERT INTO marketplace_campaigns (target_school_id, merchant_name, merchant_phone, message, banner_image_url, target_link, status, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [target_school_id, m[0].business_name, m[0].phone || null, message, '', '#', status, startDate, endDate]
   );
   const campaignId = result.insertId;
 

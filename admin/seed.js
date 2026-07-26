@@ -24,6 +24,12 @@ async function getConn() {
 }
 
 async function main() {
+  // Prevent accidental use in production
+  if (process.env.NODE_ENV === 'production' && (process.env.ALLOW_SEED || '').toLowerCase() !== 'true') {
+    console.error('Refusing to run admin/seed.js in production. Set ALLOW_SEED=true to override if you really intend to run this.');
+    process.exit(1);
+  }
+
   const [cmd, ...args] = process.argv.slice(2);
   if (!cmd) { console.log('Usage: node admin/seed.js <command>'); process.exit(1); }
 

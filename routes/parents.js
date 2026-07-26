@@ -38,7 +38,16 @@ router.post('/verify-otp', async (req, res) => {
 
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
 
-  res.json({ phone: rows[0].phone, verified: true });
+  const phone = rows[0].phone;
+  // Compare the OTP phone with registered parent profile and return a flag so the client can inform the user
+  const [parentRows] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
+  const registered = parentRows.length > 0;
+
+  // Also report how many active children are linked to this phone
+  const [childrenCountRows] = await req.db.execute('SELECT COUNT(*) AS cnt FROM student_parent_map m JOIN students s ON m.student_id = s.student_id WHERE m.parent_phone = ? AND s.enrollment_status = ?', [phone, 'Active']);
+  const linkedChildren = childrenCountRows[0]?.cnt || 0;
+
+  res.json({ phone, verified: true, registered, linked_children: linkedChildren });
 });
 
 router.get('/dashboard/:phone', async (req, res) => {
@@ -62,10 +71,26 @@ router.get('/dashboard/:phone', async (req, res) => {
     [phone]
   );
 
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+  const premiumPrice = parseInt(setting[0]?.setting_value || '100');
+  const childCount = children.length || 0;
+  const premiumTotal = premiumPrice * Math.max(childCount, 1);
+  const premiumActive = Boolean(parent[0]?.is_premium) && (!parent[0]?.premium_expires_at || new Date(parent[0].premium_expires_at) > new Date());
+
+  // If the parent is not premium, hide children in the dashboard payload to enforce access control from login
+  const payloadChildren = premiumActive ? children : [];
+  const renewalRequired = !premiumActive;
+
   res.json({
     parent: parent[0] || { is_premium: false },
     school_id: schoolId,
-    children
+    children: payloadChildren,
+    premium_price: premiumPrice,
+    premium_children_count: childCount,
+    premium_total: premiumTotal,
+    premium_active: premiumActive,
+    premium_due: premiumActive ? 0 : premiumTotal,
+    renewal_required: renewalRequired
   });
 });
 
@@ -74,9 +99,15 @@ router.post('/upgrade', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 
-  // Get premium price from settings
+  const [childCountRows] = await req.db.execute(
+    'SELECT COUNT(*) AS child_count FROM student_parent_map WHERE parent_phone = ?',
+    [phone]
+  );
+  const childCount = childCountRows[0]?.child_count || 0;
+
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const price = parseInt(setting[0]?.setting_value || '100');
+  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
+  const totalDue = pricePerChild * Math.max(childCount, 1);
 
   const txnRef = 'UPG' + Date.now().toString(36).toUpperCase();
 
@@ -84,14 +115,14 @@ router.post('/upgrade', async (req, res) => {
   if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE) {
     try {
       const mpesa = require('../services/mpesa');
-      const result = await mpesa.stkPush(phone, price, txnRef, 'Education APP Premium');
+      const result = await mpesa.stkPush(phone, totalDue, txnRef, 'Education APP Premium');
       if (result.ResponseCode === '0') {
-        console.log(`[MPESA] STK push sent to ${phone} for KSh ${price} ref ${txnRef}`);
+        console.log(`[MPESA] STK push sent to ${phone} for KSh ${totalDue} ref ${txnRef}`);
         return res.json({
           transaction_ref: txnRef,
           checkout_request_id: result.CheckoutRequestID,
           status: 'pending',
-          message: `M-Pesa STK push sent to your phone. Enter PIN to pay KSh ${price}.`
+          message: `M-Pesa STK push sent to your phone. Enter PIN to pay KSh ${totalDue} for ${childCount || 1} child${childCount === 1 ? '' : 'ren'}.`
         });
       }
       console.error('[MPESA] STK push failed:', result);
@@ -118,20 +149,46 @@ router.post('/upgrade', async (req, res) => {
   }
 
   console.log(`[PREMIUM] ${phone} upgraded (simulated) — expires ${expiresAt.toISOString()}`);
-  res.json({ transaction_ref: txnRef, status: 'confirmed', message: `Premium activated for KSh ${price}/term` });
+  res.json({
+    transaction_ref: txnRef,
+    status: 'confirmed',
+    message: `Premium activated for KSh ${totalDue}/term for ${childCount || 1} child${childCount === 1 ? '' : 'ren'}`,
+    premium_due: totalDue,
+    premium_children_count: childCount || 1
+  });
 });
 
 // GET /api/parents/premium-status/:phone
+// Lightweight endpoint used at login to show renewal/locked UI before OTP. Returns no children.
 router.get('/premium-status/:phone', async (req, res) => {
+  const phone = req.params.phone;
   const [rows] = await req.db.execute(
     'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-    [req.params.phone]
+    [phone]
   );
-  if (rows.length === 0) return res.json({ is_premium: false });
+
+  const [childCountRows] = await req.db.execute(
+    'SELECT COUNT(*) AS child_count FROM student_parent_map m JOIN students s ON m.student_id = s.student_id WHERE m.parent_phone = ? AND s.enrollment_status = ?',
+    [phone, 'Active']
+  );
+  const childCount = childCountRows[0]?.child_count || 0;
+
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+  const premiumPrice = parseInt(setting[0]?.setting_value || '100');
+  const premiumTotal = premiumPrice * Math.max(childCount, 1);
+
+  const registered = rows.length > 0;
+
+  if (!registered) return res.json({ is_premium: false, registered: false, premium_children_count: childCount, premium_total: premiumTotal, premium_price: premiumPrice, renewal_required: true });
   const active = rows[0].is_premium && (!rows[0].premium_expires_at || new Date(rows[0].premium_expires_at) > new Date());
   res.json({
     is_premium: active,
-    expires_at: rows[0].premium_expires_at
+    registered: true,
+    expires_at: rows[0].premium_expires_at,
+    premium_children_count: childCount,
+    premium_total: premiumTotal,
+    premium_price: premiumPrice,
+    renewal_required: !active
   });
 });
 

@@ -4,7 +4,7 @@ const router = express.Router();
 router.get('/random', async (req, res) => {
   try {
     const [rows] = await req.db.execute(
-      `SELECT ad_id, banner_image_url, target_link, merchant_name, message
+      `SELECT ad_id, banner_image_url, target_link, merchant_name, merchant_phone, message
        FROM marketplace_campaigns
        WHERE status = 'Active' AND end_date >= CURDATE()
        ORDER BY RAND() LIMIT 1`

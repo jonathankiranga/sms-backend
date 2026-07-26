@@ -66,7 +66,17 @@ router.get('/statement/:student_id/:term/:year', async (req, res) => {
   }));
   const total_due = items.reduce((s, i) => s + i.effective_amount, 0);
   const total_paid = items.reduce((s, i) => s + i.paid, 0);
-  res.json({ items, total_due, total_paid, balance: total_due - total_paid });
+
+  // Fetch school contact to include on fee statement
+  const [studentInfo] = await req.db.execute('SELECT school_id FROM students WHERE student_id = ?', [student_id]);
+  const schoolId = studentInfo[0]?.school_id || null;
+  let schoolContact = null;
+  if (schoolId) {
+    const [srows] = await req.db.execute('SELECT school_id, school_name, contact_name, contact_phone, contact_email, contact_address, contact_website FROM schools WHERE school_id = ?', [schoolId]);
+    schoolContact = srows[0] || null;
+  }
+
+  res.json({ items, total_due, total_paid, balance: total_due - total_paid, school_contact: schoolContact });
 });
 
 // GET /api/fees/classes?school_id=X — for dropdown

@@ -1,0 +1,16 @@
+ALTER TABLE schools
+  ADD COLUMN IF NOT EXISTS mpesa_consumer_key VARCHAR(100) NULL,
+  ADD COLUMN IF NOT EXISTS mpesa_consumer_secret VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS mpesa_paybill VARCHAR(20) NULL,
+  ADD COLUMN IF NOT EXISTS mpesa_passkey VARCHAR(255) NULL,
+  ADD COLUMN IF NOT EXISTS mpesa_environment ENUM('sandbox','production') DEFAULT 'sandbox';
+
+ALTER TABLE payment_ledger
+  ADD COLUMN IF NOT EXISTS school_id CHAR(9) NULL,
+  ADD COLUMN IF NOT EXISTS term VARCHAR(20) NULL,
+  ADD COLUMN IF NOT EXISTS academic_year YEAR NULL,
+  ADD COLUMN IF NOT EXISTS recorded_by VARCHAR(100) NULL,
+  ADD COLUMN IF NOT EXISTS notes TEXT NULL,
+  ADD COLUMN IF NOT EXISTS reversed_at DATETIME NULL,
+  ADD COLUMN IF NOT EXISTS reversed_by VARCHAR(100) NULL,
+  ADD INDEX IF NOT EXISTS idx_ledger_school_term (school_id, term, academic_year);
