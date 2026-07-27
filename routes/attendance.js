@@ -90,7 +90,8 @@ router.post('/sync', async (req, res) => {
   } catch (err) {
     await connection.rollback();
     console.error('Attendance sync error:', err);
-    res.status(500).json({ error: err.message });
+    console.error('[ATTENDANCE]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   } finally {
     connection.release();
   }
@@ -110,7 +111,8 @@ router.get('/students/:teacher_id', async (req, res) => {
     );
     res.json({ students });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[ATTENDANCE]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

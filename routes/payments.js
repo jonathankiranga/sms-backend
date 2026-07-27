@@ -1,4 +1,5 @@
 const express = require('express');
+const { authenticate } = require('../lib/auth');
 const router = express.Router();
 
 // M-Pesa C2B confirmation callback (Safaricom → us)
@@ -115,7 +116,7 @@ router.post('/callback', async (req, res) => {
 // ===== Dynamic per-school M-Pesa routes =====
 
 // POST /v1/payments/:school_id/stkpush — initiate STK push using school's credentials
-router.post('/:school_id/stkpush', async (req, res) => {
+router.post('/:school_id/stkpush', authenticate, async (req, res) => {
   const { school_id } = req.params;
   const { phone, amount, reference, description } = req.body;
   if (!phone || !amount) return res.status(400).json({ error: 'phone and amount required' });
@@ -161,6 +162,45 @@ router.post('/:school_id/callback', async (req, res) => {
        VALUES (?, ?, ?, ?, 'M-Pesa', ?, ?, ?, NOW())`,
       [receipt, amount, phone, ref, school_id, Body.stkCallback.term || null, Body.stkCallback.year || null]
     );
+
+    // Handle bulk premium payment (BLK prefix) — school pays for all students
+    if (ref.startsWith('BLK-')) {
+      const paymentId = parseInt(ref.replace('BLK-', ''), 10);
+      const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
+      const currentYear = new Date().getFullYear();
+      // Mark the bulk payment as completed
+      await req.db.execute(
+        "UPDATE premium_bulk_payments SET payment_status = 'completed', paid_at = NOW(), transaction_reference = ? WHERE payment_id = ?",
+        [receipt, paymentId]
+      );
+      // Get all parents of active students in this school
+      const [parents] = await req.db.execute(
+        `SELECT DISTINCT spm.parent_phone
+         FROM student_parent_map spm
+         JOIN students s ON spm.student_id = s.student_id
+         WHERE s.school_id = ? AND s.enrollment_status = 'Active'`,
+        [school_id]
+      );
+      const expiresAt = new Date();
+      expiresAt.setMonth(expiresAt.getMonth() + 4);
+      for (const p of parents) {
+        await req.db.execute(
+          'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',
+          [p.parent_phone]
+        );
+        await req.db.execute(
+          `INSERT INTO premium_subscriptions (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
+           VALUES (?, ?, ?, ?, 'school', 'paid', 0, NOW(), ?)
+           ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at)`,
+          [school_id, p.parent_phone, currentTerm, currentYear, expiresAt]
+        );
+        await req.db.execute(
+          'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+          [expiresAt, p.parent_phone]
+        );
+      }
+      console.log(`[BLK][${school_id}] Bulk premium activated for ${parents.length} parents`);
+    }
 
     res.status(200).json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (err) {

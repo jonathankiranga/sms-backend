@@ -22,7 +22,7 @@ router.post('/register', async (req, res) => {
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sid = crypto.randomBytes(32).toString('hex');
   await req.db.execute('INSERT INTO otp_sessions (session_id, phone, code, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))', [sid, phone, code]);
-  console.log('=== OTP for merchant', phone, ':', code, '===');
+  if (process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
   res.json({ merchant_id: mid, session_id: sid, message: 'Registered. OTP sent.' });
 });
 
@@ -35,7 +35,7 @@ router.post('/request-otp', async (req, res) => {
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sid = crypto.randomBytes(32).toString('hex');
   await req.db.execute('INSERT INTO otp_sessions (session_id, phone, code, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))', [sid, phone, code]);
-  console.log('=== OTP for merchant', phone, ':', code, '===');
+  if (process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
   res.json({ session_id: sid, message: 'OTP sent' });
 });
 

@@ -13,7 +13,8 @@ router.post('/subscribe', async (req, res) => {
     );
     res.json({ subscribed: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[WEBPUSH]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -25,7 +26,8 @@ router.post('/unsubscribe', async (req, res) => {
     await req.db.execute('UPDATE teachers SET push_subscription = NULL WHERE teacher_id = ?', [teacher_id]);
     res.json({ unsubscribed: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[WEBPUSH]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

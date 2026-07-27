@@ -19,7 +19,7 @@ router.post('/request-otp', async (req, res) => {
     await sendOtp(phone, code);
   } catch (e) {
     console.error('OTP send failed (non-blocking):', e.message);
-    console.log('=== OTP for', phone, ':', code, '===');
+    if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', phone, ':', code, '===');
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
@@ -73,11 +73,49 @@ router.get('/dashboard/:phone', async (req, res) => {
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const premiumPrice = parseInt(setting[0]?.setting_value || '100');
-  const childCount = children.length || 0;
-  const premiumTotal = premiumPrice * Math.max(childCount, 1);
-  const premiumActive = Boolean(parent[0]?.is_premium) && (!parent[0]?.premium_expires_at || new Date(parent[0].premium_expires_at) > new Date());
 
-  // If the parent is not premium, hide children in the dashboard payload to enforce access control from login
+  // Check if school pays for premium
+  let schoolPays = false;
+  let schoolFee = premiumPrice;
+  if (schoolId) {
+    const [school] = await req.db.execute('SELECT premium_payment_model, premium_fee_per_term FROM schools WHERE school_id = ?', [schoolId]);
+    if (school.length > 0 && school[0].premium_payment_model === 'school') {
+      schoolPays = true;
+      schoolFee = school[0].premium_fee_per_term || premiumPrice;
+      // Auto-activate premium for this parent if school pays and not already premium
+      const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
+      const currentYear = new Date().getFullYear();
+      const [existingSub] = await req.db.execute(
+        'SELECT subscription_id FROM premium_subscriptions WHERE school_id = ? AND parent_phone = ? AND term = ? AND year = ? AND payment_status = ?',
+        [schoolId, phone, currentTerm, currentYear, 'paid']
+      );
+      if (existingSub.length === 0) {
+        // Check school-paid subscription exists
+        const [sub] = await req.db.execute(
+          'SELECT subscription_id FROM premium_subscriptions WHERE school_id = ? AND parent_phone = ? AND term = ? AND year = ? AND payment_model = ?',
+          [schoolId, phone, currentTerm, currentYear, 'school']
+        );
+        if (sub.length > 0) {
+          // Activate this parent
+          const expiresAt = new Date();
+          expiresAt.setMonth(expiresAt.getMonth() + 4);
+          await req.db.execute(
+            "UPDATE premium_subscriptions SET payment_status = 'paid', activated_at = NOW(), expires_at = ? WHERE subscription_id = ?",
+            [expiresAt, sub[0].subscription_id]
+          );
+          await req.db.execute(
+            'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+            [expiresAt, phone]
+          );
+        }
+      }
+    }
+  }
+
+  const childCount = children.length || 0;
+  const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
+  const premiumActive = schoolPays || (Boolean(parent[0]?.is_premium) && (!parent[0]?.premium_expires_at || new Date(parent[0].premium_expires_at) > new Date()));
+
   const payloadChildren = premiumActive ? children : [];
   const renewalRequired = !premiumActive;
 
@@ -85,12 +123,13 @@ router.get('/dashboard/:phone', async (req, res) => {
     parent: parent[0] || { is_premium: false },
     school_id: schoolId,
     children: payloadChildren,
-    premium_price: premiumPrice,
+    premium_price: schoolPays ? 0 : premiumPrice,
     premium_children_count: childCount,
     premium_total: premiumTotal,
     premium_active: premiumActive,
     premium_due: premiumActive ? 0 : premiumTotal,
-    renewal_required: renewalRequired
+    renewal_required: renewalRequired,
+    school_pays: schoolPays
   });
 });
 
@@ -98,6 +137,22 @@ router.get('/dashboard/:phone', async (req, res) => {
 router.post('/upgrade', async (req, res) => {
   const { phone } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone required' });
+
+  // Prevent parent payment if school pays
+  const [childSchools] = await req.db.execute(
+    'SELECT DISTINCT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ?',
+    [phone]
+  );
+  for (const cs of childSchools) {
+    const [school] = await req.db.execute('SELECT premium_payment_model FROM schools WHERE school_id = ?', [cs.school_id]);
+    if (school.length > 0 && school[0].premium_payment_model === 'school') {
+      return res.json({
+        transaction_ref: null,
+        status: 'school_paid',
+        message: 'Your school covers the premium subscription. You already have access.'
+      });
+    }
+  }
 
   const [childCountRows] = await req.db.execute(
     'SELECT COUNT(*) AS child_count FROM student_parent_map WHERE parent_phone = ?',
@@ -126,12 +181,14 @@ router.post('/upgrade', async (req, res) => {
         });
       }
       console.error('[MPESA] STK push failed:', result);
+      return res.status(502).json({ error: 'M-Pesa payment failed', detail: result.errorMessage || 'STK push rejected' });
     } catch (err) {
-      console.error('[MPESA] STK push error, falling back to simulated:', err.message);
+      console.error('[MPESA] STK push error:', err.message);
+      return res.status(502).json({ error: 'M-Pesa service unavailable' });
     }
   }
 
-  // Simulated upgrade — mark premium immediately (used when M-Pesa not configured)
+  // Simulated upgrade — mark premium immediately (used when M-Pesa not configured in dev)
   const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
   const expiresAt = new Date();
   expiresAt.setMonth(expiresAt.getMonth() + 4);
@@ -175,20 +232,43 @@ router.get('/premium-status/:phone', async (req, res) => {
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const premiumPrice = parseInt(setting[0]?.setting_value || '100');
-  const premiumTotal = premiumPrice * Math.max(childCount, 1);
 
+  // Check if any linked school pays for premium
+  let schoolPays = false;
+  let schoolFee = premiumPrice;
+  const [childSchools] = await req.db.execute(
+    'SELECT DISTINCT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ?',
+    [phone]
+  );
+  for (const cs of childSchools) {
+    const [school] = await req.db.execute('SELECT premium_payment_model, premium_fee_per_term FROM schools WHERE school_id = ?', [cs.school_id]);
+    if (school.length > 0 && school[0].premium_payment_model === 'school') {
+      schoolPays = true;
+      schoolFee = school[0].premium_fee_per_term || premiumPrice;
+      break;
+    }
+  }
+
+  const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
   const registered = rows.length > 0;
 
-  if (!registered) return res.json({ is_premium: false, registered: false, premium_children_count: childCount, premium_total: premiumTotal, premium_price: premiumPrice, renewal_required: true });
-  const active = rows[0].is_premium && (!rows[0].premium_expires_at || new Date(rows[0].premium_expires_at) > new Date());
+  if (!registered) return res.json({
+    is_premium: false, registered: false,
+    premium_children_count: childCount, premium_total: premiumTotal,
+    premium_price: schoolPays ? 0 : premiumPrice,
+    renewal_required: !schoolPays,
+    school_pays: schoolPays
+  });
+  const active = schoolPays || (rows[0].is_premium && (!rows[0].premium_expires_at || new Date(rows[0].premium_expires_at) > new Date()));
   res.json({
     is_premium: active,
     registered: true,
     expires_at: rows[0].premium_expires_at,
     premium_children_count: childCount,
     premium_total: premiumTotal,
-    premium_price: premiumPrice,
-    renewal_required: !active
+    premium_price: schoolPays ? 0 : premiumPrice,
+    renewal_required: !active,
+    school_pays: schoolPays
   });
 });
 

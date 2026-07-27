@@ -11,7 +11,8 @@ router.get('/random', async (req, res) => {
     );
     res.json(rows[0] || null);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[ADS]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -26,7 +27,8 @@ router.get('/:school_id', async (req, res) => {
     );
     res.json(rows[0] || null);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('[ADS]', err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
