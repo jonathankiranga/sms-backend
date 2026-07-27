@@ -70,15 +70,21 @@ router.post('/results', async (req, res) => {
   const { assessment_id, results } = req.body;
   if (!assessment_id || !results?.length) return res.status(400).json({ error: 'assessment_id and results required' });
 
+  const { getRubricConfig, getLevel } = require('../lib/config');
+  // Fetch rubric config from the assessment's school
+  const [assessSchool] = await req.db.execute(
+    'SELECT c.school_id FROM assessments a JOIN classes c ON a.class_id = c.class_id WHERE a.assessment_id = ?',
+    [assessment_id]
+  );
+  const rubricConfig = assessSchool.length > 0 ? await getRubricConfig(req.db, assessSchool[0].school_id) : [];
+
   const conn = await req.db.getConnection();
   try {
     await conn.beginTransaction();
     for (const r of results) {
       const pct = r.score / (r.max_score || 100);
-      let level = 'BE';
-      if (pct >= 0.8) level = 'EE';
-      else if (pct >= 0.6) level = 'ME';
-      else if (pct >= 0.4) level = 'AE';
+      const matched = getLevel(pct, rubricConfig);
+      const level = matched ? matched.level_code : 'BE';
       await conn.execute(
         `INSERT INTO assessment_results (assessment_id, student_id, score, performance_level)
          VALUES (?, ?, ?, ?)
@@ -111,10 +117,8 @@ router.post('/results', async (req, res) => {
           );
           for (const parent of parents) {
             const pct = r.score / (r.max_score || assessInfo[0].max_score || 100);
-            let level = 'BE';
-            if (pct >= 0.8) level = 'EE';
-            else if (pct >= 0.6) level = 'ME';
-            else if (pct >= 0.4) level = 'AE';
+            const matched = getLevel(pct, rubricConfig);
+            const level = matched ? matched.level_code : 'BE';
             sendAssessmentAlert(parent.parent_phone, studentName, assessInfo[0].area_name, r.score.toString(), level).catch(e => console.error('[WA] Assessment alert failed:', e.message));
           }
         }

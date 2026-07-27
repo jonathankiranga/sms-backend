@@ -29,9 +29,19 @@ router.post('/mpesa', async (req, res) => {
       );
     }
 
+    // Resolve school from student to compute term-based expiry
+    let c2bExpires = new Date(Date.now() + 90 * 86400000);
+    const [c2bStudent] = await connection.execute('SELECT school_id FROM students WHERE student_id = ?', [BillRefNumber]);
+    if (c2bStudent.length > 0) {
+      const [c2bTerm] = await connection.execute(
+        'SELECT MIN(start_date) AS next_start FROM school_terms WHERE school_id = ? AND start_date > CURDATE()',
+        [c2bStudent[0].school_id]
+      );
+      if (c2bTerm.length > 0 && c2bTerm[0].next_start) c2bExpires = new Date(c2bTerm[0].next_start);
+    }
     await connection.execute(
-      `UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = DATE_ADD(NOW(), INTERVAL 90 DAY) WHERE parent_phone = ?`,
-      [MSISDN]
+      'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+      [c2bExpires, MSISDN]
     );
 
     await connection.execute(
@@ -82,13 +92,24 @@ router.post('/callback', async (req, res) => {
 
     // If reference starts with UPG, it's a premium upgrade for a parent
     if (ref.startsWith('UPG')) {
-      await req.db.execute(
-        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = DATE_ADD(NOW(), INTERVAL 90 DAY) WHERE parent_phone = ?',
+      // Resolve school from parent's linked children to compute term-based expiry
+      const [link] = await req.db.execute(
+        'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
         [phone]
       );
+      let expiresAt = new Date(Date.now() + 90 * 86400000);
+      if (link.length > 0) {
+        const [termRow] = await req.db.execute(
+          'SELECT MIN(start_date) AS next_start FROM school_terms WHERE school_id = ? AND start_date > CURDATE()',
+          [link[0].school_id]
+        );
+        if (termRow.length > 0 && termRow[0].next_start) {
+          expiresAt = new Date(termRow[0].next_start);
+        }
+      }
       await req.db.execute(
-        'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, TRUE)',
-        [phone]
+        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+        [expiresAt, phone]
       );
     }
 
@@ -181,8 +202,8 @@ router.post('/:school_id/callback', async (req, res) => {
          WHERE s.school_id = ? AND s.enrollment_status = 'Active'`,
         [school_id]
       );
-      const expiresAt = new Date();
-      expiresAt.setMonth(expiresAt.getMonth() + 4);
+      const { getNextTermStart } = require('../lib/config');
+      const expiresAt = await getNextTermStart(req.db, school_id);
       for (const p of parents) {
         await req.db.execute(
           'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',

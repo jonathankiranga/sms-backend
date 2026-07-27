@@ -177,17 +177,17 @@ router.post('/:id/results', async (req, res) => {
     }
   }
 
+  const { getRubricConfig, getLevel } = require('../lib/config');
+  const rubricConfig = await getRubricConfig(req.db, session.school_id);
+
   const conn = await req.db.getConnection();
   try {
     await conn.beginTransaction();
-    let savedCount = 0;
     for (const r of results) {
       if (!r.student_id || !r.sub_area_id || r.score === undefined || r.out_of === undefined) continue;
       const pct = r.out_of > 0 ? r.score / r.out_of : 0;
-      let level = 'BE';
-      if (pct >= 0.8) level = 'EE';
-      else if (pct >= 0.6) level = 'ME';
-      else if (pct >= 0.4) level = 'AE';
+      const matched = getLevel(pct, rubricConfig);
+      const level = matched ? matched.level_code : 'BE';
 
       await conn.execute(
         `INSERT INTO exam_results (session_id, student_id, sub_area_id, score, out_of, performance_level, entered_by)

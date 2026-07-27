@@ -83,7 +83,8 @@ router.get('/dashboard/:phone', async (req, res) => {
       schoolPays = true;
       schoolFee = school[0].premium_fee_per_term || premiumPrice;
       // Auto-activate premium for this parent if school pays and not already premium
-      const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
+      const { getCurrentTerm, getNextTermStart } = require('../lib/config');
+      const currentTerm = await getCurrentTerm(req.db, schoolId);
       const currentYear = new Date().getFullYear();
       const [existingSub] = await req.db.execute(
         'SELECT subscription_id FROM premium_subscriptions WHERE school_id = ? AND parent_phone = ? AND term = ? AND year = ? AND payment_status = ?',
@@ -96,9 +97,8 @@ router.get('/dashboard/:phone', async (req, res) => {
           [schoolId, phone, currentTerm, currentYear, 'school']
         );
         if (sub.length > 0) {
-          // Activate this parent
-          const expiresAt = new Date();
-          expiresAt.setMonth(expiresAt.getMonth() + 4);
+          // Activate this parent until next term starts
+          const expiresAt = await getNextTermStart(req.db, schoolId);
           await req.db.execute(
             "UPDATE premium_subscriptions SET payment_status = 'paid', activated_at = NOW(), expires_at = ? WHERE subscription_id = ?",
             [expiresAt, sub[0].subscription_id]
@@ -189,9 +189,13 @@ router.post('/upgrade', async (req, res) => {
   }
 
   // Simulated upgrade — mark premium immediately (used when M-Pesa not configured in dev)
-  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
-  const expiresAt = new Date();
-  expiresAt.setMonth(expiresAt.getMonth() + 4);
+  const { getNextTermStart } = require('../lib/config');
+  const [schoolRows] = await req.db.execute(
+    'SELECT DISTINCT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
+    [phone]
+  );
+  const schoolIdForExpiry = schoolRows[0]?.school_id;
+  const expiresAt = schoolIdForExpiry ? await getNextTermStart(req.db, schoolIdForExpiry) : new Date(Date.now() + 120 * 86400000);
 
   if (existing.length > 0) {
     await req.db.execute(
@@ -317,6 +321,155 @@ router.post('/fee-reminder', async (req, res) => {
     }
   }
   res.json({ sent, total: children.length });
+});
+
+// GET /api/parents/academic-records/:phone — free endpoint, no premium check
+router.get('/academic-records/:phone', async (req, res) => {
+  const { phone } = req.params;
+  if (!phone) return res.status(400).json({ error: 'Phone required' });
+
+  const { getCurrentTerm, getRubricConfig, getLevel } = require('../lib/config');
+
+  const [children] = await req.db.execute(
+    `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+     FROM students s
+     JOIN classes c ON s.class_id = c.class_id
+     JOIN student_parent_map m ON s.student_id = m.student_id
+     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
+    [phone]
+  );
+
+  const result = [];
+  for (const child of children) {
+    const rubricConfig = await getRubricConfig(req.db, child.school_id);
+    const currentTerm = await getCurrentTerm(req.db, child.school_id);
+    const currentYear = new Date().getFullYear();
+
+    // Current term — assessment results by learning area
+    const [currentAreas] = await req.db.execute(
+      `SELECT la.area_id, la.area_name,
+              AVG(ar.score / a.max_score) * 100 AS avg_pct
+       FROM assessment_results ar
+       JOIN assessments a ON ar.assessment_id = a.assessment_id
+       JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
+       JOIN strands st ON ss.strand_id = st.strand_id
+       JOIN learning_areas la ON st.area_id = la.area_id
+       WHERE ar.student_id = ? AND st.term = ? AND YEAR(a.date) = ?
+       GROUP BY la.area_id, la.area_name
+       ORDER BY la.area_name`,
+      [child.student_id, currentTerm, currentYear]
+    );
+
+    // Current term — exam results by learning area
+    const [currentExamAreas] = await req.db.execute(
+      `SELECT la.area_id, la.area_name,
+              AVG(er.score / er.out_of) * 100 AS avg_pct
+       FROM exam_results er
+       JOIN exam_sessions es ON er.session_id = es.session_id
+       JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+       JOIN learning_areas la ON sla.area_id = la.area_id
+       WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
+       GROUP BY la.area_id, la.area_name
+       ORDER BY la.area_name`,
+      [child.student_id, currentTerm, currentYear]
+    );
+
+    // Merge assessment + exam results
+    const areaMap = new Map();
+    for (const a of currentAreas) {
+      areaMap.set(a.area_name, { area_id: a.area_id, area_name: a.area_name, avg_pct: parseFloat(a.avg_pct) || 0 });
+    }
+    for (const a of currentExamAreas) {
+      if (areaMap.has(a.area_name)) {
+        areaMap.get(a.area_name).avg_pct = Math.max(areaMap.get(a.area_name).avg_pct, parseFloat(a.avg_pct) || 0);
+      } else {
+        areaMap.set(a.area_name, { area_id: a.area_id, area_name: a.area_name, avg_pct: parseFloat(a.avg_pct) || 0 });
+      }
+    }
+    const currentAreasList = [];
+    for (const entry of areaMap.values()) {
+      const matched = getLevel(entry.avg_pct / 100, rubricConfig);
+      currentAreasList.push({
+        area_name: entry.area_name,
+        avg_pct: Math.round(entry.avg_pct * 10) / 10,
+        level: matched ? matched.level_code : 'BE',
+        label: matched ? matched.label : 'Below Expectations',
+        color: matched ? matched.color : '#C62828'
+      });
+    }
+
+    // Archive — distinct years/terms with data (excluding current)
+    const [archiveYears] = await req.db.execute(
+      `SELECT DISTINCT YEAR(a.date) AS year, st.term
+       FROM assessment_results ar
+       JOIN assessments a ON ar.assessment_id = a.assessment_id
+       JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
+       JOIN strands st ON ss.strand_id = st.strand_id
+       WHERE ar.student_id = ?
+       UNION
+       SELECT DISTINCT es.academic_year AS year, es.term
+       FROM exam_results er
+       JOIN exam_sessions es ON er.session_id = es.session_id
+       WHERE er.student_id = ?
+       ORDER BY year DESC, term`,
+      [child.student_id, child.student_id]
+    );
+
+    const archive = [];
+    const yearMap = new Map();
+    for (const row of archiveYears) {
+      if (row.year === currentYear) continue;
+      if (!yearMap.has(row.year)) yearMap.set(row.year, []);
+      yearMap.get(row.year).push(row.term);
+    }
+    for (const [year, terms] of yearMap) {
+      const termData = [];
+      for (const term of terms) {
+        // Area averages for this archived term
+        const [areas] = await req.db.execute(
+          `SELECT la.area_name,
+                  AVG(ar.score / a.max_score) * 100 AS avg_pct
+           FROM assessment_results ar
+           JOIN assessments a ON ar.assessment_id = a.assessment_id
+           JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
+           JOIN strands st ON ss.strand_id = st.strand_id
+           JOIN learning_areas la ON st.area_id = la.area_id
+           WHERE ar.student_id = ? AND st.term = ? AND YEAR(a.date) = ?
+           GROUP BY la.area_name
+           ORDER BY la.area_name`,
+          [child.student_id, term, year]
+        );
+        termData.push({
+          term,
+          areas: areas.map(a => {
+            const matched = getLevel((parseFloat(a.avg_pct) || 0) / 100, rubricConfig);
+            return {
+              area_name: a.area_name,
+              avg_pct: Math.round((parseFloat(a.avg_pct) || 0) * 10) / 10,
+              level: matched ? matched.level_code : 'BE',
+              label: matched ? matched.label : 'Below Expectations',
+              color: matched ? matched.color : '#C62828'
+            };
+          })
+        });
+      }
+      archive.push({ year, terms: termData });
+    }
+
+    result.push({
+      student_id: child.student_id,
+      full_name: child.full_name,
+      class_name: child.class_name,
+      current: {
+        term: currentTerm,
+        year: currentYear,
+        areas: currentAreasList
+      },
+      archive
+    });
+  }
+
+  res.json(result);
 });
 
 module.exports = router;
