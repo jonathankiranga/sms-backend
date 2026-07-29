@@ -40,10 +40,12 @@ const otpLimiter = rateLimit({
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-      return;
-    }
+    if (!origin) return callback(null, true); // allow non-browser requests
+    // Allow exact configured origins
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Allow any Vercel preview deployment for this project
+    if (/^https:\/\/.*jonathankirangas-projects\.vercel\.app$/.test(origin)) return callback(null, true);
+    if (/^https:\/\/.*\.vercel\.app$/.test(origin)) return callback(null, true);
     callback(new Error(`Origin ${origin} not allowed by CORS`));
   },
   methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH']
