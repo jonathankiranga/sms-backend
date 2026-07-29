@@ -29,7 +29,9 @@ const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-front
 const configuredOrigins = (process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean);
 const allowedOrigins = [...new Set([...configuredOrigins, ...defaultOrigins.split(',')])];
 
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: false  // CSP handled by frontend, not the API server
+}));
 app.set('trust proxy', 1);
 
 const otpLimiter = rateLimit({
