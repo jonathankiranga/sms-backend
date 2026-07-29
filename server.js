@@ -50,21 +50,39 @@ app.use(cors({
 }));
 app.use(express.json());
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  port: parseInt(process.env.DB_PORT || '4000'),
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  ssl: process.env.DB_SSL === 'false' ? false : (
-    process.env.DB_SSL_CA
-      ? { ca: process.env.DB_SSL_CA }          // Aiven-style with CA cert
-      : { minVersion: 'TLSv1.2' }              // TiDB Cloud — uses system roots, no CA file needed
-  ),
-  waitForConnections: true,
-  connectionLimit: 5,
-  queueLimit: 0
-});
+// Support both DATABASE_URL connection string and individual DB_* env vars
+let poolConfig;
+if (process.env.DATABASE_URL) {
+  const u = new URL(process.env.DATABASE_URL);
+  poolConfig = {
+    host: u.hostname,
+    port: parseInt(u.port) || 4000,
+    user: u.username,
+    password: u.password,
+    database: u.pathname.replace('/', ''),
+    ssl: { minVersion: 'TLSv1.2' },
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0
+  };
+} else {
+  poolConfig = {
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT || '4000'),
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    ssl: process.env.DB_SSL === 'false' ? false : (
+      process.env.DB_SSL_CA
+        ? { ca: process.env.DB_SSL_CA }
+        : { minVersion: 'TLSv1.2' }
+    ),
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0
+  };
+}
+const pool = mysql.createPool(poolConfig);
 
 // Migration runner: if RUN_MIGRATIONS=true (and not blocked in production) the server will execute .sql files from backend/scripts in filename order.
 async function runMigrationsIfNeeded() {
