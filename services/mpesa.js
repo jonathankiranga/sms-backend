@@ -36,7 +36,10 @@ async function stkPush(phone, amount, reference, description, schoolCreds) {
 
   const cleanPhone = phone.replace(/^0+/, '254').replace(/^\+/, '');
   const baseUrl = process.env.BASE_URL || 'https://sms-backend-r0tn.onrender.com';
-  const callbackUrl = `${baseUrl}/v1/payments/${schoolId}/callback`;
+  // Use school-specific callback if schoolId is known, otherwise use the generic callback
+  const callbackUrl = (schoolId && schoolId !== 'default')
+    ? `${baseUrl}/v1/payments/${schoolId}/callback`
+    : `${baseUrl}/v1/payments/callback`;
 
   const resp = await fetch(`${getBaseUrl(env)}/mpesa/stkpush/v1/processrequest`, {
     method: 'POST',

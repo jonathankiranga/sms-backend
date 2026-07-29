@@ -83,16 +83,38 @@ router.post('/callback', async (req, res) => {
       return item ? item.Value : null;
     };
 
-    const phone = (getVal('PhoneNumber') || '').toString();
+    const phoneOrHash = (getVal('PhoneNumber') || '').toString();
     const amount = parseFloat(getVal('Amount') || 0);
     const receipt = (getVal('MpesaReceiptNumber') || '').toString();
     const ref = (Body.stkCallback.AccountReference || '').toString();
 
-    console.log(`[STK] ${phone} paid KSh ${amount} — ref ${receipt} (${ref})`);
+    console.log(`[STK] Payment received — ref ${receipt} (${ref}), amount KSh ${amount}`);
+
+    // Phone number may be hashed (SHA-256) due to data protection. 
+    // If it's a 64-char hex string, it's a hash — we need to match by reference instead
+    const isHashed = /^[a-f0-9]{64}$/i.test(phoneOrHash);
+    let phone = phoneOrHash;
 
     // If reference starts with UPG, it's a premium upgrade for a parent
     if (ref.startsWith('UPG')) {
-      // Resolve school from parent's linked children to compute term-based expiry
+      if (isHashed) {
+        // Look up the original phone from the pending record we stored before STK push
+        const [pending] = await req.db.execute(
+          "SELECT parent_phone FROM payment_ledger WHERE transaction_reference = ? AND notes = 'STK_PENDING' LIMIT 1",
+          [ref]
+        );
+        if (pending.length > 0) {
+          phone = pending[0].parent_phone;
+          console.log(`[STK] Resolved hashed phone to ${phone} via pending record`);
+        } else {
+          console.warn(`[STK] Cannot resolve hashed phone for ref ${ref} — no pending record found`);
+          await req.db.execute(
+            'INSERT IGNORE INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes) VALUES (?, ?, ?, ?, ?, NOW(), ?)',
+            [receipt, amount, phoneOrHash, ref, 'M-Pesa', 'HASHED_PHONE_UNRESOLVED']
+          );
+          return res.status(200).json({ ResultCode: 0, ResultDesc: 'Success — pending manual reconciliation' });
+        }
+      }
       const [link] = await req.db.execute(
         'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
         [phone]
@@ -111,6 +133,11 @@ router.post('/callback', async (req, res) => {
         'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
         [expiresAt, phone]
       );
+      // Mark the pending record as completed
+      await req.db.execute(
+        "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
+        [receipt, ref]
+      );
     }
 
     // If reference starts with CAM, it's a merchant campaign payment
@@ -123,7 +150,7 @@ router.post('/callback', async (req, res) => {
     }
 
     await req.db.execute(
-      'INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at) VALUES (?, ?, ?, ?, ?, NOW())',
+      'INSERT IGNORE INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at) VALUES (?, ?, ?, ?, ?, NOW())',
       [receipt, amount, phone, ref, 'M-Pesa']
     );
 

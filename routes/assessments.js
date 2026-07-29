@@ -70,21 +70,15 @@ router.post('/results', async (req, res) => {
   const { assessment_id, results } = req.body;
   if (!assessment_id || !results?.length) return res.status(400).json({ error: 'assessment_id and results required' });
 
-  const { getRubricConfig, getLevel } = require('../lib/config');
-  // Fetch rubric config from the assessment's school
-  const [assessSchool] = await req.db.execute(
-    'SELECT c.school_id FROM assessments a JOIN classes c ON a.class_id = c.class_id WHERE a.assessment_id = ?',
-    [assessment_id]
-  );
-  const rubricConfig = assessSchool.length > 0 ? await getRubricConfig(req.db, assessSchool[0].school_id) : [];
-
   const conn = await req.db.getConnection();
   try {
     await conn.beginTransaction();
     for (const r of results) {
       const pct = r.score / (r.max_score || 100);
-      const matched = getLevel(pct, rubricConfig);
-      const level = matched ? matched.level_code : 'BE';
+      let level = 'BE';
+      if (pct >= 0.8) level = 'EE';
+      else if (pct >= 0.6) level = 'ME';
+      else if (pct >= 0.4) level = 'AE';
       await conn.execute(
         `INSERT INTO assessment_results (assessment_id, student_id, score, performance_level)
          VALUES (?, ?, ?, ?)
@@ -117,8 +111,10 @@ router.post('/results', async (req, res) => {
           );
           for (const parent of parents) {
             const pct = r.score / (r.max_score || assessInfo[0].max_score || 100);
-            const matched = getLevel(pct, rubricConfig);
-            const level = matched ? matched.level_code : 'BE';
+            let level = 'BE';
+            if (pct >= 0.8) level = 'EE';
+            else if (pct >= 0.6) level = 'ME';
+            else if (pct >= 0.4) level = 'AE';
             sendAssessmentAlert(parent.parent_phone, studentName, assessInfo[0].area_name, r.score.toString(), level).catch(e => console.error('[WA] Assessment alert failed:', e.message));
           }
         }
@@ -152,6 +148,9 @@ router.get('/results/:assessment_id', async (req, res) => {
 // GET /api/assessments/report/:student_id/:term
 router.get('/report/:student_id/:term', async (req, res) => {
   const { student_id, term } = req.params;
+  const { year } = req.query;
+  const reportYear = parseInt(year) || new Date().getFullYear();
+
   const [student] = await req.db.execute(
     `SELECT s.student_id, s.full_name, c.class_name, s.school_id
      FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.student_id = ?`,
@@ -159,7 +158,8 @@ router.get('/report/:student_id/:term', async (req, res) => {
   );
   if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
 
-  const [areas] = await req.db.execute(
+  // Strand-based assessment results (formative)
+  const [strandAreas] = await req.db.execute(
     `SELECT la.area_id, la.area_name,
             ROUND(AVG(r.score/a.max_score)*100, 1) AS avg_pct,
             GROUP_CONCAT(DISTINCT CONCAT(s.strand_name, ':', r.performance_level) SEPARATOR ', ') AS strand_summary
@@ -168,10 +168,47 @@ router.get('/report/:student_id/:term', async (req, res) => {
      JOIN sub_strands ss ON s.strand_id = ss.strand_id
      JOIN assessments a ON ss.sub_strand_id = a.sub_strand_id
      JOIN assessment_results r ON a.assessment_id = r.assessment_id AND r.student_id = ?
+     WHERE YEAR(a.date) = ?
      GROUP BY la.area_id, la.area_name
      ORDER BY la.area_name`,
-    [term, student_id]
+    [term, student_id, reportYear]
   );
+
+  // Exam session results (CAT / End Term)
+  const [examAreas] = await req.db.execute(
+    `SELECT la.area_id, la.area_name,
+            ROUND(AVG(er.score / er.out_of) * 100, 1) AS avg_pct,
+            GROUP_CONCAT(DISTINCT CONCAT(es.exam_type, ':', er.performance_level) SEPARATOR ', ') AS strand_summary
+     FROM exam_results er
+     JOIN exam_sessions es ON er.session_id = es.session_id
+     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+     JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
+     GROUP BY la.area_id, la.area_name
+     ORDER BY la.area_name`,
+    [student_id, term, reportYear]
+  );
+
+  // Merge both sources — exam results take priority if both exist for same area
+  const areaMap = new Map();
+  for (const a of strandAreas) {
+    areaMap.set(a.area_id, { ...a, source: 'assessment' });
+  }
+  for (const a of examAreas) {
+    if (areaMap.has(a.area_id)) {
+      // average both sources
+      const existing = areaMap.get(a.area_id);
+      areaMap.set(a.area_id, {
+        ...existing,
+        avg_pct: Math.round(((parseFloat(existing.avg_pct) || 0) + (parseFloat(a.avg_pct) || 0)) / 2 * 10) / 10,
+        strand_summary: [existing.strand_summary, a.strand_summary].filter(Boolean).join(', '),
+        source: 'both'
+      });
+    } else {
+      areaMap.set(a.area_id, { ...a, source: 'exam' });
+    }
+  }
+  const areas = Array.from(areaMap.values()).sort((a, b) => a.area_name.localeCompare(b.area_name));
 
   const [attendance] = await req.db.execute(
     `SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) AS present
@@ -199,12 +236,15 @@ router.get('/report/:student_id/:term', async (req, res) => {
     layout_json: null
   };
 
-  // Fetch school contact details to include on the report (contact form displayed on academic reports and fee statements)
-  const [schoolInfo] = await req.db.execute('SELECT school_id, school_name, contact_name, contact_phone, contact_email, contact_address, contact_website FROM schools WHERE school_id = ?', [student[0].school_id]);
+  const [schoolInfo] = await req.db.execute(
+    'SELECT school_id, school_name, contact_name, contact_phone, contact_email, contact_address, contact_website FROM schools WHERE school_id = ?',
+    [student[0].school_id]
+  );
 
   res.json({
     student: student[0],
     term,
+    year: reportYear,
     areas,
     attendance: attendance[0],
     report_settings: settings,

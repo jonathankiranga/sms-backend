@@ -164,7 +164,17 @@ router.post('/upgrade', async (req, res) => {
   const pricePerChild = parseInt(setting[0]?.setting_value || '100');
   const totalDue = pricePerChild * Math.max(childCount, 1);
 
-  const txnRef = 'UPG' + Date.now().toString(36).toUpperCase();
+  // Reference includes last 6 digits of phone + timestamp — unique per parent even if concurrent
+  const phoneSuffix = phone.replace(/\D/g, '').slice(-6);
+  const txnRef = 'UPG' + phoneSuffix + Date.now().toString(36).toUpperCase();
+
+  // Store the pending upgrade so we can match it in the callback
+  // even if Safaricom returns a hashed phone number
+  await req.db.execute(
+    `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes)
+     VALUES (?, ?, ?, ?, 'M-Pesa-Pending', NOW(), 'STK_PENDING')`,
+    [txnRef, totalDue, phone, txnRef]
+  );
 
   // Try real M-Pesa STK push if credentials are configured
   if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE) {
@@ -197,6 +207,7 @@ router.post('/upgrade', async (req, res) => {
   const schoolIdForExpiry = schoolRows[0]?.school_id;
   const expiresAt = schoolIdForExpiry ? await getNextTermStart(req.db, schoolIdForExpiry) : new Date(Date.now() + 120 * 86400000);
 
+  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
   if (existing.length > 0) {
     await req.db.execute(
       'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
@@ -274,6 +285,65 @@ router.get('/premium-status/:phone', async (req, res) => {
     renewal_required: !active,
     school_pays: schoolPays
   });
+});
+
+// GET /api/parents/payment-status — poll after STK push to check if payment completed
+router.get('/payment-status', async (req, res) => {
+  const { checkout_request_id, phone } = req.query;
+  if (!checkout_request_id && !phone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
+
+  // Check if the pending record was updated to STK_COMPLETED (callback arrived)
+  const [rows] = await req.db.execute(
+    `SELECT notes, transaction_reference, amount FROM payment_ledger
+     WHERE (student_reference LIKE 'UPG%' OR transaction_reference LIKE 'UPG%')
+       AND parent_phone = ?
+       AND notes IN ('STK_COMPLETED', 'STK_PENDING')
+     ORDER BY logged_at DESC LIMIT 1`,
+    [phone]
+  );
+
+  if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
+    // Also verify parent_profiles is_premium is now true
+    const [p] = await req.db.execute(
+      'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+      [phone]
+    );
+    return res.json({
+      status: 'completed',
+      is_premium: p[0]?.is_premium || false,
+      premium_expires_at: p[0]?.premium_expires_at || null
+    });
+  }
+
+  if (rows.length > 0 && rows[0].notes === 'STK_PENDING') {
+    // Check if Safaricom already confirmed via STK query
+    if (process.env.MPESA_CONSUMER_KEY && checkout_request_id) {
+      try {
+        const mpesa = require('../services/mpesa');
+        const queryResult = await mpesa.stkPushQuery(checkout_request_id);
+        if (queryResult.ResultCode === '0' || queryResult.ResultCode === 0) {
+          return res.json({ status: 'completed' });
+        }
+        if (queryResult.ResultCode === '1032') {
+          return res.json({ status: 'failed', reason: 'Cancelled by user' });
+        }
+        if (queryResult.ResultCode === '1') {
+          return res.json({ status: 'failed', reason: 'Insufficient funds or wrong PIN' });
+        }
+      } catch (e) {
+        console.error('[PAYMENT STATUS] STK query failed:', e.message);
+      }
+    }
+    return res.json({ status: 'pending' });
+  }
+
+  // No pending record found — check if already premium (paid via another path)
+  const [p] = await req.db.execute(
+    'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+    [phone]
+  );
+  const active = p[0]?.is_premium && (!p[0]?.premium_expires_at || new Date(p[0].premium_expires_at) > new Date());
+  return res.json({ status: active ? 'completed' : 'pending' });
 });
 
 // POST /api/parents/fee-reminder — send fee balance to parent's WhatsApp

@@ -52,11 +52,15 @@ app.use(express.json());
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
-  port: parseInt(process.env.DB_PORT || '3306'),
+  port: parseInt(process.env.DB_PORT || '4000'),
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
-  ssl: process.env.DB_SSL === 'true' ? (process.env.DB_SSL_CA ? { ca: process.env.DB_SSL_CA } : {}) : process.env.DB_SSL_CA ? { ca: process.env.DB_SSL_CA } : false,
+  ssl: process.env.DB_SSL === 'false' ? false : (
+    process.env.DB_SSL_CA
+      ? { ca: process.env.DB_SSL_CA }          // Aiven-style with CA cert
+      : { minVersion: 'TLSv1.2' }              // TiDB Cloud — uses system roots, no CA file needed
+  ),
   waitForConnections: true,
   connectionLimit: 5,
   queueLimit: 0
