@@ -50,11 +50,30 @@ router.post('/verify-otp', async (req, res) => {
   res.json({ phone, verified: true, registered, linked_children: linkedChildren });
 });
 
+// GET /api/parents/my-schools/:phone — returns all schools a parent has children in
+router.get('/my-schools/:phone', async (req, res) => {
+  const { phone } = req.params;
+  const [rows] = await req.db.execute(
+    `SELECT DISTINCT sc.school_id, sc.school_name, sc.region, sc.contact_phone,
+            COUNT(s.student_id) AS children_count
+     FROM student_parent_map m
+     JOIN students s ON m.student_id = s.student_id AND s.enrollment_status = 'Active'
+     JOIN schools sc ON s.school_id = sc.school_id
+     WHERE m.parent_phone = ?
+     GROUP BY sc.school_id, sc.school_name, sc.region, sc.contact_phone
+     ORDER BY sc.school_name`,
+    [phone]
+  );
+  res.json({ schools: rows });
+});
+
 router.get('/dashboard/:phone', async (req, res) => {
   const { phone } = req.params;
+  const { school_id: filterSchoolId } = req.query;
 
   const [children] = await req.db.execute(
     `SELECT s.student_id, s.full_name, c.class_name, s.school_id,
+       sc.school_name,
        (SELECT status FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS last_attendance,
        (SELECT attendance_date FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS last_date,
        (SELECT marked_at FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS arrival_time,
@@ -62,9 +81,12 @@ router.get('/dashboard/:phone', async (req, res) => {
        (SELECT logged_at FROM payment_ledger WHERE student_reference = s.student_id AND reversed_at IS NULL ORDER BY logged_at DESC LIMIT 1) AS last_payment_date
      FROM students s
      JOIN classes c ON s.class_id = c.class_id
+     JOIN schools sc ON s.school_id = sc.school_id
      JOIN student_parent_map m ON s.student_id = m.student_id
-     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
-    [phone]
+     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'
+       ${filterSchoolId ? 'AND s.school_id = ?' : ''}
+     ORDER BY sc.school_name, s.full_name`,
+    filterSchoolId ? [phone, filterSchoolId] : [phone]
   );
 
   const schoolId = children.length > 0 ? children[0].school_id : null;
