@@ -198,6 +198,233 @@ app.use('/api/assessments', assessmentRoutes);
 app.use('/api/schools', schoolRoutes);
 app.use('/api/merchants', merchantRoutes);
 app.use('/api/fees', feeRoutes);
+
+// ─── ONE-TIME DEMO SEED ENDPOINT ─────────────────────────────────────────────
+// Protected by SEED_SECRET env var. Hit once to populate demo data, then
+// remove SEED_SECRET from Render env vars to disable permanently.
+app.post('/api/seed-demo', async (req, res) => {
+  const secret = process.env.SEED_SECRET;
+  if (!secret) return res.status(403).json({ error: 'SEED_SECRET not configured — seed disabled' });
+  if (req.headers['x-seed-secret'] !== secret) return res.status(401).json({ error: 'Invalid seed secret' });
+
+  const db = req.db;
+  const DEMO_SCHOOL_ID = 'DEM000001';
+  const DEMO_YEAR = 2026;
+  const log = [];
+
+  try {
+    // School
+    await db.execute(`INSERT IGNORE INTO schools
+      (school_id, school_name, region, contact_name, contact_phone, contact_email)
+      VALUES (?, 'Greenfield Academy', 'Nairobi', 'Jonathan Kiranga', '254712345678', 'jonathankiranga@gmail.com')`,
+      [DEMO_SCHOOL_ID]);
+    log.push('✓ School: Greenfield Academy');
+
+    // Headteacher — you
+    await db.execute(`INSERT IGNORE INTO teachers
+      (teacher_id, full_name, phone, email, role, school_id)
+      VALUES ('TCHWX001', 'Jonathan Kiranga', '254712345678', 'jonathankiranga@gmail.com', 'head', ?)`,
+      [DEMO_SCHOOL_ID]);
+    log.push('✓ Headteacher: jonathankiranga@gmail.com');
+
+    // Class teacher
+    await db.execute(`INSERT IGNORE INTO teachers
+      (teacher_id, full_name, phone, email, role, school_id)
+      VALUES ('TCHWX002', 'Mary Wanjiku', '254722000001', 'mary.wanjiku@demo.com', 'teacher', ?)`,
+      [DEMO_SCHOOL_ID]);
+    log.push('✓ Teacher: Mary Wanjiku');
+
+    // Classes
+    const classes = [
+      ['Grade 1', 1], ['Grade 2', 2], ['Grade 3', 3],
+      ['Grade 4', 4], ['Grade 5', 5], ['Grade 6', 6]
+    ];
+    for (const [name, rank] of classes) {
+      await db.execute(`INSERT IGNORE INTO classes (school_id, class_name, level_name, academic_year, class_rank)
+        VALUES (?, ?, ?, ?, ?)`, [DEMO_SCHOOL_ID, name, name, DEMO_YEAR, rank]);
+    }
+    const [classRows] = await db.execute('SELECT class_id, class_name FROM classes WHERE school_id = ?', [DEMO_SCHOOL_ID]);
+    const classIds = {};
+    classRows.forEach(c => { classIds[c.class_name] = c.class_id; });
+    const grade4Id = classIds['Grade 4'];
+    log.push('✓ Classes: Grade 1–6');
+
+    // Students
+    const students = [
+      ['STU000001', 'Amina Hassan', 'Female'],
+      ['STU000002', 'Brian Ochieng', 'Male'],
+      ['STU000003', 'Cynthia Mwangi', 'Female'],
+      ['STU000004', 'David Kamau', 'Male'],
+      ['STU000005', 'Esther Njeri', 'Female'],
+      ['STU000006', 'Francis Otieno', 'Male'],
+      ['STU000007', 'Grace Akinyi', 'Female'],
+      ['STU000008', 'Hassan Abdi', 'Male'],
+      ['STU000009', 'Irene Waithera', 'Female'],
+      ['STU000010', 'James Kariuki', 'Male'],
+    ];
+    for (const [id, name, gender] of students) {
+      await db.execute(`INSERT IGNORE INTO students
+        (student_id, full_name, class_id, school_id, gender, enrollment_status)
+        VALUES (?, ?, ?, ?, ?, 'Active')`, [id, name, grade4Id, DEMO_SCHOOL_ID, gender]);
+    }
+    log.push(`✓ Students: ${students.length} in Grade 4`);
+
+    // Parent — linked to Amina Hassan
+    await db.execute(`INSERT IGNORE INTO parent_profiles
+      (parent_phone, full_name, is_premium, premium_expires_at)
+      VALUES ('254712345678', 'Jonathan Kiranga', TRUE, DATE_ADD(NOW(), INTERVAL 6 MONTH))`);
+    await db.execute(`INSERT IGNORE INTO student_parent_map
+      (student_id, parent_phone, relationship) VALUES ('STU000001', '254712345678', 'Parent')`);
+    log.push('✓ Parent: 254712345678 (premium, linked to Amina Hassan)');
+
+    // Learning areas
+    const areas = ['English', 'Mathematics', 'Science', 'Social Studies', 'Kiswahili', 'Creative Arts'];
+    for (const name of areas) {
+      await db.execute(`INSERT IGNORE INTO learning_areas (school_id, level_name, area_name)
+        VALUES (?, 'Grade 4', ?)`, [DEMO_SCHOOL_ID, name]);
+    }
+    const [areaRows] = await db.execute('SELECT area_id, area_name FROM learning_areas WHERE school_id = ?', [DEMO_SCHOOL_ID]);
+    const areaIds = {};
+    areaRows.forEach(a => { areaIds[a.area_name] = a.area_id; });
+    log.push('✓ Learning areas: ' + areas.join(', '));
+
+    // Sub-learning areas
+    const subDefs = {
+      'English':     [['Language', 1], ['Composition', 2], ['Reading', 3]],
+      'Mathematics': [['Numbers', 1], ['Algebra', 2], ['Geometry', 3], ['Measurement', 4]],
+      'Science':     [['Scientific Investigation', 1], ['Living Things', 2], ['Matter & Energy', 3]],
+    };
+    for (const [aName, subs] of Object.entries(subDefs)) {
+      if (!areaIds[aName]) continue;
+      for (const [sName, order] of subs) {
+        await db.execute(`INSERT IGNORE INTO sub_learning_areas (area_id, sub_area_name, display_order)
+          VALUES (?, ?, ?)`, [areaIds[aName], sName, order]);
+      }
+    }
+    const [subRows] = await db.execute(
+      `SELECT sla.sub_area_id, sla.sub_area_name, la.area_name
+       FROM sub_learning_areas sla JOIN learning_areas la ON sla.area_id = la.area_id
+       WHERE la.school_id = ?`, [DEMO_SCHOOL_ID]);
+    const subAreaIds = {};
+    subRows.forEach(s => {
+      if (!subAreaIds[s.area_name]) subAreaIds[s.area_name] = {};
+      subAreaIds[s.area_name][s.sub_area_name] = s.sub_area_id;
+    });
+    log.push('✓ Sub-learning areas seeded');
+
+    // Exam session
+    await db.execute(`INSERT IGNORE INTO exam_sessions
+      (school_id, class_id, term, academic_year, exam_name, exam_type, status, created_by)
+      VALUES (?, ?, 'Term 1', ?, 'End Term 1 2026', 'End Term', 'Closed', 'TCHWX001')`,
+      [DEMO_SCHOOL_ID, grade4Id, DEMO_YEAR]);
+    const [[sessionRow]] = await db.execute(
+      `SELECT session_id FROM exam_sessions WHERE school_id = ? AND exam_name = 'End Term 1 2026' LIMIT 1`,
+      [DEMO_SCHOOL_ID]);
+    const sessionId = sessionRow?.session_id;
+    log.push('✓ Exam session: End Term 1 2026');
+
+    // Exam results
+    const scores = {
+      'STU000001': { English: [72, 65, 78], Mathematics: [85, 70, 88, 75], Science: [68, 72, 65] },
+      'STU000002': { English: [55, 60, 52], Mathematics: [45, 50, 48, 55], Science: [58, 45, 62] },
+      'STU000003': { English: [90, 85, 92], Mathematics: [95, 88, 92, 90], Science: [88, 85, 90] },
+      'STU000004': { English: [63, 70, 68], Mathematics: [72, 65, 75, 68], Science: [70, 68, 72] },
+      'STU000005': { English: [82, 78, 85], Mathematics: [80, 75, 82, 78], Science: [85, 80, 88] },
+      'STU000006': { English: [48, 52, 45], Mathematics: [55, 48, 52, 60], Science: [50, 55, 48] },
+      'STU000007': { English: [76, 72, 80], Mathematics: [68, 72, 75, 70], Science: [75, 70, 78] },
+      'STU000008': { English: [60, 65, 58], Mathematics: [62, 58, 65, 60], Science: [65, 60, 68] },
+      'STU000009': { English: [88, 82, 90], Mathematics: [85, 82, 88, 85], Science: [80, 85, 82] },
+      'STU000010': { English: [70, 68, 72], Mathematics: [75, 70, 78, 72], Science: [72, 68, 75] },
+    };
+    if (sessionId) {
+      for (const [studentId, areaScores] of Object.entries(scores)) {
+        for (const [aName, scoreList] of Object.entries(areaScores)) {
+          const subs = Object.entries(subAreaIds[aName] || {});
+          for (let i = 0; i < subs.length && i < scoreList.length; i++) {
+            const subId = subs[i][1];
+            const score = scoreList[i];
+            const pct = score / 100;
+            const level = pct >= 0.8 ? 'EE' : pct >= 0.6 ? 'ME' : pct >= 0.4 ? 'AE' : 'BE';
+            await db.execute(`INSERT IGNORE INTO exam_results
+              (session_id, student_id, sub_area_id, score, out_of, performance_level, entered_by)
+              VALUES (?, ?, ?, ?, 100, ?, 'TCHWX002')`,
+              [sessionId, studentId, subId, score, level]);
+          }
+        }
+      }
+    }
+    log.push('✓ Exam results seeded for 10 students');
+
+    // Attendance — last 5 weekdays
+    const today = new Date();
+    for (let d = 4; d >= 0; d--) {
+      const date = new Date(today);
+      date.setDate(today.getDate() - d);
+      if (date.getDay() === 0 || date.getDay() === 6) continue;
+      const dateStr = date.toISOString().split('T')[0];
+      for (const [studentId] of students) {
+        const status = Math.random() > 0.15 ? 'Present' : 'Absent';
+        const markedAt = new Date(date);
+        markedAt.setHours(7, 30 + Math.floor(Math.random() * 30), 0, 0);
+        await db.execute(`INSERT IGNORE INTO attendance_logs
+          (student_id, teacher_id, attendance_date, status, marked_at, synced_at)
+          VALUES (?, 'TCHWX002', ?, ?, ?, NOW())`,
+          [studentId, dateStr, status, markedAt]);
+      }
+    }
+    log.push('✓ Attendance seeded for last 5 school days');
+
+    // Fees
+    const fees = [['Tuition Fee', 5000], ['Activity Fee', 500], ['Lunch Fee', 1500]];
+    for (const [name, amount] of fees) {
+      await db.execute(`INSERT IGNORE INTO fee_structures
+        (school_id, fee_name, amount, term, academic_year) VALUES (?, ?, ?, 'Term 1', ?)`,
+        [DEMO_SCHOOL_ID, name, amount, DEMO_YEAR]);
+    }
+    log.push('✓ Fee structures seeded');
+
+    // Demo payment
+    await db.execute(`INSERT IGNORE INTO payment_ledger
+      (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, logged_at)
+      VALUES ('DEMO-PAY-001', 5000, '254712345678', 'STU000001', 'M-Pesa', ?, 'Term 1', ?, DATE_SUB(NOW(), INTERVAL 3 DAY))`,
+      [DEMO_SCHOOL_ID, DEMO_YEAR]);
+    log.push('✓ Demo payment: KSh 5,000 for Amina Hassan');
+
+    // School terms
+    await db.execute(`INSERT IGNORE INTO school_terms (school_id, term_name, start_date, end_date, academic_year)
+      VALUES (?, 'Term 1', '2026-01-06', '2026-04-04', ?)`, [DEMO_SCHOOL_ID, DEMO_YEAR]);
+    await db.execute(`INSERT IGNORE INTO school_terms (school_id, term_name, start_date, end_date, academic_year)
+      VALUES (?, 'Term 2', '2026-05-04', '2026-08-07', ?)`, [DEMO_SCHOOL_ID, DEMO_YEAR]);
+    await db.execute(`INSERT IGNORE INTO school_terms (school_id, term_name, start_date, end_date, academic_year)
+      VALUES (?, 'Term 3', '2026-09-07', '2026-11-20', ?)`, [DEMO_SCHOOL_ID, DEMO_YEAR]);
+    log.push('✓ School terms: Term 1, 2, 3 for 2026');
+
+    // Rubric
+    const rubric = [['EE',80,'Exceeding Expectations','#2E7D32'],['ME',60,'Meeting Expectations','#1565C0'],['AE',40,'Approaching Expectations','#E65100'],['BE',0,'Below Expectations','#C62828']];
+    for (const [code, min, label, color] of rubric) {
+      await db.execute(`INSERT IGNORE INTO school_rubric_config (school_id, level_code, min_percent, label, color)
+        VALUES (?, ?, ?, ?, ?)`, [DEMO_SCHOOL_ID, code, min, label, color]);
+    }
+    log.push('✓ Rubric config seeded');
+
+    return res.json({
+      success: true,
+      log,
+      instructions: {
+        school: 'Greenfield Academy',
+        school_id: DEMO_SCHOOL_ID,
+        headteacher_email: 'jonathankiranga@gmail.com',
+        headteacher_phone: '254712345678',
+        parent_phone: '254712345678',
+        note: 'Remove SEED_SECRET from Render env vars to disable this endpoint'
+      }
+    });
+  } catch (err) {
+    console.error('[SEED]', err.message);
+    return res.status(500).json({ error: err.message, log });
+  }
+});
+// ─── END SEED ENDPOINT ────────────────────────────────────────────────────────
 app.use('/admin/api', adminApiRoutes);
 app.use('/admin', adminRoutes);
 app.use('/api/webpush', webpushRoutes);
