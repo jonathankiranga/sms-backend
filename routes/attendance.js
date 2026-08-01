@@ -12,11 +12,14 @@ router.post('/sync', async (req, res) => {
     await connection.beginTransaction();
 
     for (const r of records) {
+      // Use the device-captured marked_at if provided, otherwise fall back to NOW()
+      const markedAt = r.marked_at ? new Date(r.marked_at) : new Date();
+
       await connection.execute(
-        `INSERT INTO attendance_logs (student_id, teacher_id, attendance_date, status, synced_at)
-         VALUES (?, ?, ?, ?, NOW())
-         ON DUPLICATE KEY UPDATE status = VALUES(status), synced_at = NOW()`,
-        [r.student_id, teacher_id, attendance_date, r.status]
+        `INSERT INTO attendance_logs (student_id, teacher_id, attendance_date, status, marked_at, synced_at)
+         VALUES (?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE status = VALUES(status), marked_at = VALUES(marked_at), synced_at = NOW()`,
+        [r.student_id, teacher_id, attendance_date, r.status, markedAt]
       );
 
       if (r.status === 'Absent') {

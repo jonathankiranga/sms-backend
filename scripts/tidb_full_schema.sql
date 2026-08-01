@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS attendance_logs (
   teacher_id      CHAR(9)  NOT NULL,
   attendance_date DATE     NOT NULL,
   status          ENUM('Present','Absent','Late','Excused') NOT NULL,
+  marked_at       DATETIME NULL,
   synced_at       DATETIME NULL,
   UNIQUE KEY uq_student_date (student_id, attendance_date),
   FOREIGN KEY (student_id)  REFERENCES students(student_id),
