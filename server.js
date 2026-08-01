@@ -356,6 +356,18 @@ app.post('/api/seed-demo', async (req, res) => {
     log.push('✓ Exam results seeded for 10 students');
 
     // Attendance — last 5 weekdays
+    // Ensure marked_at column exists (migration may not have run yet)
+    try {
+      await db.execute(`ALTER TABLE attendance_logs ADD COLUMN marked_at DATETIME NULL AFTER status`);
+      log.push('✓ Migration: added marked_at column to attendance_logs');
+    } catch (e) {
+      if (e.code === 'ER_DUP_FIELDNAME' || e.message.includes('Duplicate column')) {
+        log.push('✓ marked_at column already exists');
+      } else {
+        log.push(`⚠ marked_at migration skipped: ${e.message}`);
+      }
+    }
+
     const today = new Date();
     for (let d = 4; d >= 0; d--) {
       const date = new Date(today);
@@ -366,14 +378,21 @@ app.post('/api/seed-demo', async (req, res) => {
         const status = Math.random() > 0.15 ? 'Present' : 'Absent';
         const markedAt = new Date(date);
         markedAt.setHours(7, 30 + Math.floor(Math.random() * 30), 0, 0);
-        await db.execute(`INSERT IGNORE INTO attendance_logs
-          (student_id, teacher_id, attendance_date, status, marked_at, synced_at)
-          VALUES (?, 'TCHWX002', ?, ?, ?, NOW())`,
-          [studentId, dateStr, status, markedAt]);
+        try {
+          await db.execute(`INSERT IGNORE INTO attendance_logs
+            (student_id, teacher_id, attendance_date, status, marked_at, synced_at)
+            VALUES (?, 'TCHWX002', ?, ?, ?, NOW())`,
+            [studentId, dateStr, status, markedAt]);
+        } catch (e) {
+          // marked_at column may not exist yet — fall back without it
+          await db.execute(`INSERT IGNORE INTO attendance_logs
+            (student_id, teacher_id, attendance_date, status, synced_at)
+            VALUES (?, 'TCHWX002', ?, ?, NOW())`,
+            [studentId, dateStr, status]);
+        }
       }
     }
     log.push('✓ Attendance seeded for last 5 school days');
-
     // Fees
     const fees = [['Tuition Fee', 5000], ['Activity Fee', 500], ['Lunch Fee', 1500]];
     for (const [name, amount] of fees) {
