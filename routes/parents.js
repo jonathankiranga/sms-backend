@@ -56,7 +56,10 @@ router.get('/dashboard/:phone', async (req, res) => {
   const [children] = await req.db.execute(
     `SELECT s.student_id, s.full_name, c.class_name, s.school_id,
        (SELECT status FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS last_attendance,
-       (SELECT attendance_date FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS last_date
+       (SELECT attendance_date FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS last_date,
+       (SELECT synced_at FROM attendance_logs WHERE student_id = s.student_id ORDER BY attendance_date DESC LIMIT 1) AS arrival_time,
+       (SELECT amount FROM payment_ledger WHERE student_reference = s.student_id AND reversed_at IS NULL ORDER BY logged_at DESC LIMIT 1) AS last_payment_amount,
+       (SELECT logged_at FROM payment_ledger WHERE student_reference = s.student_id AND reversed_at IS NULL ORDER BY logged_at DESC LIMIT 1) AS last_payment_date
      FROM students s
      JOIN classes c ON s.class_id = c.class_id
      JOIN student_parent_map m ON s.student_id = m.student_id
