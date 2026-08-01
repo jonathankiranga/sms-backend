@@ -208,6 +208,21 @@ app.post('/api/seed-demo', async (req, res) => {
   if (req.headers['x-seed-secret'] !== secret) return res.status(401).json({ error: 'Invalid seed secret' });
 
   const db = req.db;
+  const { action, phone } = req.body || {};
+
+  // ── UPDATE PHONE ──────────────────────────────────────────────
+  // POST /api/seed-demo with body { "action": "fix-phone", "phone": "254725999521" }
+  if (action === 'fix-phone') {
+    if (!phone) return res.status(400).json({ error: 'phone required in body' });
+    const oldPhone = '254712345678';
+    await db.execute('UPDATE teachers SET phone = ? WHERE teacher_id = ?', [phone, 'TCHWX001']);
+    await db.execute('UPDATE parent_profiles SET parent_phone = ? WHERE parent_phone = ?', [phone, oldPhone]);
+    await db.execute('UPDATE student_parent_map SET parent_phone = ? WHERE parent_phone = ?', [phone, oldPhone]);
+    await db.execute('UPDATE payment_ledger SET parent_phone = ? WHERE parent_phone = ?', [phone, oldPhone]);
+    await db.execute('UPDATE schools SET contact_phone = ? WHERE school_id = ?', [phone, 'DEM000001']);
+    return res.json({ success: true, message: `Phone updated from ${oldPhone} to ${phone} across all tables` });
+  }
+
   const DEMO_SCHOOL_ID = 'DEM000001';
   const DEMO_YEAR = 2026;
   const log = [];
