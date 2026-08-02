@@ -296,4 +296,138 @@ router.get('/report', async (req, res) => {
   res.json({ class_report: classReport, daily_collections: dailyCollections });
 });
 
+// GET /api/bazar-pay/parent-subscriptions — list all parents with subscription status
+// Allows bazar to see who has paid and who hasn't, and pay on behalf of those who haven't
+router.get('/parent-subscriptions', async (req, res) => {
+  const { school_id, term, year } = req.query;
+  if (!school_id || !term || !year) return res.status(400).json({ error: 'school_id, term, year required' });
+
+  // Get all unique parents linked to active students at this school
+  const [parents] = await req.db.execute(
+    `SELECT
+       spm.parent_phone,
+       pp.full_name AS parent_name,
+       pp.is_premium,
+       pp.premium_expires_at,
+       GROUP_CONCAT(s.full_name ORDER BY s.full_name SEPARATOR ', ') AS children_names,
+       COUNT(s.student_id) AS child_count
+     FROM student_parent_map spm
+     JOIN students s ON spm.student_id = s.student_id AND s.school_id = ? AND s.enrollment_status = 'Active'
+     LEFT JOIN parent_profiles pp ON spm.parent_phone = pp.parent_phone
+     GROUP BY spm.parent_phone, pp.full_name, pp.is_premium, pp.premium_expires_at
+     ORDER BY pp.full_name, spm.parent_phone`,
+    [school_id]
+  );
+
+  // Get app_settings for price
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
+
+  const result = parents.map(p => {
+    const isActive = p.is_premium && (!p.premium_expires_at || new Date(p.premium_expires_at) > new Date());
+    return {
+      parent_phone: p.parent_phone,
+      parent_name: p.parent_name || 'Unknown',
+      child_count: p.child_count,
+      children_names: p.children_names,
+      is_active: isActive,
+      premium_expires_at: p.premium_expires_at,
+      amount_due: isActive ? 0 : pricePerChild * p.child_count,
+      price_per_child: pricePerChild
+    };
+  });
+
+  const summary = {
+    total_parents: result.length,
+    active: result.filter(p => p.is_active).length,
+    unpaid: result.filter(p => !p.is_active).length,
+    total_outstanding: result.filter(p => !p.is_active).reduce((sum, p) => sum + p.amount_due, 0)
+  };
+
+  res.json({ parents: result, summary });
+});
+
+// POST /api/bazar-pay/pay-parent-subscription — bazar pays on behalf of parent(s)
+// Activates subscription immediately (cash/manual payment recorded)
+router.post('/pay-parent-subscription', async (req, res) => {
+  const { school_id, parent_phones, term, year, payment_method, recorded_by } = req.body;
+  if (!school_id || !parent_phones?.length || !term || !year) {
+    return res.status(400).json({ error: 'school_id, parent_phones array, term, year required' });
+  }
+
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
+
+  const { getNextTermStart } = require('../lib/config');
+  const expiresAt = await getNextTermStart(req.db, school_id);
+
+  const method = payment_method || 'Cash';
+  const conn = await req.db.getConnection();
+  const activated = [];
+
+  try {
+    await conn.beginTransaction();
+
+    for (const phone of parent_phones) {
+      // Count children for this parent at this school
+      const [childRows] = await conn.execute(
+        `SELECT COUNT(*) AS cnt FROM student_parent_map spm
+         JOIN students s ON spm.student_id = s.student_id
+         WHERE spm.parent_phone = ? AND s.school_id = ? AND s.enrollment_status = 'Active'`,
+        [phone, school_id]
+      );
+      const childCount = childRows[0]?.cnt || 1;
+      const amount = pricePerChild * childCount;
+      const ref = `BAZPAY-${phone.slice(-6)}-${Date.now().toString(36).toUpperCase()}`;
+
+      // Ensure parent_profile exists
+      await conn.execute(
+        'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',
+        [phone]
+      );
+
+      // Activate premium
+      await conn.execute(
+        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+        [expiresAt, phone]
+      );
+
+      // Record payment
+      await conn.execute(
+        `INSERT IGNORE INTO payment_ledger
+         (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, notes, recorded_by, logged_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Bazar bulk parent subscription', ?, NOW())`,
+        [ref, amount, phone, `SUB-${phone}`, method, school_id, term, year, recorded_by || 'BAZAR']
+      );
+
+      // Record premium subscription
+      await conn.execute(
+        `INSERT INTO premium_subscriptions
+         (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
+         VALUES (?, ?, ?, ?, 'school', 'paid', ?, NOW(), ?)
+         ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at), amount = VALUES(amount)`,
+        [school_id, phone, term, year, amount, expiresAt]
+      );
+
+      activated.push({ phone, amount, children: childCount });
+    }
+
+    await conn.commit();
+    const totalAmount = activated.reduce((sum, a) => sum + a.amount, 0);
+    res.json({
+      success: true,
+      activated: activated.length,
+      total_amount: totalAmount,
+      expires_at: expiresAt,
+      details: activated
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error('[BAZAR PAY SUBSCRIPTION]', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 module.exports = router;
