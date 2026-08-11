@@ -71,55 +71,16 @@ async function sendOtp(phone, code) {
   return { provider: 'log', status: 'logged' };
 }
 
-// Email OTP support — uses Nodemailer with any SMTP server (Gmail, Outlook, custom)
-// Configure via env vars: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
+// Email OTP support — simple fallback logger. If you configure EMAIL_PROVIDER and implement sending logic, replace this.
 async function sendEmailOtp(email, code) {
-  const nodemailer = require('nodemailer');
-
-  const host     = process.env.SMTP_HOST;
-  const port     = parseInt(process.env.SMTP_PORT || '587');
-  const user     = process.env.SMTP_USER;
-  const pass     = process.env.SMTP_PASS;
-  const from     = process.env.SMTP_FROM || user;
-  const fromName = process.env.SMTP_FROM_NAME || 'FreeSchool';
-
-  // Dev fallback — no SMTP configured
-  if (!host || !user || !pass) {
-    console.log(`[EMAIL OTP] SMTP not configured — To: ${email} | Code: ${code}`);
+  const provider = process.env.EMAIL_PROVIDER || 'log';
+  if (provider === 'log') {
+    console.log(`[EMAIL] To ${email}: Your verification code is ${code}`);
     return { provider: 'log', status: 'logged' };
   }
-
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,          // true for 465 (SSL), false for 587 (STARTTLS)
-    auth: { user, pass },
-    tls: { rejectUnauthorized: false }  // allow self-signed certs on custom mail servers
-  });
-
-  try {
-    await transporter.sendMail({
-      from: `"${fromName}" <${from}>`,
-      to: email,
-      subject: 'Your FreeSchool Login Code',
-      text: `Your FreeSchool login code is: ${code}\n\nThis code expires in 5 minutes.`,
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:400px;margin:0 auto;padding:24px">
-          <h2 style="color:#7B4F9B;margin-bottom:8px">FreeSchool Login</h2>
-          <p style="color:#555;margin-bottom:24px">Your one-time login code is:</p>
-          <div style="background:#F3E5F5;border-radius:8px;padding:20px;text-align:center;margin-bottom:24px">
-            <span style="font-size:36px;font-weight:bold;color:#7B4F9B;letter-spacing:8px">${code}</span>
-          </div>
-          <p style="color:#888;font-size:12px">This code expires in 5 minutes. Do not share it with anyone.</p>
-        </div>
-      `
-    });
-    console.log(`[EMAIL] OTP sent to ${email} via ${host}`);
-    return { provider: 'smtp', status: 'sent' };
-  } catch (err) {
-    console.error(`[EMAIL] SMTP send failed for ${email}: ${err.message}`);
-    throw err;
-  }
+  // Placeholder: implement real email sending (SMTP, SendGrid, SES...) if desired.
+  console.warn('[EMAIL] sendEmailOtp called but no provider implemented; set EMAIL_PROVIDER and add implementation.');
+  return { provider: 'none' };
 }
 
 async function sendAssessmentAlert(parentPhone, studentName, subject, score, level) {

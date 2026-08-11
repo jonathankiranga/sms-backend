@@ -31,6 +31,7 @@ router.post('/sync', async (req, res) => {
            JOIN student_parent_map m ON s.student_id = m.student_id
            JOIN parent_profiles p ON m.parent_phone = p.parent_phone
            WHERE a.student_id = ? AND a.attendance_date = ?
+             AND a.absence_alerted_at IS NULL
              AND p.is_premium = TRUE AND p.premium_expires_at >= NOW()
            LIMIT 1`,
           [r.student_id, attendance_date]
@@ -41,6 +42,10 @@ router.post('/sync', async (req, res) => {
           try {
             const { sendAbsenceAlert } = require('../services/messaging');
             await sendAbsenceAlert(parent.parent_phone, parent.student_name, parent.school_name, attendance_date);
+            await connection.execute(
+              'UPDATE attendance_logs SET absence_alerted_at = NOW() WHERE student_id = ? AND attendance_date = ?',
+              [r.student_id, attendance_date]
+            );
           } catch (e) {
             console.error('WhatsApp send failed (non-blocking):', e.message);
           }
@@ -69,6 +74,12 @@ router.post('/sync', async (req, res) => {
           [r.student_id, attendance_date, attendance_date]
         );
         if (absCnt[0].cnt >= 3) {
+          // Only alert once per school-day for this student
+          const [alerted] = await connection.execute(
+            'SELECT consecutive_alerted_at FROM attendance_logs WHERE student_id = ? AND attendance_date = ?',
+            [r.student_id, attendance_date]
+          );
+          if (alerted[0]?.consecutive_alerted_at) continue;
           const [parentRows] = await connection.execute(
             `SELECT p.parent_phone, s.full_name AS student_name, sch.school_name
              FROM students s
@@ -81,6 +92,10 @@ router.post('/sync', async (req, res) => {
           );
           for (const p of parentRows) {
             sendConsecutiveAbsenceAlert(p.parent_phone, p.student_name, absCnt[0].cnt, p.school_name)
+              .then(() => connection.execute(
+                'UPDATE attendance_logs SET consecutive_alerted_at = NOW() WHERE student_id = ? AND attendance_date = ?',
+                [r.student_id, attendance_date]
+              ))
               .catch(e => console.error('[WA] Consecutive absence alert failed:', e.message));
           }
         }

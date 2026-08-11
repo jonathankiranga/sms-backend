@@ -1,6 +1,4 @@
-const https = require('https');
-
-function getBaseUrl(env) {
+﻿function getBaseUrl(env) {
   return env === 'production'
     ? 'https://api.safaricom.co.ke'
     : 'https://sandbox.safaricom.co.ke';
@@ -15,13 +13,20 @@ async function getAccessToken(consumerKey, consumerSecret, env) {
   return data.access_token;
 }
 
-async function stkPush(phone, amount, reference, description, schoolCreds) {
-  const consumerKey = schoolCreds?.mpesa_consumer_key || process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = schoolCreds?.mpesa_consumer_secret || process.env.MPESA_CONSUMER_SECRET;
-  const passkey = schoolCreds?.mpesa_passkey || process.env.MPESA_PASSKEY;
-  const shortcode = schoolCreds?.mpesa_paybill || process.env.MPESA_SHORTCODE;
-  const env = schoolCreds?.mpesa_environment || process.env.MPESA_ENV || 'sandbox';
-  const schoolId = schoolCreds?.school_id || 'default';
+// STK push always uses the vendor's global M-Pesa credentials from env vars.
+// A callbackKey can be passed so the resulting STK push callback routes to a school-specific notification handler.
+async function stkPush(phone, amount, reference, description, options = {}) {
+  const consumerKey = process.env.MPESA_CONSUMER_KEY;
+  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+  const passkey = process.env.MPESA_PASSKEY;
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const env = process.env.MPESA_ENV || 'sandbox';
+  const callbackKey = options.callbackKey;
+  const baseUrl = process.env.BASE_URL || 'https://sms-backend-r0tn.onrender.com';
+  let callbackUrl = `${baseUrl}/v1/payments/callback`;
+  if (callbackKey) {
+    callbackUrl = `${baseUrl}/v1/payments/secret/${callbackKey}/s`;
+  }
 
   const token = await getAccessToken(consumerKey, consumerSecret, env);
   const now = new Date();
@@ -35,16 +40,11 @@ async function stkPush(phone, amount, reference, description, schoolCreds) {
   const password = Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
 
   const cleanPhone = phone.replace(/^0+/, '254').replace(/^\+/, '');
-  const baseUrl = process.env.BASE_URL || 'https://sms-backend-r0tn.onrender.com';
-  // Use school-specific callback if schoolId is known, otherwise use the generic callback
-  const callbackUrl = (schoolId && schoolId !== 'default')
-    ? `${baseUrl}/v1/payments/${schoolId}/callback`
-    : `${baseUrl}/v1/payments/callback`;
 
   const resp = await fetch(`${getBaseUrl(env)}/mpesa/stkpush/v1/processrequest`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: Bearer ,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
@@ -64,12 +64,12 @@ async function stkPush(phone, amount, reference, description, schoolCreds) {
   return resp.json();
 }
 
-async function stkPushQuery(checkoutRequestId, schoolCreds) {
-  const consumerKey = schoolCreds?.mpesa_consumer_key || process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = schoolCreds?.mpesa_consumer_secret || process.env.MPESA_CONSUMER_SECRET;
-  const passkey = schoolCreds?.mpesa_passkey || process.env.MPESA_PASSKEY;
-  const shortcode = schoolCreds?.mpesa_paybill || process.env.MPESA_SHORTCODE;
-  const env = schoolCreds?.mpesa_environment || process.env.MPESA_ENV || 'sandbox';
+async function stkPushQuery(checkoutRequestId) {
+  const consumerKey = process.env.MPESA_CONSUMER_KEY;
+  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+  const passkey = process.env.MPESA_PASSKEY;
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const env = process.env.MPESA_ENV || 'sandbox';
 
   const token = await getAccessToken(consumerKey, consumerSecret, env);
   const now = new Date();
@@ -85,7 +85,7 @@ async function stkPushQuery(checkoutRequestId, schoolCreds) {
   const resp = await fetch(`${getBaseUrl(env)}/mpesa/stkpushquery/v1/query`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: Bearer ,
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
@@ -98,18 +98,19 @@ async function stkPushQuery(checkoutRequestId, schoolCreds) {
   return resp.json();
 }
 
-async function registerC2BUrls(validationUrl, confirmationUrl, schoolCreds) {
-  const consumerKey = schoolCreds?.mpesa_consumer_key || process.env.MPESA_CONSUMER_KEY;
-  const consumerSecret = schoolCreds?.mpesa_consumer_secret || process.env.MPESA_CONSUMER_SECRET;
-  const shortcode = schoolCreds?.mpesa_paybill || process.env.MPESA_SHORTCODE;
-  const env = schoolCreds?.mpesa_environment || process.env.MPESA_ENV || 'sandbox';
+// C2B URL registration also uses the vendor's global M-Pesa credentials.
+async function registerC2BUrls(validationUrl, confirmationUrl) {
+  const consumerKey = process.env.MPESA_CONSUMER_KEY;
+  const consumerSecret = process.env.MPESA_CONSUMER_SECRET;
+  const shortcode = process.env.MPESA_SHORTCODE;
+  const env = process.env.MPESA_ENV || 'sandbox';
 
   const token = await getAccessToken(consumerKey, consumerSecret, env);
   const resp = await fetch(`${getBaseUrl(env)}/mpesa/c2b/v2/register`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json'
+      Authorization: Bearer ,
     },
     body: JSON.stringify({
       ShortCode: shortcode,
@@ -122,3 +123,5 @@ async function registerC2BUrls(validationUrl, confirmationUrl, schoolCreds) {
 }
 
 module.exports = { getAccessToken, stkPush, stkPushQuery, registerC2BUrls };
+
+

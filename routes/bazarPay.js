@@ -305,128 +305,256 @@ router.get('/parent-subscriptions', async (req, res) => {
   // Get all unique parents linked to active students at this school
   const [parents] = await req.db.execute(
     `SELECT
-       spm.parent_phone,
-       pp.full_name AS parent_name,
-       pp.is_premium,
-       pp.premium_expires_at,
-       GROUP_CONCAT(s.full_name ORDER BY s.full_name SEPARATOR ', ') AS children_names,
-       COUNT(s.student_id) AS child_count
-     FROM student_parent_map spm
-     JOIN students s ON spm.student_id = s.student_id AND s.school_id = ? AND s.enrollment_status = 'Active'
-     LEFT JOIN parent_profiles pp ON spm.parent_phone = pp.parent_phone
-     GROUP BY spm.parent_phone, pp.full_name, pp.is_premium, pp.premium_expires_at
-     ORDER BY pp.full_name, spm.parent_phone`,
+      spm.parent_phone,
+      pp.full_name AS parent_name,
+      pp.is_premium,
+      pp.premium_expires_at,
+      GROUP_CONCAT(s.full_name ORDER BY s.full_name SEPARATOR ', ') AS children_names,
+      GROUP_CONCAT(s.student_id ORDER BY s.full_name SEPARATOR ',') AS child_ids,
+      COUNT(s.student_id) AS child_count
+    FROM student_parent_map spm
+    JOIN students s ON spm.student_id = s.student_id AND s.school_id = ? AND s.enrollment_status = 'Active'
+    LEFT JOIN parent_profiles pp ON spm.parent_phone = pp.parent_phone
+    GROUP BY spm.parent_phone, pp.full_name, pp.is_premium, pp.premium_expires_at
+    ORDER BY pp.full_name, spm.parent_phone`,
     [school_id]
   );
+
+  // Parents whose children have any non-reversed school-fee payment this term/year
+  const [feePaid] = await req.db.execute(
+    `SELECT DISTINCT spm.parent_phone
+     FROM student_parent_map spm
+     JOIN payment_ledger pl ON pl.student_reference = spm.student_id
+     WHERE pl.school_id = ? AND pl.term = ? AND pl.academic_year = ? AND pl.reversed_at IS NULL`,
+    [school_id, term, year]
+  );
+  const feePaidPhones = new Set(feePaid.map(r => r.parent_phone));
+
+  const [activeSubs] = await req.db.execute(
+    `SELECT parent_phone
+     FROM premium_subscriptions
+     WHERE school_id = ? AND term = ? AND year = ? AND payment_status = 'paid'
+       AND (expires_at IS NULL OR expires_at > NOW())`,
+    [school_id, term, year]
+  );
+  const activeParentPhones = new Set(activeSubs.map(s => s.parent_phone));
 
   // Get app_settings for price
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const pricePerChild = parseInt(setting[0]?.setting_value || '100');
 
   const result = parents.map(p => {
-    const isActive = p.is_premium && (!p.premium_expires_at || new Date(p.premium_expires_at) > new Date());
+    const activeFromSubscriptions = activeParentPhones.has(p.parent_phone);
+    const activeFromProfile = p.is_premium && (!p.premium_expires_at || new Date(p.premium_expires_at) > new Date());
+    const isActive = activeFromSubscriptions || activeFromProfile;
+    const feesPaid = feePaidPhones.has(p.parent_phone);
     return {
       parent_phone: p.parent_phone,
       parent_name: p.parent_name || 'Unknown',
       child_count: p.child_count,
       children_names: p.children_names,
+      child_ids: p.child_ids || '',
       is_active: isActive,
+      fees_paid: feesPaid,
+      cashback_candidate: feesPaid && !isActive,
       premium_expires_at: p.premium_expires_at,
       amount_due: isActive ? 0 : pricePerChild * p.child_count,
       price_per_child: pricePerChild
     };
   });
-
+  result.sort((a, b) => (b.cashback_candidate ? 1 : 0) - (a.cashback_candidate ? 1 : 0) || a.parent_name.localeCompare(b.parent_name));
   const summary = {
     total_parents: result.length,
     active: result.filter(p => p.is_active).length,
     unpaid: result.filter(p => !p.is_active).length,
+    cashback_candidates: result.filter(p => p.cashback_candidate).length,
     total_outstanding: result.filter(p => !p.is_active).reduce((sum, p) => sum + p.amount_due, 0)
   };
 
   res.json({ parents: result, summary });
 });
 
-// POST /api/bazar-pay/pay-parent-subscription — bazar pays on behalf of parent(s)
-// Activates subscription immediately (cash/manual payment recorded)
-router.post('/pay-parent-subscription', async (req, res) => {
-  const { school_id, parent_phones, term, year, payment_method, recorded_by } = req.body;
-  if (!school_id || !parent_phones?.length || !term || !year) {
-    return res.status(400).json({ error: 'school_id, parent_phones array, term, year required' });
+// POST /api/bazar-pay/pay-bulk-subscriptions — bazar/vendor pays for all unpaid parents via a single STK push
+router.post('/pay-bulk-subscriptions', async (req, res) => {
+  const { school_id, term, year, school_phone, recorded_by } = req.body;
+  if (!school_id || !term || !year || !school_phone) {
+    return res.status(400).json({ error: 'school_id, term, year, school_phone required' });
   }
 
-  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
+  try {
+    // Dedupe: reject if there's an existing pending bulk STK submission for this school/term/year
+    const [existingPending] = await req.db.execute(
+      `SELECT COUNT(*) AS cnt FROM premium_bulk_payments WHERE school_id = ? AND term = ? AND year = ? AND payment_status = 'pending'`,
+      [school_id, term, year]
+    );
+    if (existingPending[0]?.cnt > 0) {
+      return res.status(409).json({ error: 'A pending bulk STK submission already exists for this school/term/year. Wait for it to complete or cancel it before initiating a new one.' });
+    }
 
-  const { getNextTermStart } = require('../lib/config');
-  const expiresAt = await getNextTermStart(req.db, school_id);
+    const [activeSubs] = await req.db.execute(
+      `SELECT parent_phone
+       FROM premium_subscriptions
+       WHERE school_id = ? AND term = ? AND year = ? AND payment_status = 'paid'
+         AND (expires_at IS NULL OR expires_at > NOW())`,
+      [school_id, term, year]
+    );
+    const activeParentPhones = new Set(activeSubs.map(s => s.parent_phone));
 
-  const method = payment_method || 'Cash';
-  const conn = await req.db.getConnection();
-  const activated = [];
+    // Compute unpaid parents and total amount
+    const [parents] = await req.db.execute(
+      `SELECT spm.parent_phone, COUNT(s.student_id) AS child_count
+       FROM student_parent_map spm
+       JOIN students s ON spm.student_id = s.student_id AND s.school_id = ? AND s.enrollment_status = 'Active'
+       LEFT JOIN parent_profiles pp ON spm.parent_phone = pp.parent_phone
+       GROUP BY spm.parent_phone HAVING (pp.is_premium IS NULL OR pp.is_premium = 0)`
+    , [school_id]);
+
+    const unpaidParents = (parents || []).filter(p => !activeParentPhones.has(p.parent_phone));
+
+    if (!unpaidParents || unpaidParents.length === 0) {
+      return res.json({ success: true, message: 'No unpaid parents found', activated: 0 });
+    }
+    const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+    const pricePerChild = parseInt(setting[0]?.setting_value || '100');
+
+    const totalStudents = unpaidParents.reduce((sum, p) => sum + (p.child_count || 1), 0);
+    const totalAmount = unpaidParents.reduce((sum, p) => sum + ((p.child_count || 1) * pricePerChild), 0);
+
+    // Insert pending bulk payment record
+    const [result] = await req.db.execute(
+      `INSERT INTO premium_bulk_payments (school_id, term, year, amount, total_students, initiated_by_phone, payment_status)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+      [school_id, term, year, totalAmount, totalStudents, recorded_by || school_phone]
+    );
+    const paymentId = result.insertId;
+    const reference = `BLK-${paymentId}`;
+
+    // Ensure school has callback key
+    const [schoolRows] = await req.db.execute('SELECT mpesa_callback_key FROM schools WHERE school_id = ?', [school_id]);
+    const callbackKey = schoolRows[0]?.mpesa_callback_key || await ensureSchoolCallbackKey(req.db, school_id);
+
+    // Initiate STK push to the school office phone using vendor MPESA credentials
+    const mpesa = require('../services/mpesa');
+    const stk = await mpesa.stkPush(school_phone, totalAmount, reference, 'School premium subscription payment', { callbackKey });
+
+    // Store the reference so callback can match
+    await req.db.execute('UPDATE premium_bulk_payments SET transaction_reference = ? WHERE payment_id = ?', [reference, paymentId]);
+
+    if (stk.ResponseCode === '0') {
+      return res.json({ success: true, status: 'pending', checkout_request_id: stk.CheckoutRequestID, transaction_reference: reference, amount: totalAmount, total_students: totalStudents });
+    }
+
+    // STK push failed
+    await req.db.execute('UPDATE premium_bulk_payments SET payment_status = ? WHERE payment_id = ?', ['failed', paymentId]);
+    return res.status(502).json({ error: 'M-Pesa STK push failed', detail: stk });
+  } catch (err) {
+    console.error('[BAZAR BULK STK]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// POST /api/bazar-pay/pay-selected-subscriptions — bazar/vendor pays for selected parents via a single STK push
+router.post('/pay-selected-subscriptions', async (req, res) => {
+  const { school_id, term, year, parent_phones, school_phone, recorded_by } = req.body;
+  if (!school_id || !term || !year || !Array.isArray(parent_phones) || parent_phones.length === 0 || !school_phone) {
+    return res.status(400).json({ error: 'school_id, term, year, parent_phones (non-empty array), school_phone required' });
+  }
 
   try {
-    await conn.beginTransaction();
+    const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+    const pricePerChild = parseInt(setting[0]?.setting_value || '100');
 
-    for (const phone of parent_phones) {
-      // Count children for this parent at this school
-      const [childRows] = await conn.execute(
-        `SELECT COUNT(*) AS cnt FROM student_parent_map spm
-         JOIN students s ON spm.student_id = s.student_id
-         WHERE spm.parent_phone = ? AND s.school_id = ? AND s.enrollment_status = 'Active'`,
+    const [activeSubs] = await req.db.execute(
+      `SELECT parent_phone
+       FROM premium_subscriptions
+       WHERE school_id = ? AND term = ? AND year = ? AND payment_status = 'paid'
+         AND (expires_at IS NULL OR expires_at > NOW())`,
+      [school_id, term, year]
+    );
+    const activeParentPhones = new Set(activeSubs.map(s => s.parent_phone));
+
+    // Dedupe: reject if any of the selected parent phones already have a pending STK entry for this school/term/year
+    const placeholders = parent_phones.map(() => '?').join(',');
+    const pendingParams = [...parent_phones, school_id, term, year];
+    const [pendingRows] = await req.db.execute(
+      `SELECT DISTINCT parent_phone FROM payment_ledger WHERE parent_phone IN (${placeholders}) AND school_id = ? AND term = ? AND academic_year = ? AND notes = 'STK_PENDING'`,
+      pendingParams
+    );
+    if (pendingRows.length > 0) {
+      const pendingPhones = pendingRows.map(r => r.parent_phone);
+      return res.status(409).json({ error: 'Some selected parents already have a pending STK submission', pending_phones: pendingPhones });
+    }
+
+    const eligibleParentPhones = parent_phones.filter(phone => !activeParentPhones.has(phone));
+    if (eligibleParentPhones.length === 0) {
+      return res.json({ success: true, message: 'All selected parents are already paid for this term/year', activated: 0 });
+    }
+
+    // Calculate amount per parent (based on child count at this school)
+    const parentDetails = [];
+    for (const phone of eligibleParentPhones) {
+      const [childRows] = await req.db.execute(
+        `SELECT COUNT(*) AS cnt FROM student_parent_map spm JOIN students s ON spm.student_id = s.student_id WHERE spm.parent_phone = ? AND s.school_id = ? AND s.enrollment_status = 'Active'`,
         [phone, school_id]
       );
       const childCount = childRows[0]?.cnt || 1;
       const amount = pricePerChild * childCount;
-      const ref = `BAZPAY-${phone.slice(-6)}-${Date.now().toString(36).toUpperCase()}`;
-
-      // Ensure parent_profile exists
-      await conn.execute(
-        'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',
-        [phone]
-      );
-
-      // Activate premium
-      await conn.execute(
-        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
-        [expiresAt, phone]
-      );
-
-      // Record payment
-      await conn.execute(
-        `INSERT IGNORE INTO payment_ledger
-         (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, notes, recorded_by, logged_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Bazar bulk parent subscription', ?, NOW())`,
-        [ref, amount, phone, `SUB-${phone}`, method, school_id, term, year, recorded_by || 'BAZAR']
-      );
-
-      // Record premium subscription
-      await conn.execute(
-        `INSERT INTO premium_subscriptions
-         (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
-         VALUES (?, ?, ?, ?, 'school', 'paid', ?, NOW(), ?)
-         ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at), amount = VALUES(amount)`,
-        [school_id, phone, term, year, amount, expiresAt]
-      );
-
-      activated.push({ phone, amount, children: childCount });
+      parentDetails.push({ phone, childCount, amount });
     }
 
-    await conn.commit();
-    const totalAmount = activated.reduce((sum, a) => sum + a.amount, 0);
-    res.json({
-      success: true,
-      activated: activated.length,
-      total_amount: totalAmount,
-      expires_at: expiresAt,
-      details: activated
-    });
+    const totalStudents = parentDetails.reduce((sum, p) => sum + p.childCount, 0);
+    const totalAmount = parentDetails.reduce((sum, p) => sum + p.amount, 0);
+
+    // Insert premium_bulk_payments record for tracking
+    const [resIns] = await req.db.execute(
+      `INSERT INTO premium_bulk_payments (school_id, term, year, amount, total_students, initiated_by_phone, payment_status)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending')`,
+      [school_id, term, year, totalAmount, totalStudents, recorded_by || school_phone]
+    );
+    const paymentId = resIns.insertId;
+    const reference = `BAZPAY-${paymentId}`;
+
+    // Insert STK_PENDING payment_ledger rows for each selected parent with same reference
+    const conn = await req.db.getConnection();
+    try {
+      await conn.beginTransaction();
+      for (const p of parentDetails) {
+        await conn.execute(
+          `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, notes, recorded_by, logged_at)
+           VALUES (?, ?, ?, ?, 'M-Pesa-Pending', ?, ?, ?, 'STK_PENDING', ?, NOW())`,
+          [reference, p.amount, p.phone, `SUB-${p.phone}`, school_id, term, year, recorded_by || 'BAZAR']
+        );
+      }
+      await conn.commit();
+    } catch (err) {
+      await conn.rollback();
+      throw err;
+    } finally {
+      conn.release();
+    }
+
+    // Ensure school has callback key
+    const [schoolRows] = await req.db.execute('SELECT mpesa_callback_key FROM schools WHERE school_id = ?', [school_id]);
+    const callbackKey = schoolRows[0]?.mpesa_callback_key || await ensureSchoolCallbackKey(req.db, school_id);
+
+    // Initiate STK push to school office phone
+    const mpesa = require('../services/mpesa');
+    const stk = await mpesa.stkPush(school_phone, totalAmount, reference, 'School selected subscriptions payment', { callbackKey });
+
+    // Store the transaction reference in the bulk tracking row
+    await req.db.execute('UPDATE premium_bulk_payments SET transaction_reference = ? WHERE payment_id = ?', [reference, paymentId]);
+
+    if (stk.ResponseCode === '0') {
+      return res.json({ success: true, status: 'pending', checkout_request_id: stk.CheckoutRequestID, transaction_reference: reference, amount: totalAmount, total_students: totalStudents, parents: eligibleParentPhones.length });
+    }
+
+    // Mark bulk record failed
+    await req.db.execute('UPDATE premium_bulk_payments SET payment_status = ? WHERE payment_id = ?', ['failed', paymentId]);
+    return res.status(502).json({ error: 'M-Pesa STK push failed', detail: stk });
   } catch (err) {
-    await conn.rollback();
-    console.error('[BAZAR PAY SUBSCRIPTION]', err.message);
+    console.error('[BAZAR SELECTED BULK STK]', err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    conn.release();
   }
 });
 

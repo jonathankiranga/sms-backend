@@ -365,7 +365,7 @@ function renderSchoolsTable(filter) {
     '</div>' +
     (rows.length ? '<div class="table-wrap"><table><thead><tr><th>School ID</th><th>Name</th><th>Region</th><th>Created</th><th></th></tr></thead><tbody>' +
       rows.map(function(s) {
-        return '<tr><td style="font-family:monospace;font-size:12px">' + s.school_id + '</td><td><b>' + s.school_name + '</b></td><td>' + (s.region || '&mdash;') + '</td><td class="text-muted">' + (s.created_at ? new Date(s.created_at).toLocaleDateString() : '&mdash;') + '</td><td><button class="btn-del" onclick="deleteSchool(\'' + s.school_id + '\')">Delete</button></td></tr>';
+        return '<tr><td style="font-family:monospace;font-size:12px">' + s.school_id + '</td><td><b>' + s.school_name + '</b></td><td>' + (s.region || '&mdash;') + '</td><td class="text-muted">' + (s.created_at ? new Date(s.created_at).toLocaleDateString() : '&mdash;') + '</td><td style="width:220px;display:flex;gap:8px;justify-content:flex-end">' + '<button class="btn-add-sm" onclick="showMpesaCallbacks(\'' + s.school_id + '\')">MPESA URLs</button>' + '<button class="btn-del" onclick="deleteSchool(\'' + s.school_id + '\')">Delete</button>' + '</td></tr>';
       }).join('') +
     '</tbody></table><div class="pagination"><span>' + rows.length + ' school' + (rows.length !== 1 ? 's' : '') + '</span></div></div>' : '<div class="empty">No schools match</div>');
 }
@@ -403,6 +403,46 @@ function deleteSchool(id) {
   api('/schools/' + id, { method: 'DELETE' })
     .then(function() { renderSchools(); showMsg('schools-msg', 'Deleted', true); })
     .catch(function(e) { showMsg('schools-msg', e.message, false); });
+}
+
+function showMpesaCallbacks(schoolId) {
+  var el = document.getElementById('content');
+  // fetch callback URLs (ensures key exists)
+  api('/schools/' + encodeURIComponent(schoolId) + '/mpesa-callbacks')
+    .then(function(r) {
+      var html = '<div style="font-size:13px">' +
+        '<div style="margin-bottom:8px"><b>Public (register these with Daraja)</b></div>' +
+        '<div style="font-family:monospace;background:#F8FAFC;padding:8px;border-radius:6px;margin-bottom:6px">Validation: ' + r.public.validation + '</div>' +
+        '<div style="font-family:monospace;background:#F8FAFC;padding:8px;border-radius:6px;margin-bottom:6px">Confirmation: ' + r.public.confirmation + '</div>' +
+        '<div style="font-family:monospace;background:#F8FAFC;padding:8px;border-radius:6px;margin-bottom:10px">STK result: ' + r.public.stk + '</div>' +
+        '<div style="margin-bottom:8px"><b>Internal (for debugging only)</b></div>' +
+        '<div style="font-family:monospace;background:#FFF7ED;padding:8px;border-radius:6px;margin-bottom:6px">Validation: ' + r.secret.validation + '</div>' +
+        '<div style="font-family:monospace;background:#FFF7ED;padding:8px;border-radius:6px;margin-bottom:6px">Confirmation: ' + r.secret.confirmation + '</div>' +
+        '<div style="font-family:monospace;background:#FFF7ED;padding:8px;border-radius:6px;margin-bottom:12px">STK result: ' + r.secret.stk + '</div>' +
+        '<div style="display:flex;gap:8px"><button class="btn-add btn-add-sm" onclick="copyToClipboard(\'' + r.public.validation + '\')">Copy Validation</button><button class="btn-add btn-add-sm" onclick="copyToClipboard(\'' + r.public.confirmation + '\')">Copy Confirmation</button><button class="btn-add btn-add-sm" onclick="copyToClipboard(\'' + r.public.stk + '\')">Copy STK URL</button></div>' +
+        '<div style="margin-top:12px;font-size:12px;color:#555">Note: Give the <b>public</b> URLs to Safaricom/Daraja when registering. The internal URLs are for debugging and should not be exposed.</div>' +
+        '</div>';
+      openModal('M-Pesa Callback URLs for ' + schoolId, html, null);
+    }).catch(function(e) {
+      alert('Failed to fetch callback URLs: ' + (e.message || e.error || JSON.stringify(e)));
+    });
+}
+
+function copyToClipboard(text) {
+  if (!text) return;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(function() { alert('Copied!'); }).catch(function() { fallbackCopy(text); });
+  } else {
+    fallbackCopy(text);
+  }
+}
+function fallbackCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); alert('Copied!'); } catch (e) { prompt('Copy this URL:', text); }
+  document.body.removeChild(ta);
 }
 
 // === CLASSES ===
@@ -939,19 +979,11 @@ function renderSettings() {
     el.innerHTML =
       '<div class="card" style="padding:24px;background:var(--card);border-radius:var(--radius);box-shadow:0 1px 3px rgba(0,0,0,0.06);max-width:500px">' +
         '<h3 style="font-size:15px;font-weight:700;margin-bottom:4px">Pricing Settings</h3>' +
-        '<p style="font-size:12px;color:var(--text2);margin-bottom:20px">Configure premium and merchant pricing (KSh)</p>' +
+        '<p style="font-size:12px;color:var(--text2);margin-bottom:20px">Configure premium pricing (KSh)</p>' +
         '<div id="settings-msg" class="msg"></div>' +
         '<div class="settings-form">' +
           '<label>Premium (per term)</label>' +
           '<input id="s-premium_price" type="number" value="' + (s.premium_price || '100') + '" />' +
-          '<label>Merchant 7 days</label>' +
-          '<input id="s-merchant_7_day" type="number" value="' + (s.merchant_7_day || '200') + '" />' +
-          '<label>Merchant 14 days</label>' +
-          '<input id="s-merchant_14_day" type="number" value="' + (s.merchant_14_day || '350') + '" />' +
-          '<label>Merchant 30 days</label>' +
-          '<input id="s-merchant_30_day" type="number" value="' + (s.merchant_30_day || '500') + '" />' +
-          '<label>Merchant 90 days</label>' +
-          '<input id="s-merchant_90_day" type="number" value="' + (s.merchant_90_day || '1200') + '" />' +
           '<button onclick="saveSettings()" class="btn-add" style="margin-top:18px;width:100%;justify-content:center">Save Settings</button>' +
         '</div>' +
       '</div>';
@@ -961,7 +993,7 @@ function renderSettings() {
 }
 
 function saveSettings() {
-  var keys = ['premium_price', 'merchant_7_day', 'merchant_14_day', 'merchant_30_day', 'merchant_90_day'];
+  var keys = ['premium_price'];
   var settings = {};
   keys.forEach(function(k) {
     var el = document.getElementById('s-' + k);

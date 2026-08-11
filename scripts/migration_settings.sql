@@ -5,8 +5,4 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 
 INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES
-  ('premium_price', '100'),
-  ('merchant_7_day', '200'),
-  ('merchant_14_day', '350'),
-  ('merchant_30_day', '500'),
-  ('merchant_90_day', '1200');
+  ('premium_price', '100');

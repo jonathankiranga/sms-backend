@@ -70,33 +70,12 @@ router.post('/campaigns', async (req, res) => {
   const duration = Math.min(Math.max(parseInt(days) || 7, 1), 60);
   const startDate = new Date().toISOString().slice(0, 10);
   const endDate = new Date(Date.now() + duration * 86400000).toISOString().slice(0, 10);
-  // Get campaign price from settings (key uses the actual duration)
-  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = ?", ['merchant_' + duration + '_day']);
-  const price = parseInt(setting[0]?.setting_value || '0');
-
-  // If M-Pesa is configured and price > 0, create as Pending (requires payment)
-  const status = (process.env.MPESA_CONSUMER_KEY && price > 0) ? 'Pending' : 'Active';
 
   const [result] = await req.db.execute(
     'INSERT INTO marketplace_campaigns (target_school_id, merchant_name, merchant_phone, message, banner_image_url, target_link, status, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [target_school_id, m[0].business_name, m[0].phone || null, message, '', '#', status, startDate, endDate]
+    [target_school_id, m[0].business_name, m[0].phone || null, message, '', '#', 'Active', startDate, endDate]
   );
   const campaignId = result.insertId;
-
-  // If payment required, initiate STK push
-  if (status === 'Pending') {
-    try {
-      const mpesa = require('../services/mpesa');
-      const txnRef = 'CAM' + campaignId;
-      const pushResult = await mpesa.stkPush(m[0].phone || req.body.phone, price, txnRef, 'Education APP Advert');
-      if (pushResult.ResponseCode === '0') {
-        return res.json({ message: 'Campaign created. Pay via M-Pesa to activate.', campaign_id: campaignId, checkout_request_id: pushResult.CheckoutRequestID, amount: price, status: 'pending' });
-      }
-    } catch (err) {
-      console.error('[MERCHANT] STK push failed:', err.message);
-    }
-    return res.json({ message: 'Campaign created. Payment required to activate.', campaign_id: campaignId, amount: price, status: 'pending' });
-  }
 
   res.json({ message: 'Campaign created', campaign_id: campaignId, days: duration });
 });

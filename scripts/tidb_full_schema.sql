@@ -127,13 +127,15 @@ CREATE TABLE IF NOT EXISTS otp_sessions (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS attendance_logs (
-  log_id          BIGINT   PRIMARY KEY AUTO_INCREMENT,
-  student_id      CHAR(9)  NOT NULL,
-  teacher_id      CHAR(9)  NOT NULL,
-  attendance_date DATE     NOT NULL,
-  status          ENUM('Present','Absent','Late','Excused') NOT NULL,
-  marked_at       DATETIME NULL,
-  synced_at       DATETIME NULL,
+  log_id                BIGINT   PRIMARY KEY AUTO_INCREMENT,
+  student_id            CHAR(9)  NOT NULL,
+  teacher_id            CHAR(9)  NOT NULL,
+  attendance_date       DATE     NOT NULL,
+  status                ENUM('Present','Absent','Late','Excused') NOT NULL,
+  marked_at             DATETIME NULL,
+  synced_at             DATETIME NULL,
+  absence_alerted_at    DATETIME NULL,
+  consecutive_alerted_at DATETIME NULL,
   UNIQUE KEY uq_student_date (student_id, attendance_date),
   FOREIGN KEY (student_id)  REFERENCES students(student_id),
   FOREIGN KEY (teacher_id)  REFERENCES teachers(teacher_id)
@@ -494,11 +496,7 @@ CREATE TABLE IF NOT EXISTS migrations_history (
 -- ── SEED DATA ────────────────────────────────────────────────
 
 INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES
-  ('premium_price',   '100'),
-  ('merchant_7_day',  '200'),
-  ('merchant_14_day', '350'),
-  ('merchant_30_day', '500'),
-  ('merchant_90_day', '1200');
+  ('premium_price', '100');
 
 INSERT IGNORE INTO core_competencies (competency_id, competency_name, category, description) VALUES
   (1,  'Communication and Collaboration',    'competency', 'Ability to express ideas and work with others'),

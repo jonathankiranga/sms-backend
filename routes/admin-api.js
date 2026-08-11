@@ -23,6 +23,42 @@ router.get('/schools', async (req, res) => {
   res.json({ schools: rows });
 });
 
+// GET /admin/api/schools/:id/mpesa-callbacks
+// Returns or generates the mpesa callback key and public/secret URLs for registration
+router.get('/schools/:id/mpesa-callbacks', async (req, res) => {
+  const schoolId = req.params.id;
+  // fetch existing key
+  const [rows] = await req.db.execute('SELECT mpesa_callback_key FROM schools WHERE school_id = ? LIMIT 1', [schoolId]);
+  if (rows.length === 0) return res.status(404).json({ error: 'School not found' });
+  let key = rows[0].mpesa_callback_key;
+  const crypto = require('crypto');
+  // ensure key exists, retry on duplicate
+  if (!key) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      key = crypto.randomBytes(16).toString('hex');
+      try {
+        await req.db.execute('UPDATE schools SET mpesa_callback_key = ? WHERE school_id = ?', [key, schoolId]);
+        break;
+      } catch (err) {
+        if (err && err.code === 'ER_DUP_ENTRY') { key = null; continue; }
+        throw err;
+      }
+    }
+    if (!key) return res.status(500).json({ error: 'Failed to allocate callback key' });
+  }
+  const baseUrl = process.env.BASE_URL || (req.get('origin') || `${req.protocol}://${req.get('host')}`);
+  const publicValidation = `${baseUrl.replace(/\/$/, '')}/cb/${key}/v`;
+  const publicConfirmation = `${baseUrl.replace(/\/$/, '')}/cb/${key}/c`;
+  const publicStk = `${baseUrl.replace(/\/$/, '')}/cb/${key}/s`;
+  const secretValidation = `${baseUrl.replace(/\/$/, '')}/v1/payments/secret/${key}/v`;
+  const secretConfirmation = `${baseUrl.replace(/\/$/, '')}/v1/payments/secret/${key}/c`;
+  const secretStk = `${baseUrl.replace(/\/$/, '')}/v1/payments/secret/${key}/s`;
+  return res.json({ mpesa_callback_key: key,
+    public: { validation: publicValidation, confirmation: publicConfirmation, stk: publicStk },
+    secret: { validation: secretValidation, confirmation: secretConfirmation, stk: secretStk }
+  });
+});
+
 router.post('/schools', async (req, res) => {
   const { school_id, school_name, region, sales_rep_id } = req.body;
   if (!school_id || !school_name) return res.status(400).json({ error: 'school_id and school_name required' });

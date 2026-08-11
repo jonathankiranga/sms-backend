@@ -320,7 +320,7 @@ router.get('/payment-status', async (req, res) => {
   // Check if the pending record was updated to STK_COMPLETED (callback arrived)
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
-     WHERE (student_reference LIKE 'UPG%' OR transaction_reference LIKE 'UPG%')
+     WHERE (student_reference LIKE 'UPG%' OR transaction_reference LIKE 'UPG%' OR student_reference LIKE 'BAZPAY-%' OR transaction_reference LIKE 'BAZPAY-%')
        AND parent_phone = ?
        AND notes IN ('STK_COMPLETED', 'STK_PENDING')
      ORDER BY logged_at DESC LIMIT 1`,
