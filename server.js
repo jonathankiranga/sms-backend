@@ -24,6 +24,16 @@ const competencyRoutes = require('./routes/competencies');
 const bazarPayRoutes = require('./routes/bazarPay');
 const examSessionRoutes = require('./routes/examSessions');
 
+process.on('uncaughtException', (err) => {
+  console.error('[CRASH-GUARD] uncaughtException:', err);
+  if (err && err.stack) console.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[CRASH-GUARD] unhandledRejection:', reason);
+  if (reason && reason.stack) console.error(reason.stack);
+});
+
 const app = express();
 const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,https://headteacher-frontend.vercel.app,http://localhost:5173,http://localhost:3000';
 const configuredOrigins = (process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean);
@@ -476,6 +486,13 @@ app.get('/health', async (req, res) => {
     console.error('[HEALTH]', err.message);
     res.status(500).json({ status: 'error', db: 'Database connection failed' });
   }
+});
+
+// Central error handler — keeps API responses consistent and never crashes the server
+app.use((err, req, res, next) => {
+  console.error('[UNHANDLED ROUTE ERROR]', req.method, req.originalUrl, err);
+  if (res.headersSent) return next(err);
+  res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
 const PORT = process.env.PORT || 3000;

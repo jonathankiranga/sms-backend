@@ -488,3 +488,4 @@ router.post('/:school_id/register', async (req, res) => {
 });
 
 module.exports = router;
+router.ensureSchoolCallbackKey = ensureSchoolCallbackKey;

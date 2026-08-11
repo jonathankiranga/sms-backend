@@ -1,4 +1,5 @@
 const express = require('express');
+const { ensureSchoolCallbackKey } = require('./payments');
 const router = express.Router();
 
 // GET /api/bazar-pay/fee-structures/:school_id — list fee items for a school
