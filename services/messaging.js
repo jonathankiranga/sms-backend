@@ -50,25 +50,25 @@ async function sendAbsenceAlert(parentPhone, studentName, schoolName, date) {
   ]);
 }
 
-// OTP sending: prefer Africa's Talking SMS for OTP delivery. Falls back to WhatsApp template if configured and AT not set, or to logging in dev.
+// OTP sending: Africa's Talking SMS for phone OTP delivery. Falls back to WhatsApp template or console log.
 async function sendOtp(phone, code) {
-  const msg = process.env.OTP_SMS_TEMPLATE || `Your verification code is ${code}`;
-  // If AT credentials exist, use africastalking via sendSms override
+  const msg = process.env.OTP_SMS_TEMPLATE || `Your Education APP verification code is ${code}. Valid for 5 minutes.`;
+  // If AT credentials exist, send via Africa's Talking SMS
   if (process.env.AT_API_KEY && process.env.AT_USERNAME) {
     return await sendSms(phone, msg, 'africastalking');
   }
-  // If Meta WhatsApp configured, use WhatsApp template as fallback
+  // If Meta WhatsApp configured, fallback to WhatsApp template
   if (process.env.META_ACCESS_TOKEN && process.env.PHONE_NUMBER_ID) {
     try {
       const result = await sendTemplate(phone, process.env.WHATSAPP_TEMPLATE_OTP || 'otp_verification', [code]);
       return result;
     } catch (e) {
-      console.error('[OTP] WhatsApp send failed, falling back to log:', e.message);
+      console.error('[OTP] WhatsApp fallback failed:', e.message);
     }
   }
-  // last resort: log the OTP
-  console.log(`[OTP] To ${phone}: ${code}`);
-  return { provider: 'log', status: 'logged' };
+  // last resort: log the OTP for local dev/testing
+  console.log(`[OTP][DEV] To ${phone}: ${code}`);
+  return { provider: 'log', status: 'logged', phone, code };
 }
 
 // Email OTP support — simple fallback logger. If you configure EMAIL_PROVIDER and implement sending logic, replace this.
@@ -78,7 +78,6 @@ async function sendEmailOtp(email, code) {
     console.log(`[EMAIL] To ${email}: Your verification code is ${code}`);
     return { provider: 'log', status: 'logged' };
   }
-  // Placeholder: implement real email sending (SMTP, SendGrid, SES...) if desired.
   console.warn('[EMAIL] sendEmailOtp called but no provider implemented; set EMAIL_PROVIDER and add implementation.');
   return { provider: 'none' };
 }
@@ -107,29 +106,57 @@ async function sendBroadcast(parentPhone, schoolName, message) {
   ]);
 }
 
-// SMS fallback — used when WhatsApp fails
+// SMS delivery via Africa's Talking (or log fallback)
 async function sendSms(phone, message, providerOverride) {
-  const provider = providerOverride || process.env.SMS_PROVIDER || 'log';
-  if (provider === 'log') {
-    console.log(`[SMS] To ${phone}: ${message}`);
-    return { provider: 'log', status: 'logged' };
+  const provider = providerOverride || process.env.SMS_PROVIDER || 'africastalking';
+  const apiKey = process.env.AT_API_KEY;
+  const username = process.env.AT_USERNAME || 'sandbox';
+  const senderId = process.env.AT_SENDER_ID;
+
+  // Format phone to E.164 (e.g. +254712345678)
+  let formattedPhone = (phone || '').toString().trim().replace(/\s+/g, '');
+  if (formattedPhone.startsWith('0')) {
+    formattedPhone = '+254' + formattedPhone.slice(1);
+  } else if (!formattedPhone.startsWith('+')) {
+    formattedPhone = '+' + formattedPhone;
   }
+
+  if (provider === 'log' || !apiKey) {
+    console.log(`[SMS][AT-MOCK] To ${formattedPhone}: ${message}`);
+    return { provider: 'log', status: 'logged', phone: formattedPhone, message };
+  }
+
   if (provider === 'africastalking') {
+    const isSandbox = username.toLowerCase() === 'sandbox';
+    const url = isSandbox
+      ? 'https://api.sandbox.africastalking.com/version1/messaging'
+      : 'https://api.africastalking.com/version1/messaging';
+
+    const formData = new URLSearchParams();
+    formData.append('username', username);
+    formData.append('to', formattedPhone);
+    formData.append('message', message);
+    if (senderId && !isSandbox) {
+      formData.append('from', senderId);
+    }
+
     try {
-      const resp = await axios.post('https://api.africastalking.com/version1/messaging', null, {
-        params: {
-          username: process.env.AT_USERNAME || 'sandbox',
-          to: phone,
-          message: message,
-          from: process.env.AT_SENDER_ID || ''
+      const resp = await axios.post(url, formData.toString(), {
+        headers: {
+          'ApiKey': apiKey,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json'
         },
-        headers: { 'ApiKey': process.env.AT_API_KEY || '', 'Accept': 'application/json' }
+        timeout: 10000
       });
-      console.log(`[SMS] Sent to ${phone}: ${resp.data?.SMSMessageData?.Recipients?.[0]?.status}`);
+
+      const recipientStatus = resp.data?.SMSMessageData?.Recipients?.[0]?.status;
+      console.log(`[SMS][AT] Sent to ${formattedPhone}: ${recipientStatus || 'Success'}`);
       return resp.data;
     } catch (err) {
-      console.error(`[SMS] Failed to send to ${phone}: ${err.message}`);
-      return { error: err.message };
+      const detail = err.response?.data?.SMSMessageData?.Message || err.response?.data || err.message;
+      console.error(`[SMS][AT] Failed to send to ${formattedPhone}:`, detail);
+      return { error: detail };
     }
   }
   return { provider: 'none', status: 'unsupported' };

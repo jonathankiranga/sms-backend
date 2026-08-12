@@ -100,7 +100,7 @@ async function handleStkCallback(req, res, school_id) {
 
     const { ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
     if (ResultCode !== 0) {
-      console.log(`[STK][${school_id}] Payment failed:`, ResultDesc);
+      console.log(`[STK][${school_id || 'GLOBAL'}] Payment failed:`, ResultDesc);
       return res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
     }
 
@@ -110,18 +110,72 @@ async function handleStkCallback(req, res, school_id) {
       return item ? item.Value : null;
     };
 
-    const phone = (getVal('PhoneNumber') || '').toString();
+    const phoneOrHash = (getVal('PhoneNumber') || '').toString();
     const amount = parseFloat(getVal('Amount') || 0);
     const receipt = (getVal('MpesaReceiptNumber') || '').toString();
     const ref = (Body.stkCallback.AccountReference || '').toString();
 
-    console.log(`[STK][${school_id}] ${phone} paid KSh ${amount} — ref ${receipt} (${ref})`);
+    console.log(`[STK][${school_id || 'GLOBAL'}] ${phoneOrHash} paid KSh ${amount} — ref ${receipt} (${ref})`);
 
-    await req.db.execute(
-      `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, logged_at)
-       VALUES (?, ?, ?, ?, 'M-Pesa', ?, ?, ?, NOW())`,
-      [receipt, amount, phone, ref, school_id, Body.stkCallback.term || null, Body.stkCallback.year || null]
+    const [pending] = await req.db.execute(
+      "SELECT parent_phone FROM payment_ledger WHERE transaction_reference = ? AND notes = 'STK_PENDING' LIMIT 1",
+      [ref]
     );
+    const pendingParentPhone = pending.length > 0 ? pending[0].parent_phone : null;
+
+    const isHashed = /^[a-f0-9]{64}$/i.test(phoneOrHash);
+    let phone = phoneOrHash;
+    if (pendingParentPhone) {
+      phone = pendingParentPhone;
+    }
+
+    if (isHashed && !pendingParentPhone) {
+      console.warn(`[STK] Cannot resolve hashed phone for ref ${ref}`);
+      await req.db.execute(
+        'INSERT IGNORE INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes) VALUES (?, ?, ?, ?, ?, NOW(), ?)',
+        [receipt, amount, phoneOrHash, ref, 'M-Pesa', 'HASHED_PHONE_UNRESOLVED']
+      );
+      return res.status(200).json({ ResultCode: 0, ResultDesc: 'Success — pending manual reconciliation' });
+    }
+
+    if (ref.startsWith('UPG') || ref.startsWith('BAZPAY-')) {
+      const [link] = await req.db.execute(
+        'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
+        [phone]
+      );
+      let expiresAt = new Date(Date.now() + 90 * 86400000);
+      if (link.length > 0) {
+        const [termRow] = await req.db.execute(
+          'SELECT MIN(start_date) AS next_start FROM school_terms WHERE school_id = ? AND start_date > CURDATE()',
+          [link[0].school_id]
+        );
+        if (termRow.length > 0 && termRow[0].next_start) {
+          expiresAt = new Date(termRow[0].next_start);
+        }
+      }
+      await req.db.execute(
+        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+        [expiresAt, phone]
+      );
+
+      const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
+      const currentYear = new Date().getFullYear();
+      const activeSchoolId = school_id || (link.length > 0 ? link[0].school_id : null);
+      if (activeSchoolId) {
+        await req.db.execute(
+          `INSERT INTO premium_subscriptions
+           (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
+           VALUES (?, ?, ?, ?, 'parent', 'paid', ?, NOW(), ?)
+           ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at), amount = VALUES(amount)`,
+          [activeSchoolId, phone, currentTerm, currentYear, amount, expiresAt]
+        );
+      }
+
+      await req.db.execute(
+        "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
+        [receipt, ref]
+      );
+    }
 
     if (ref.startsWith('BLK-')) {
       const paymentId = parseInt(ref.replace('BLK-', ''), 10);
@@ -131,40 +185,87 @@ async function handleStkCallback(req, res, school_id) {
         "UPDATE premium_bulk_payments SET payment_status = 'completed', paid_at = NOW(), transaction_reference = ? WHERE payment_id = ?",
         [receipt, paymentId]
       );
-      const [parents] = await req.db.execute(
-        `SELECT DISTINCT spm.parent_phone
-         FROM student_parent_map spm
-         JOIN students s ON spm.student_id = s.student_id
-         WHERE s.school_id = ? AND s.enrollment_status = 'Active'`,
-        [school_id]
-      );
-      const { getNextTermStart } = require('../lib/config');
-      const expiresAt = await getNextTermStart(req.db, school_id);
-      for (const p of parents) {
-        await req.db.execute(
-          'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',
-          [p.parent_phone]
+
+      const activeSchoolId = school_id || null;
+      if (activeSchoolId) {
+        const [parents] = await req.db.execute(
+          `SELECT DISTINCT spm.parent_phone
+           FROM student_parent_map spm
+           JOIN students s ON spm.student_id = s.student_id
+           WHERE s.school_id = ? AND s.enrollment_status = 'Active'`,
+          [activeSchoolId]
         );
-        await req.db.execute(
-          `INSERT INTO premium_subscriptions (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
-           VALUES (?, ?, ?, ?, 'school', 'paid', 0, NOW(), ?)
-           ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at)`,
-          [school_id, p.parent_phone, currentTerm, currentYear, expiresAt]
-        );
-        await req.db.execute(
-          'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
-          [expiresAt, p.parent_phone]
-        );
+        const { getNextTermStart } = require('../lib/config');
+        const expiresAt = await getNextTermStart(req.db, activeSchoolId);
+        for (const p of parents) {
+          await req.db.execute(
+            'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',
+            [p.parent_phone]
+          );
+          await req.db.execute(
+            `INSERT INTO premium_subscriptions (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
+             VALUES (?, ?, ?, ?, 'school', 'paid', 0, NOW(), ?)
+             ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at)`,
+            [activeSchoolId, p.parent_phone, currentTerm, currentYear, expiresAt]
+          );
+          await req.db.execute(
+            'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
+            [expiresAt, p.parent_phone]
+          );
+        }
+        console.log(`[BLK][${activeSchoolId}] Bulk premium activated for ${parents.length} parents`);
       }
-      console.log(`[BLK][${school_id}] Bulk premium activated for ${parents.length} parents`);
     }
+
+    await req.db.execute(
+      `INSERT IGNORE INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, logged_at)
+       VALUES (?, ?, ?, ?, 'M-Pesa', ?, ?, ?, NOW())`,
+      [receipt, amount, phone, ref, school_id || null, Body.stkCallback.term || null, Body.stkCallback.year || null]
+    );
 
     return res.status(200).json({ ResultCode: 0, ResultDesc: 'Success' });
   } catch (err) {
-    console.error(`[STK CALLBACK ERROR][${school_id}]`, err.message);
+    console.error(`[STK CALLBACK ERROR][${school_id || 'GLOBAL'}]`, err.message);
     return res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
   }
 }
+
+// POST /v1/payments/query — query STK Push status by checkout_request_id or transaction reference
+router.post('/query', async (req, res) => {
+  const { checkout_request_id, transaction_reference } = req.body;
+  if (!checkout_request_id && !transaction_reference) {
+    return res.status(400).json({ error: 'checkout_request_id or transaction_reference required' });
+  }
+
+  // Check ledger first if reference supplied
+  if (transaction_reference) {
+    const [ledger] = await req.db.execute(
+      'SELECT notes, transaction_reference FROM payment_ledger WHERE transaction_reference = ? OR (notes = "STK_COMPLETED" AND transaction_reference = ?) LIMIT 1',
+      [transaction_reference, transaction_reference]
+    );
+    if (ledger.length > 0 && ledger[0].notes === 'STK_COMPLETED') {
+      return res.json({ status: 'completed', ResultCode: '0', ResultDesc: 'The service request is processed successfully.' });
+    }
+  }
+
+  if (checkout_request_id && process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET) {
+    try {
+      const mpesa = require('../services/mpesa');
+      const result = await mpesa.stkPushQuery(checkout_request_id);
+      return res.json({
+        status: result.ResultCode === '0' ? 'completed' : result.ResultCode === '1032' ? 'cancelled' : 'pending',
+        ResultCode: result.ResultCode,
+        ResultDesc: result.ResultDesc,
+        detail: result
+      });
+    } catch (err) {
+      console.error('[STK QUERY ERROR]', err.message);
+      return res.status(500).json({ error: 'Failed to query STK Push status', message: err.message });
+    }
+  }
+
+  return res.json({ status: 'pending', ResultCode: '1', ResultDesc: 'Payment pending confirmation' });
+});
 
 // M-Pesa C2B confirmation callback (Safaricom → us)
 router.post('/mpesa', async (req, res) => {
@@ -199,16 +300,10 @@ router.post('/secret/:callback_key/s', async (req, res) => {
 });
 
 // ===== Public short-form proxy routes (internal rewrite/proxy) =====
-// These endpoints are safe to register with Daraja. They are public and short,
-// but handled internally by the same logic as /secret/:callback_key/* so we
-// do NOT send HTTP redirects — Daraja POSTs directly to these and the server
-// processes them as if they hit /v1/payments/secret/:callback_key/*.
-
 router.post('/cb/:callback_key/v', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
-  // Mirror validation response
   return res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
@@ -216,7 +311,6 @@ router.post('/cb/:callback_key/c', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
-  // Proxy to same confirmation handler
   return handleC2BConfirmation(req, res);
 });
 
@@ -224,117 +318,12 @@ router.post('/cb/:callback_key/s', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
-  // Proxy to same STK handler
   return handleStkCallback(req, res, school.school_id);
 });
 
 // STK Push callback (Safaricom → us after STK push)
 router.post('/callback', async (req, res) => {
-  try {
-    const { Body } = req.body;
-    if (!Body || !Body.stkCallback) {
-      return res.status(200).json({ ResultCode: 1, ResultDesc: 'Invalid callback' });
-    }
-
-    const { ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
-
-    if (ResultCode !== 0) {
-      console.log('[STK] Payment failed:', ResultDesc);
-      return res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
-    }
-
-    const items = CallbackMetadata?.Item || [];
-    const getVal = (name) => {
-      const item = items.find(i => i.Name === name);
-      return item ? item.Value : null;
-    };
-
-    const phoneOrHash = (getVal('PhoneNumber') || '').toString();
-    const amount = parseFloat(getVal('Amount') || 0);
-    const receipt = (getVal('MpesaReceiptNumber') || '').toString();
-    const ref = (Body.stkCallback.AccountReference || '').toString();
-
-    console.log(`[STK] Payment received — ref ${receipt} (${ref}), amount KSh ${amount}`);
-
-    const [pending] = await req.db.execute(
-      "SELECT parent_phone FROM payment_ledger WHERE transaction_reference = ? AND notes = 'STK_PENDING' LIMIT 1",
-      [ref]
-    );
-    const pendingParentPhone = pending.length > 0 ? pending[0].parent_phone : null;
-
-    // Phone number may be hashed (SHA-256) due to data protection.
-    // If it's a 64-char hex string, we'll try to resolve the actual parent phone from the pending STK record.
-    const isHashed = /^[a-f0-9]{64}$/i.test(phoneOrHash);
-    let phone = phoneOrHash;
-    if (pendingParentPhone) {
-      phone = pendingParentPhone;
-      if (isHashed) {
-        console.log(`[STK] Resolved hashed phone to ${phone} via pending record`);
-      } else {
-        console.log(`[STK] Using pending parent phone ${phone} for ref ${ref}`);
-      }
-    }
-
-    if (isHashed && !pendingParentPhone) {
-      console.warn(`[STK] Cannot resolve hashed phone for ref ${ref} — no pending record found`);
-      await req.db.execute(
-        'INSERT IGNORE INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes) VALUES (?, ?, ?, ?, ?, NOW(), ?)',
-        [receipt, amount, phoneOrHash, ref, 'M-Pesa', 'HASHED_PHONE_UNRESOLVED']
-      );
-      return res.status(200).json({ ResultCode: 0, ResultDesc: 'Success — pending manual reconciliation' });
-    }
-
-    // If reference starts with UPG or BAZPAY-, it's a premium upgrade or bazar collection for a parent.
-    if (ref.startsWith('UPG') || ref.startsWith('BAZPAY-')) {
-      const [link] = await req.db.execute(
-        'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
-        [phone]
-      );
-      let expiresAt = new Date(Date.now() + 90 * 86400000);
-      if (link.length > 0) {
-        const [termRow] = await req.db.execute(
-          'SELECT MIN(start_date) AS next_start FROM school_terms WHERE school_id = ? AND start_date > CURDATE()',
-          [link[0].school_id]
-        );
-        if (termRow.length > 0 && termRow[0].next_start) {
-          expiresAt = new Date(termRow[0].next_start);
-        }
-      }
-      await req.db.execute(
-        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
-        [expiresAt, phone]
-      );
-
-      const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
-      const currentYear = new Date().getFullYear();
-      const activeSchoolId = school_id || (link.length > 0 ? link[0].school_id : null);
-      if (activeSchoolId) {
-        await req.db.execute(
-          `INSERT INTO premium_subscriptions
-           (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
-           VALUES (?, ?, ?, ?, 'parent', 'paid', ?, NOW(), ?)
-           ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at), amount = VALUES(amount)`,
-          [activeSchoolId, phone, currentTerm, currentYear, amount, expiresAt]
-        );
-      }
-
-      // Mark the pending record as completed
-      await req.db.execute(
-        "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
-        [receipt, ref]
-      );
-    }
-
-    await req.db.execute(
-      'INSERT IGNORE INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at) VALUES (?, ?, ?, ?, ?, NOW())',
-      [receipt, amount, phone, ref, 'M-Pesa']
-    );
-
-    res.status(200).json({ ResultCode: 0, ResultDesc: 'Success' });
-  } catch (err) {
-    console.error('[STK CALLBACK ERROR]', err.message);
-    res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
-  }
+  return handleStkCallback(req, res, null);
 });
 
 // ===== Dynamic per-school M-Pesa routes =====
