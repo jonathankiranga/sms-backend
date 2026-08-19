@@ -35,7 +35,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const app = express();
-const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,https://headteacher-frontend.vercel.app,http://localhost:5173,http://localhost:3000';
+const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,https://headteacher-frontend.vercel.app,https://admin.smarternowapps.co.ke,http://localhost:5173,http://localhost:3000';
 const configuredOrigins = (process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean);
 const allowedOrigins = [...new Set([...configuredOrigins, ...defaultOrigins.split(',')])];
 
