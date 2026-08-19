@@ -18,10 +18,11 @@ router.post('/request-otp', async (req, res) => {
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');
 
-  // Store session with phone and/or email populated
+  // Store session with phone and/or email populated.
+  // otp_sessions.phone is NOT NULL, so use '' (empty string) for email-only logins.
   await req.db.execute(
     'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE)',
-    [sessionId, phone || null, email || null, code]
+    [sessionId, phone || '', email || null, code]
   );
 
   try {

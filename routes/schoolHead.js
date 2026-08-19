@@ -12,9 +12,19 @@ async function requireHead(req, res) {
   if (srows.length === 0) { res.status(401).json({ error: 'Invalid session' }); return null; }
   const sess = srows[0];
   if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
-  // Resolve teacher by phone
-  const [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
-  if (trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
+  // Resolve teacher by phone; if phone is empty (email-only login) resolve by email
+  let trows;
+  if (sess.phone) {
+    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
+  }
+  if (!trows || trows.length === 0) {
+    const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [sessionId]);
+    const email = (sessRows[0] && sessRows[0].email) || null;
+    if (email) {
+      [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ?', [email]);
+    }
+  }
+  if (!trows || trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
   const teacher = trows[0];
   if (teacher.role !== 'head' || teacher.school_id !== req.params.schoolId) { res.status(403).json({ error: 'Only the school head may perform this action' }); return null; }
   return { teacher_id: teacher.teacher_id, role: teacher.role, school_id: teacher.school_id };
@@ -38,7 +48,7 @@ router.post('/:schoolId/teachers', async (req, res) => {
   if (role && role.toLowerCase() === 'head') return res.status(403).json({ error: 'Creating headteachers is restricted to admin only.' });
   if (!full_name || !phone) return res.status(400).json({ error: 'Name and phone required' });
 
-  const teacherId = 'TCH' + Date.now().toString(36).toUpperCase();
+  const teacherId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
 

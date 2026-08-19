@@ -181,6 +181,7 @@ router.post('/:id/results', async (req, res) => {
   const rubricConfig = await getRubricConfig(req.db, session.school_id);
 
   const conn = await req.db.getConnection();
+  let savedCount = 0;
   try {
     await conn.beginTransaction();
     for (const r of results) {

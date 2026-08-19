@@ -19,14 +19,16 @@ router.get('/fee-structures/:school_id', async (req, res) => {
 router.get('/dashboard', async (req, res) => {
   const { school_id, term, year } = req.query;
   if (!school_id) return res.status(400).json({ error: 'school_id required' });
+  const termName = term || `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
+  const yearName = year || new Date().getFullYear();
 
   // Total fee structure amount for this term/year
   const [feeTotal] = await req.db.execute(
-    `SELECT COALESCE(SUM(fa.effective), 0) AS total_expected
+    `SELECT COALESCE(SUM(COALESCE(fa.adjusted_amount, f.amount)), 0) AS total_expected
      FROM (SELECT f.fee_id, f.amount, f.is_optional FROM fee_structures f WHERE f.school_id = ? AND f.term = ? AND f.academic_year = ?) f
      JOIN fee_assignments fa ON f.fee_id = fa.fee_id
      WHERE fa.waived = FALSE`,
-    [school_id, term, year]
+    [school_id, termName, yearName]
   );
 
   // Total paid (non-reversed)
@@ -34,7 +36,7 @@ router.get('/dashboard', async (req, res) => {
     `SELECT COALESCE(SUM(amount), 0) AS total_paid
      FROM payment_ledger
      WHERE school_id = ? AND term = ? AND academic_year = ? AND reversed_at IS NULL`,
-    [school_id, term, year]
+    [school_id, termName, yearName]
   );
 
   // Payment method breakdown
@@ -44,7 +46,7 @@ router.get('/dashboard', async (req, res) => {
      WHERE school_id = ? AND term = ? AND academic_year = ? AND reversed_at IS NULL
      GROUP BY payment_method
      ORDER BY total DESC`,
-    [school_id, term, year]
+    [school_id, termName, yearName]
   );
 
   // Today's collections

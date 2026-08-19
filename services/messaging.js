@@ -71,15 +71,44 @@ async function sendOtp(phone, code) {
   return { provider: 'log', status: 'logged', phone, code };
 }
 
-// Email OTP support — simple fallback logger. If you configure EMAIL_PROVIDER and implement sending logic, replace this.
+// Email OTP support — sends via Resend HTTP API (SMTP is blocked on Render).
+// Requires RESEND_API_KEY env var. Falls back to console log for local dev.
 async function sendEmailOtp(email, code) {
-  const provider = process.env.EMAIL_PROVIDER || 'log';
-  if (provider === 'log') {
-    console.log(`[EMAIL] To ${email}: Your verification code is ${code}`);
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM || 'cbcSchool App <noreply@smarternowapps.co.ke>';
+
+  if (!apiKey) {
+    console.log(`[EMAIL][DEV] To ${email}: Your verification code is ${code}`);
     return { provider: 'log', status: 'logged' };
   }
-  console.warn('[EMAIL] sendEmailOtp called but no provider implemented; set EMAIL_PROVIDER and add implementation.');
-  return { provider: 'none' };
+
+  try {
+    const resp = await axios.post(
+      'https://api.resend.com/emails',
+      {
+        from,
+        to: [email],
+        subject: 'Your Education APP verification code',
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;">
+            <h2 style="color:#7B4F9B;">Education APP</h2>
+            <p>Your verification code is:</p>
+            <p style="font-size:32px;font-weight:bold;letter-spacing:8px;color:#333;">${code}</p>
+            <p style="color:#777;">This code is valid for 5 minutes. Do not share it with anyone.</p>
+            <p style="font-size:12px;color:#aaa;">Powered by Smarternow Data Venture</p>
+          </div>
+        `
+      },
+      { headers: { Authorization: `Bearer ${apiKey}` }, timeout: 15000 }
+    );
+    console.log(`[EMAIL] OTP sent to ${email}: ${resp.data?.id || 'ok'}`);
+    return { provider: 'resend', status: 'sent', id: resp.data?.id };
+  } catch (err) {
+    const detail = err.response?.data?.message || err.message;
+    console.error(`[EMAIL] Resend failed for ${email}: ${detail}`);
+    console.log(`[EMAIL][DEV] To ${email}: Your verification code is ${code}`);
+    return { provider: 'resend', status: 'failed', error: detail };
+  }
 }
 
 async function sendAssessmentAlert(parentPhone, studentName, subject, score, level) {

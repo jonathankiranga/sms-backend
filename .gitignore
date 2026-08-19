@@ -1,2 +1,4 @@
 node_modules/
 .env
+server-test.log
+server-test.err.log

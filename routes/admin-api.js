@@ -1,14 +1,67 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'jonathankiranga@gmail.com';
 
-function requireAuth(req, res, next) {
+// ─── ADMIN EMAIL-OTP LOGIN ─────────────────────────────────────────
+// POST /admin/api/request-otp  { email }  → sends OTP if email is the admin email
+// POST /admin/api/verify-otp   { session_id, code } → returns bearer token (session_id)
+router.post('/request-otp', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  if (email.toLowerCase() !== ADMIN_EMAIL.toLowerCase()) {
+    return res.status(404).json({ error: 'No admin account with that email' });
+  }
+  const code = Math.floor(1000 + Math.random() * 9000).toString();
+  const sessionId = crypto.randomBytes(32).toString('hex');
+  await req.db.execute(
+    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE)',
+    [sessionId, '', email, code]
+  );
+  try {
+    const { sendEmailOtp } = require('../services/messaging');
+    await sendEmailOtp(email, code);
+  } catch (e) {
+    console.error('Admin OTP send failed (non-blocking):', e.message);
+    if (process.env.NODE_ENV !== 'production') console.log('=== Admin OTP for', email, ':', code, '===');
+  }
+  res.json({ session_id: sessionId, message: 'OTP sent' });
+});
+
+router.post('/verify-otp', async (req, res) => {
+  const { session_id, code } = req.body;
+  if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
+  const [rows] = await req.db.execute(
+    'SELECT email FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
+    [session_id, code]
+  );
+  if (rows.length === 0) return res.status(401).json({ error: 'Invalid or expired code' });
+  await req.db.execute('UPDATE otp_sessions SET verified = TRUE, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?', [session_id]);
+  res.json({ email: rows[0].email, session_id, verified: true, token: session_id });
+});
+
+async function requireAuth(req, res, next) {
   const key = req.headers['x-admin-key'];
   const oauthEmail = req.headers['x-admin-oauth-email'];
   if (key === ADMIN_PASSWORD) return next();
   if (oauthEmail && oauthEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase()) return next();
+  // Accept a verified OTP session as bearer token when the session's email is the admin email
+  const auth = (req.headers.authorization || '').trim();
+  if (auth.startsWith('Bearer ')) {
+    const sessionId = auth.split(' ')[1];
+    const [rows] = await req.db.execute(
+      'SELECT email, verified, expires_at FROM otp_sessions WHERE session_id = ?',
+      [sessionId]
+    );
+    if (rows.length > 0 && rows[0].verified && rows[0].expires_at && new Date(rows[0].expires_at) > new Date()) {
+      if ((rows[0].email || '').toLowerCase() === ADMIN_EMAIL.toLowerCase()) {
+        req.adminEmail = rows[0].email;
+        return next();
+      }
+    }
+  }
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
@@ -17,7 +70,7 @@ router.use(requireAuth);
 // SCHOOLS
 router.get('/schools', async (req, res) => {
   const limit = parseInt(req.query.limit) || 0;
-  let sql = 'SELECT school_id, school_name, region, created_at FROM schools ORDER BY school_name';
+  let sql = 'SELECT school_id, school_name, region, sales_rep_id, created_at FROM schools ORDER BY school_name';
   if (limit > 0) sql += ' LIMIT ' + limit;
   const [rows] = await req.db.execute(sql);
   res.json({ schools: rows });
@@ -76,21 +129,321 @@ router.post('/schools', async (req, res) => {
 });
 
 router.delete('/schools/:id', async (req, res) => {
-  await req.db.execute('DELETE FROM attendance_logs WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [req.params.id]);
-  await req.db.execute('DELETE FROM assessment_results WHERE assessment_id IN (SELECT assessment_id FROM assessments WHERE class_id IN (SELECT class_id FROM classes WHERE school_id = ?))', [req.params.id]);
-  await req.db.execute('DELETE FROM assessments WHERE class_id IN (SELECT class_id FROM classes WHERE school_id = ?)', [req.params.id]);
-  await req.db.execute('DELETE FROM sub_strands WHERE strand_id IN (SELECT strand_id FROM strands WHERE area_id IN (SELECT area_id FROM learning_areas WHERE school_id = ?))', [req.params.id]);
-  await req.db.execute('DELETE FROM strands WHERE area_id IN (SELECT area_id FROM learning_areas WHERE school_id = ?)', [req.params.id]);
-  await req.db.execute('DELETE FROM learning_areas WHERE school_id = ?', [req.params.id]);
-  await req.db.execute('DELETE FROM fee_assignments WHERE fee_id IN (SELECT fee_id FROM fee_structures WHERE school_id = ?)', [req.params.id]);
-  await req.db.execute('DELETE FROM fee_structures WHERE school_id = ?', [req.params.id]);
-  await req.db.execute('DELETE FROM marketplace_campaigns WHERE target_school_id = ?', [req.params.id]);
-  await req.db.execute('DELETE FROM student_parent_map WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [req.params.id]);
-  await req.db.execute('DELETE FROM students WHERE school_id = ?', [req.params.id]);
-  await req.db.execute('DELETE FROM teachers WHERE school_id = ?', [req.params.id]);
-  await req.db.execute('DELETE FROM classes WHERE school_id = ?', [req.params.id]);
-  await req.db.execute('DELETE FROM schools WHERE school_id = ?', [req.params.id]);
-  res.json({ deleted: true });
+  const schoolId = req.params.id;
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+    // Students' exam results
+    await conn.execute('DELETE FROM exam_results WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM student_competency_ratings WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM attendance_logs WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM assessment_results WHERE assessment_id IN (SELECT assessment_id FROM assessments WHERE class_id IN (SELECT class_id FROM classes WHERE school_id = ?))', [schoolId]);
+    await conn.execute('DELETE FROM assessments WHERE class_id IN (SELECT class_id FROM classes WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM payment_ledger WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM exam_sessions WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM lesson_plans WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM student_competency_ratings WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM premium_subscriptions WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM premium_bulk_payments WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM promotion_history WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [schoolId]);
+    // Learning areas tree (sub_learning_areas -> learning_areas) and strands tree
+    await conn.execute('DELETE FROM sub_learning_areas WHERE area_id IN (SELECT area_id FROM learning_areas WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM sub_strands WHERE strand_id IN (SELECT strand_id FROM strands WHERE area_id IN (SELECT area_id FROM learning_areas WHERE school_id = ?))', [schoolId]);
+    await conn.execute('DELETE FROM strands WHERE area_id IN (SELECT area_id FROM learning_areas WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM learning_areas WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM fee_assignments WHERE fee_id IN (SELECT fee_id FROM fee_structures WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM fee_structures WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM marketplace_campaigns WHERE target_school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM student_parent_map WHERE student_id IN (SELECT student_id FROM students WHERE school_id = ?)', [schoolId]);
+    await conn.execute('DELETE FROM students WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM teachers WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM student_id_sequences WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM school_streams WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM school_terms WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM school_rubric_config WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM school_report_settings WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM classes WHERE school_id = ?', [schoolId]);
+    await conn.execute('DELETE FROM schools WHERE school_id = ?', [schoolId]);
+    await conn.commit();
+    res.json({ deleted: true });
+  } catch (err) {
+    await conn.rollback();
+    console.error('[DELETE SCHOOL]', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ─── RAPID-START SCHOOL SETUP ──────────────────────────────────────
+// POST /admin/api/schools/setup
+// Creates a school + sales rep + headteacher + classes + learning areas + terms + rubric + fees in one shot.
+// The headteacher's only remaining job is to import students.
+// Body: {
+//   school_name, region, contact_name, contact_phone, contact_email,
+//   headteacher_name, headteacher_phone, headteacher_email,
+//   academic_year, class_names: ["PP1","PP2","Grade 1",...],  // optional, defaults to PP1-Grade 6
+//   premium_payment_model: "parent"|"school", premium_fee_per_term,
+//   fees: [{ name, amount, term }]  // optional
+// }
+router.post('/schools/setup', async (req, res) => {
+  const {
+    school_name, region, contact_name, contact_phone, contact_email,
+    headteacher_name, headteacher_phone, headteacher_email,
+    academic_year, class_names, premium_payment_model, premium_fee_per_term, fees
+  } = req.body;
+
+  if (!school_name) return res.status(400).json({ error: 'school_name required' });
+  if (!headteacher_name || !headteacher_phone) return res.status(400).json({ error: 'headteacher_name and headteacher_phone required' });
+  const year = parseInt(academic_year) || new Date().getFullYear();
+
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Generate unique school_id (SCH + 6 digits)
+    let schoolId = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const candidate = 'SCH' + String(Math.floor(100000 + Math.random() * 900000));
+      const [exist] = await conn.execute('SELECT school_id FROM schools WHERE school_id = ?', [candidate]);
+      if (exist.length === 0) { schoolId = candidate; break; }
+    }
+    if (!schoolId) return res.status(500).json({ error: 'Failed to allocate school id' });
+
+    // Sales rep (reuse the admin's default rep or create a generic one)
+    const [repRows] = await conn.execute("SELECT rep_id FROM sales_reps WHERE email = ? LIMIT 1", [headteacher_email || ADMIN_EMAIL]);
+    let repId = repRows[0]?.rep_id || null;
+    if (!repId) {
+      repId = 'REP' + String(Math.floor(100000 + Math.random() * 900000));
+      await conn.execute('INSERT INTO sales_reps (rep_id, full_name, phone, email) VALUES (?, ?, ?, ?)',
+        [repId, headteacher_name, headteacher_phone, headteacher_email || null]);
+    }
+
+    await conn.execute(
+      `INSERT INTO schools (school_id, school_name, region, contact_name, contact_phone, contact_email,
+         premium_payment_model, premium_fee_per_term, sales_rep_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [schoolId, school_name, region || null, contact_name || null, contact_phone || null, contact_email || null,
+        premium_payment_model === 'school' ? 'school' : 'parent',
+        premium_payment_model === 'school' ? (premium_fee_per_term || 0) : null, repId]
+    );
+
+    // Headteacher
+    const headId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
+    await conn.execute(
+      'INSERT INTO teachers (teacher_id, full_name, phone, email, role, school_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [headId, headteacher_name, headteacher_phone, headteacher_email || null, 'head', schoolId]
+    );
+
+    // Classes — default CBC progression if not provided
+    const defaultClasses = ['PP1', 'PP2', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6'];
+    const classes = Array.isArray(class_names) && class_names.length > 0 ? class_names : defaultClasses;
+    const classRows = [];
+    for (let i = 0; i < classes.length; i++) {
+      const [r] = await conn.execute(
+        'INSERT INTO classes (school_id, class_name, academic_year, class_rank) VALUES (?, ?, ?, ?)',
+        [schoolId, classes[i], year, i + 1]
+      );
+      classRows.push({ class_id: r.insertId, class_name: classes[i] });
+    }
+
+    // Learning areas + sub-areas per level
+    const levelAreas = {
+      'PP1': { areas: ['Language Activities', 'Mathematical Activities', 'Environmental Activities', 'Psychomotor and Creative Activities', 'Religious Education'],
+               subs: { 'Language Activities': ['Listening', 'Speaking', 'Reading'], 'Mathematical Activities': ['Number Work', 'Measurement', 'Geometry'],
+                       'Environmental Activities': ['Our Environment', 'Living Things'], 'Psychomotor and Creative Activities': ['Creative Arts', 'Physical Activities'],
+                       'Religious Education': ['Bible Stories', 'Values'] } },
+      'PP2': { areas: ['Language Activities', 'Mathematical Activities', 'Environmental Activities', 'Psychomotor and Creative Activities', 'Religious Education'],
+               subs: { 'Language Activities': ['Listening', 'Speaking', 'Reading', 'Writing'], 'Mathematical Activities': ['Number Work', 'Measurement', 'Geometry'],
+                       'Environmental Activities': ['Our Environment', 'Living Things'], 'Psychomotor and Creative Activities': ['Creative Arts', 'Physical Activities'],
+                       'Religious Education': ['Bible Stories', 'Values'] } },
+      'Grade 1': { areas: ['English', 'Mathematics', 'Environmental Activities', 'Kiswahili', 'Creative Arts', 'Religious Education'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry'],
+                           'Environmental Activities': ['Our Environment', 'Living Things'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika'],
+                           'Creative Arts': ['Creative Arts', 'Physical Education'], 'Religious Education': ['Stories', 'Values'] } },
+      'Grade 2': { areas: ['English', 'Mathematics', 'Environmental Activities', 'Kiswahili', 'Creative Arts', 'Religious Education'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry'],
+                           'Environmental Activities': ['Our Environment', 'Living Things'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika'],
+                           'Creative Arts': ['Creative Arts', 'Physical Education'], 'Religious Education': ['Stories', 'Values'] } },
+      'Grade 3': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry'],
+                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika'],
+                           'Social Studies': ['Our Environment', 'Our Nation'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
+                           'Religious Education': ['Stories', 'Values'] } },
+      'Grade 4': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
+                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
+                           'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
+                           'Religious Education': ['Stories', 'Values'] } },
+      'Grade 5': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
+                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
+                           'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
+                           'Religious Education': ['Stories', 'Values'] } },
+      'Grade 6': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
+                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
+                           'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
+                           'Religious Education': ['Stories', 'Values'] } }
+    };
+
+    const areaIdCache = {};
+    for (const cls of classes) {
+      const def = levelAreas[cls] || levelAreas['Grade 4'];
+      const areas = def.areas;
+      for (const areaName of areas) {
+        const [a] = await conn.execute(
+          'INSERT INTO learning_areas (school_id, level_name, area_name) VALUES (?, ?, ?)',
+          [schoolId, cls, areaName]
+        );
+        const subs = (def.subs[areaName] || []).map((s, idx) => ({ name: s, order: idx + 1 }));
+        for (const sub of subs) {
+          await conn.execute(
+            'INSERT INTO sub_learning_areas (area_id, sub_area_name, display_order) VALUES (?, ?, ?)',
+            [a.insertId, sub.name, sub.order]
+          );
+        }
+        areaIdCache[`${cls}|${areaName}`] = a.insertId;
+      }
+    }
+
+    // School terms
+    const termDefs = [
+      ['Term 1', `${year}-01-06`, `${year}-04-04`],
+      ['Term 2', `${year}-05-04`, `${year}-08-07`],
+      ['Term 3', `${year}-09-07`, `${year}-11-20`]
+    ];
+    for (const [tname, start, end] of termDefs) {
+      await conn.execute('INSERT INTO school_terms (school_id, term_name, start_date, end_date, academic_year) VALUES (?, ?, ?, ?, ?)',
+        [schoolId, tname, start, end, year]);
+    }
+
+    // Rubric
+    const rubric = [['EE',80,'Exceeding Expectations','#2E7D32'],['ME',60,'Meeting Expectations','#1565C0'],['AE',40,'Approaching Expectations','#E65100'],['BE',0,'Below Expectations','#C62828']];
+    for (const [code, min, label, color] of rubric) {
+      await conn.execute('INSERT INTO school_rubric_config (school_id, level_code, min_percent, label, color) VALUES (?, ?, ?, ?, ?)',
+        [schoolId, code, min, label, color]);
+    }
+
+    // Fee structures (optional) — spread across terms if term not specified
+    if (Array.isArray(fees) && fees.length > 0) {
+      for (const fee of fees) {
+        if (!fee.name || !fee.amount) continue;
+        const terms = fee.term ? [fee.term] : ['Term 1', 'Term 2', 'Term 3'];
+        for (const t of terms) {
+          await conn.execute(
+            'INSERT INTO fee_structures (school_id, fee_name, amount, term, academic_year, is_optional) VALUES (?, ?, ?, ?, ?, ?)',
+            [schoolId, fee.name, fee.amount, t, year, fee.is_optional || false]
+          );
+        }
+      }
+    }
+
+    await conn.commit();
+
+    res.json({
+      success: true,
+      school_id: schoolId,
+      school_name,
+      headteacher_id: headId,
+      headteacher_email: headteacher_email || null,
+      sales_rep_id: repId,
+      classes: classRows,
+      note: 'Headteacher can now log in via email/phone OTP and import students.'
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error('[SCHOOL SETUP]', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// GET /admin/api/schools/:id/details — full snapshot for the admin portal
+// Returns school info, classes, learning areas, fee structures across terms,
+// student counts, and per-term payment summary (paid/unpaid/outstanding).
+router.get('/schools/:id/details', async (req, res) => {
+  const { id } = req.params;
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+
+  const [school] = await req.db.execute(
+    `SELECT s.*, sr.full_name AS sales_rep_name FROM schools s
+     LEFT JOIN sales_reps sr ON s.sales_rep_id = sr.rep_id
+     WHERE s.school_id = ?`, [id]);
+  if (school.length === 0) return res.status(404).json({ error: 'School not found' });
+
+  const [classes] = await req.db.execute(
+    'SELECT class_id, class_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name', [id]);
+
+  const [learningAreas] = await req.db.execute(
+    'SELECT area_id, level_name, area_name FROM learning_areas WHERE school_id = ? ORDER BY level_name, area_name', [id]);
+
+  const [fees] = await req.db.execute(
+    'SELECT fee_id, fee_name, amount, term, academic_year, is_optional FROM fee_structures WHERE school_id = ? AND academic_year = ? ORDER BY term, fee_name', [id, year]);
+
+  const [teachers] = await req.db.execute(
+    'SELECT teacher_id, full_name, phone, email, role FROM teachers WHERE school_id = ?', [id]);
+
+  const [studentCount] = await req.db.execute(
+    'SELECT COUNT(*) AS total FROM students WHERE school_id = ? AND enrollment_status = ?', [id, 'Active']);
+
+  // Per-term payment summary
+  const terms = ['Term 1', 'Term 2', 'Term 3'];
+  const termSummary = [];
+  for (const term of terms) {
+    const [feeTotal] = await req.db.execute(
+      `SELECT COALESCE(SUM(COALESCE(fa.adjusted_amount, f.amount)), 0) AS expected
+       FROM (SELECT fee_id, amount, is_optional FROM fee_structures WHERE school_id = ? AND term = ? AND academic_year = ?) f
+       JOIN fee_assignments fa ON f.fee_id = fa.fee_id WHERE fa.waived = FALSE`, [id, term, year]);
+    const [paidTotal] = await req.db.execute(
+      `SELECT COALESCE(SUM(amount), 0) AS paid, COUNT(*) AS txns
+       FROM payment_ledger WHERE school_id = ? AND term = ? AND academic_year = ? AND reversed_at IS NULL`, [id, term, year]);
+    const expected = parseFloat(feeTotal[0]?.expected || 0);
+    const paid = parseFloat(paidTotal[0]?.paid || 0);
+    termSummary.push({
+      term, year,
+      expected, paid,
+      outstanding: Math.max(0, expected - paid),
+      collection_rate: expected > 0 ? Math.round(paid / expected * 100 * 10) / 10 : 0,
+      transactions: paidTotal[0]?.txns || 0
+    });
+  }
+
+  // Paid/unpaid parent subscription summary (who has paid premium)
+  const [parents] = await req.db.execute(
+    `SELECT spm.parent_phone, pp.full_name AS parent_name, pp.is_premium, pp.premium_expires_at,
+       COUNT(s.student_id) AS child_count
+     FROM student_parent_map spm
+     JOIN students s ON spm.student_id = s.student_id AND s.school_id = ? AND s.enrollment_status = 'Active'
+     LEFT JOIN parent_profiles pp ON spm.parent_phone = pp.parent_phone
+     GROUP BY spm.parent_phone, pp.full_name, pp.is_premium, pp.premium_expires_at
+     ORDER BY pp.full_name`, [id]);
+  const [activeSubs] = await req.db.execute(
+    `SELECT parent_phone FROM premium_subscriptions
+     WHERE school_id = ? AND year = ? AND payment_status = 'paid' AND (expires_at IS NULL OR expires_at > NOW())`, [id, year]);
+  const activePhones = new Set(activeSubs.map(s => s.parent_phone));
+  const parentSummary = parents.map(p => {
+    const active = p.is_premium || activePhones.has(p.parent_phone);
+    return {
+      parent_phone: p.parent_phone,
+      parent_name: p.parent_name || 'Unknown',
+      child_count: p.child_count,
+      paid: Boolean(active),
+      premium_expires_at: p.premium_expires_at
+    };
+  });
+  const paidParents = parentSummary.filter(p => p.paid).length;
+
+  res.json({
+    school: school[0],
+    classes,
+    learning_areas: learningAreas,
+    fees,
+    teachers,
+    students: studentCount[0]?.total || 0,
+    payment_summary: { terms: termSummary, parents: parentSummary, paid_parents: paidParents, total_parents: parentSummary.length }
+  });
 });
 
 // CLASSES
@@ -172,7 +525,7 @@ router.post('/teachers', async (req, res) => {
   if (!school_id || !full_name || !phone) return res.status(400).json({ error: 'school_id, full_name, phone required' });
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
-  const teacherId = 'TCH' + Date.now().toString(36).toUpperCase();
+  const teacherId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
   await req.db.execute('INSERT INTO teachers (teacher_id, full_name, phone, school_id, role) VALUES (?, ?, ?, ?, ?)', [teacherId, full_name, phone, school_id, role || 'teacher']);
   res.json({ teacher_id: teacherId, full_name });
 });
@@ -193,7 +546,7 @@ router.get('/sales-reps', async (req, res) => {
 router.post('/sales-reps', async (req, res) => {
   const { full_name, phone, email } = req.body;
   if (!full_name) return res.status(400).json({ error: 'full_name required' });
-  const repId = 'REP' + Date.now().toString(36).toUpperCase();
+  const repId = 'REP' + String(Math.floor(100000 + Math.random() * 900000));
   await req.db.execute('INSERT INTO sales_reps (rep_id, full_name, phone, email) VALUES (?, ?, ?, ?)', [repId, full_name, phone || null, email || null]);
   res.json({ rep_id: repId, full_name });
 });
