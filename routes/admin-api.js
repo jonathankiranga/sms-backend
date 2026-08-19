@@ -379,6 +379,11 @@ router.get('/schools/:id/details', async (req, res) => {
   const [learningAreas] = await req.db.execute(
     'SELECT area_id, level_name, area_name FROM learning_areas WHERE school_id = ? ORDER BY level_name, area_name', [id]);
 
+  const [subLearningAreas] = await req.db.execute(
+    `SELECT sla.sub_area_id, sla.area_id, sla.sub_area_name, sla.display_order
+     FROM sub_learning_areas sla JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE la.school_id = ? ORDER BY sla.display_order, sla.sub_area_name`, [id]);
+
   const [fees] = await req.db.execute(
     'SELECT fee_id, fee_name, amount, term, academic_year, is_optional FROM fee_structures WHERE school_id = ? AND academic_year = ? ORDER BY term, fee_name', [id, year]);
 
@@ -450,6 +455,7 @@ router.get('/schools/:id/details', async (req, res) => {
     school: school[0],
     classes,
     learning_areas: learningAreas,
+    sub_learning_areas: subLearningAreas,
     fees,
     teachers,
     students: studentCount[0]?.total || 0,
@@ -482,6 +488,92 @@ router.delete('/classes/:id', async (req, res) => {
   await req.db.execute('DELETE FROM student_parent_map WHERE student_id IN (SELECT student_id FROM students WHERE class_id = ?)', [req.params.id]);
   await req.db.execute('DELETE FROM students WHERE class_id = ?', [req.params.id]);
   await req.db.execute('DELETE FROM classes WHERE class_id = ?', [req.params.id]);
+  res.json({ deleted: true });
+});
+
+// POST /admin/api/schools/:id/classes — add a class to a school
+router.post('/schools/:id/classes', async (req, res) => {
+  const { class_name, academic_year, class_rank } = req.body;
+  if (!class_name) return res.status(400).json({ error: 'class_name required' });
+  const year = parseInt(academic_year) || new Date().getFullYear();
+  const [r] = await req.db.execute(
+    'INSERT INTO classes (school_id, class_name, academic_year, class_rank) VALUES (?, ?, ?, ?)',
+    [req.params.id, class_name, year, class_rank === undefined ? null : parseInt(class_rank)]);
+  res.json({ class_id: r.insertId, class_name, academic_year: year });
+});
+
+router.put('/classes/:id', async (req, res) => {
+  const { class_name, class_rank } = req.body;
+  const fields = [];
+  const params = [];
+  if (class_name) { fields.push('class_name = ?'); params.push(class_name); }
+  if (class_rank !== undefined) { fields.push('class_rank = ?'); params.push(parseInt(class_rank)); }
+  if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  params.push(req.params.id);
+  await req.db.execute(`UPDATE classes SET ${fields.join(', ')} WHERE class_id = ?`, params);
+  res.json({ updated: true });
+});
+
+// LEARNING AREAS + SUB-AREAS CRUD
+// POST /admin/api/schools/:id/learning-areas { level_name, area_name }
+router.post('/schools/:id/learning-areas', async (req, res) => {
+  const { level_name, area_name } = req.body;
+  if (!area_name) return res.status(400).json({ error: 'area_name required' });
+  const [r] = await req.db.execute('INSERT INTO learning_areas (school_id, level_name, area_name) VALUES (?, ?, ?)', [req.params.id, level_name || null, area_name]);
+  res.json({ area_id: r.insertId, level_name: level_name || null, area_name });
+});
+
+router.put('/learning-areas/:id', async (req, res) => {
+  const { level_name, area_name } = req.body;
+  const fields = [];
+  const params = [];
+  if (area_name) { fields.push('area_name = ?'); params.push(area_name); }
+  if (level_name !== undefined) { fields.push('level_name = ?'); params.push(level_name); }
+  if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  params.push(req.params.id);
+  await req.db.execute(`UPDATE learning_areas SET ${fields.join(', ')} WHERE area_id = ?`, params);
+  res.json({ updated: true });
+});
+
+router.delete('/learning-areas/:id', async (req, res) => {
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+    await conn.execute('DELETE FROM sub_strands WHERE strand_id IN (SELECT strand_id FROM strands WHERE area_id = ?)', [req.params.id]);
+    await conn.execute('DELETE FROM strands WHERE area_id = ?', [req.params.id]);
+    await conn.execute('DELETE FROM sub_learning_areas WHERE area_id = ?', [req.params.id]);
+    await conn.execute('DELETE FROM learning_areas WHERE area_id = ?', [req.params.id]);
+    await conn.commit();
+    res.json({ deleted: true });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally { conn.release(); }
+});
+
+// POST /admin/api/sub-learning-areas { area_id, sub_area_name }
+router.post('/sub-learning-areas', async (req, res) => {
+  const { area_id, sub_area_name } = req.body;
+  if (!area_id || !sub_area_name) return res.status(400).json({ error: 'area_id, sub_area_name required' });
+  const [count] = await req.db.execute('SELECT COUNT(*) AS c FROM sub_learning_areas WHERE area_id = ?', [area_id]);
+  const [r] = await req.db.execute('INSERT INTO sub_learning_areas (area_id, sub_area_name, display_order) VALUES (?, ?, ?)', [area_id, sub_area_name, (count[0]?.c || 0) + 1]);
+  res.json({ sub_area_id: r.insertId, sub_area_name });
+});
+
+router.put('/sub-learning-areas/:id', async (req, res) => {
+  const { sub_area_name, display_order } = req.body;
+  const fields = [];
+  const params = [];
+  if (sub_area_name) { fields.push('sub_area_name = ?'); params.push(sub_area_name); }
+  if (display_order !== undefined) { fields.push('display_order = ?'); params.push(parseInt(display_order)); }
+  if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  params.push(req.params.id);
+  await req.db.execute(`UPDATE sub_learning_areas SET ${fields.join(', ')} WHERE sub_area_id = ?`, params);
+  res.json({ updated: true });
+});
+
+router.delete('/sub-learning-areas/:id', async (req, res) => {
+  await req.db.execute('DELETE FROM sub_learning_areas WHERE sub_area_id = ?', [req.params.id]);
   res.json({ deleted: true });
 });
 
@@ -532,13 +624,29 @@ router.get('/teachers', async (req, res) => {
 });
 
 router.post('/teachers', async (req, res) => {
-  const { school_id, full_name, phone, role } = req.body;
+  const { school_id, full_name, phone, role, email } = req.body;
   if (!school_id || !full_name || !phone) return res.status(400).json({ error: 'school_id, full_name, phone required' });
+  if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
   const teacherId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
-  await req.db.execute('INSERT INTO teachers (teacher_id, full_name, phone, school_id, role) VALUES (?, ?, ?, ?, ?)', [teacherId, full_name, phone, school_id, role || 'teacher']);
+  await req.db.execute('INSERT INTO teachers (teacher_id, full_name, phone, email, school_id, role) VALUES (?, ?, ?, ?, ?, ?)', [teacherId, full_name, phone, email || null, school_id, role || 'teacher']);
   res.json({ teacher_id: teacherId, full_name });
+});
+
+router.put('/teachers/:id', async (req, res) => {
+  const { full_name, phone, email, role } = req.body;
+  if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
+  const fields = [];
+  const params = [];
+  if (full_name) { fields.push('full_name = ?'); params.push(full_name); }
+  if (phone) { fields.push('phone = ?'); params.push(phone); }
+  if (email !== undefined) { fields.push('email = ?'); params.push(email); }
+  if (role) { fields.push('role = ?'); params.push(role); }
+  if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  params.push(req.params.id);
+  await req.db.execute(`UPDATE teachers SET ${fields.join(', ')} WHERE teacher_id = ?`, params);
+  res.json({ updated: true });
 });
 
 router.delete('/teachers/:id', async (req, res) => {
