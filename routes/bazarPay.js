@@ -2,6 +2,46 @@ const express = require('express');
 const { ensureSchoolCallbackKey } = require('./payments');
 const router = express.Router();
 
+// Require a bursar or headteacher session (OTP bearer token) for all Bazar Pay routes.
+async function requireBursar(req, res) {
+  const auth = (req.headers.authorization || '').trim();
+  if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
+  const sessionId = auth.split(' ')[1];
+  const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [sessionId]);
+  if (srows.length === 0) { res.status(401).json({ error: 'Invalid session' }); return null; }
+  const sess = srows[0];
+  if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
+
+  let trows;
+  if (sess.phone) {
+    [trows] = await req.db.execute('SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
+  }
+  if (!trows || trows.length === 0) {
+    const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [sessionId]);
+    const email = (sessRows[0] && sessRows[0].email) || null;
+    if (email) {
+      [trows] = await req.db.execute('SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE email = ?', [email]);
+    }
+  }
+  if (!trows || trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
+
+  const teacher = trows[0];
+  if (teacher.role !== 'bursar' && teacher.role !== 'head') { res.status(403).json({ error: 'Only a bursar or school head may use Bazar Pay' }); return null; }
+
+  // Enforce school scoping when the request specifies a school
+  const requestedSchool = req.params.school_id || req.query.school_id;
+  if (requestedSchool && String(requestedSchool) !== String(teacher.school_id)) {
+    res.status(403).json({ error: 'Access denied for this school' });
+    return null;
+  }
+  return teacher;
+}
+
+router.use(async (req, res, next) => {
+  req.bursar = await requireBursar(req, res);
+  if (req.bursar) next();
+});
+
 // GET /api/bazar-pay/fee-structures/:school_id — list fee items for a school
 router.get('/fee-structures/:school_id', async (req, res) => {
   const { school_id } = req.params;

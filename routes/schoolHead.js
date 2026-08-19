@@ -33,31 +33,37 @@ async function requireHead(req, res) {
 // List teachers for the school (public-ish)
 router.get('/:schoolId/teachers', async (req, res) => {
   const [rows] = await req.db.execute(
-    'SELECT teacher_id, full_name, phone, role FROM teachers WHERE school_id = ? ORDER BY full_name',
+    'SELECT teacher_id, full_name, phone, email, role FROM teachers WHERE school_id = ? ORDER BY full_name',
     [req.params.schoolId]
   );
   res.json({ teachers: rows });
 });
 
-// Create a teacher (only headteacher)
+// Create a teacher or bursar (only headteacher). Creating headteachers is restricted to admin only.
 router.post('/:schoolId/teachers', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return; // response already sent
 
-  const { full_name, phone, role } = req.body;
-  if (role && role.toLowerCase() === 'head') return res.status(403).json({ error: 'Creating headteachers is restricted to admin only.' });
+  const { full_name, phone, email, role } = req.body;
+  const cleanRole = (role || 'teacher').toLowerCase();
+  if (cleanRole === 'head') return res.status(403).json({ error: 'Creating headteachers is restricted to admin only.' });
+  if (cleanRole !== 'teacher' && cleanRole !== 'bursar') return res.status(400).json({ error: 'Invalid role. Must be teacher or bursar.' });
   if (!full_name || !phone) return res.status(400).json({ error: 'Name and phone required' });
 
   const teacherId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
+  if (email) {
+    const [emailExisting] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ?', [email]);
+    if (emailExisting.length > 0) return res.status(409).json({ error: 'Email already registered' });
+  }
 
   await req.db.execute(
-    'INSERT INTO teachers (teacher_id, full_name, phone, school_id, role) VALUES (?, ?, ?, ?, ?)',
-    [teacherId, full_name, phone, req.params.schoolId, 'teacher']
+    'INSERT INTO teachers (teacher_id, full_name, phone, email, school_id, role) VALUES (?, ?, ?, ?, ?, ?)',
+    [teacherId, full_name, phone, email || null, req.params.schoolId, cleanRole]
   );
 
-  res.json({ teacher_id: teacherId, full_name, phone, role: 'teacher' });
+  res.json({ teacher_id: teacherId, full_name, phone, email: email || null, role: cleanRole });
 });
 
 // Delete a teacher (only headteacher)
@@ -85,12 +91,12 @@ router.post('/:schoolId/classes', async (req, res) => {
   res.json({ class_id: r.insertId, class_name });
 });
 
-// Create a single student — only headteacher
+// Create a single student — only headteacher. Optional parent_phone/parent_name links the parent.
 router.post('/:schoolId/students', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return;
 
-  const { student_id, full_name, class_id } = req.body;
+  const { student_id, full_name, class_id, parent_phone, parent_name } = req.body;
   if (!student_id || !full_name || !class_id) return res.status(400).json({ error: 'student_id, full_name, class_id required' });
 
   // Verify class belongs to this school
@@ -99,14 +105,19 @@ router.post('/:schoolId/students', async (req, res) => {
 
   try {
     await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id) VALUES (?, ?, ?, ?)', [student_id, full_name, class_id, req.params.schoolId]);
-    res.json({ student_id, full_name });
+    if (parent_phone) {
+      await req.db.execute('INSERT INTO parent_profiles (parent_phone, full_name, is_premium) VALUES (?, ?, FALSE) ON DUPLICATE KEY UPDATE full_name = COALESCE(NULLIF(?, \'\'), full_name)', [parent_phone, parent_name || null, parent_name || null]);
+      await req.db.execute('INSERT IGNORE INTO student_parent_map (student_id, parent_phone) VALUES (?, ?)', [student_id, parent_phone]);
+    }
+    res.json({ student_id, full_name, parent_phone: parent_phone || null });
   } catch (err) {
     if (err && err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Student ID already exists' });
     res.status(500).json({ error: err.message });
   }
 });
 
-// CSV Import Students — school head can bulk-import into a class
+// CSV Import Students — school head can bulk-import into a class.
+// Format per line: student_id,full_name  OR  student_id,full_name,parent_phone,parent_name
 router.post('/:schoolId/students/import', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return;
@@ -114,20 +125,27 @@ router.post('/:schoolId/students/import', async (req, res) => {
   const { class_id, csv } = req.body;
   if (!class_id || !csv) return res.status(400).json({ error: 'class_id and csv required' });
   const lines = csv.trim().split('\n');
-  let imported = 0, errors = 0;
+  let imported = 0, errors = 0, parentsLinked = 0;
   for (const line of lines) {
     const parts = line.split(',');
     if (parts.length < 2) { errors++; continue; }
     const student_id = parts[0].trim();
     const full_name = parts.slice(1).join(',').trim();
     if (!student_id || !full_name) { errors++; continue; }
+    const parent_phone = parts.length >= 3 ? parts[2].trim() : '';
+    const parent_name = parts.length >= 4 ? parts.slice(3).join(',').trim() : '';
     try {
       await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id) VALUES (?, ?, ?, ?)',
         [student_id, full_name, class_id, req.params.schoolId]);
       imported++;
+      if (parent_phone) {
+        await req.db.execute('INSERT INTO parent_profiles (parent_phone, full_name, is_premium) VALUES (?, ?, FALSE) ON DUPLICATE KEY UPDATE full_name = COALESCE(NULLIF(?, \'\'), full_name)', [parent_phone, parent_name || null, parent_name || null]);
+        await req.db.execute('INSERT IGNORE INTO student_parent_map (student_id, parent_phone) VALUES (?, ?)', [student_id, parent_phone]);
+        parentsLinked++;
+      }
     } catch { errors++; }
   }
-  res.json({ imported, errors });
+  res.json({ imported, errors, parentsLinked });
 });
 
 // Analytics — attendance summary per class for school head

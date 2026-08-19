@@ -45,6 +45,21 @@ router.post('/assign', async (req, res) => {
   res.json({ assigned: true });
 });
 
+// POST /api/fees/unassign — remove a fee assignment
+router.post('/unassign', async (req, res) => {
+  const { assignment_id, fee_id, class_id, student_id } = req.body;
+  if (assignment_id) {
+    await req.db.execute('DELETE FROM fee_assignments WHERE assignment_id = ?', [assignment_id]);
+  } else if (fee_id) {
+    if (class_id) await req.db.execute('DELETE FROM fee_assignments WHERE fee_id = ? AND class_id = ?', [fee_id, class_id]);
+    else if (student_id) await req.db.execute('DELETE FROM fee_assignments WHERE fee_id = ? AND student_id = ?', [fee_id, student_id]);
+    else return res.status(400).json({ error: 'assignment_id, or fee_id with class_id/student_id required' });
+  } else {
+    return res.status(400).json({ error: 'assignment_id, or fee_id with class_id/student_id required' });
+  }
+  res.json({ unassigned: true });
+});
+
 // GET /api/fees/statement/:student_id/:term/:year
 router.get('/statement/:student_id/:term/:year', async (req, res) => {
   const { student_id, term, year } = req.params;
