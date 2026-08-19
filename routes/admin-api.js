@@ -410,7 +410,7 @@ router.get('/schools/:id/details', async (req, res) => {
     });
   }
 
-  // Paid/unpaid parent subscription summary (who has paid premium)
+  // Who has paid premium — subscription revenue for the admin (not school fees)
   const [parents] = await req.db.execute(
     `SELECT spm.parent_phone, pp.full_name AS parent_name, pp.is_premium, pp.premium_expires_at,
        COUNT(s.student_id) AS child_count
@@ -420,20 +420,31 @@ router.get('/schools/:id/details', async (req, res) => {
      GROUP BY spm.parent_phone, pp.full_name, pp.is_premium, pp.premium_expires_at
      ORDER BY pp.full_name`, [id]);
   const [activeSubs] = await req.db.execute(
-    `SELECT parent_phone FROM premium_subscriptions
-     WHERE school_id = ? AND year = ? AND payment_status = 'paid' AND (expires_at IS NULL OR expires_at > NOW())`, [id, year]);
-  const activePhones = new Set(activeSubs.map(s => s.parent_phone));
+    `SELECT parent_phone, term FROM premium_subscriptions
+     WHERE school_id = ? AND year = ? AND payment_status = 'paid'
+       AND (expires_at IS NULL OR expires_at > NOW())`, [id, year]);
+  const activeTermsByPhone = {};
+  for (const s of activeSubs) {
+    if (!activeTermsByPhone[s.parent_phone]) activeTermsByPhone[s.parent_phone] = [];
+    if (!activeTermsByPhone[s.parent_phone].includes(s.term)) activeTermsByPhone[s.parent_phone].push(s.term);
+  }
+  const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
   const parentSummary = parents.map(p => {
-    const active = p.is_premium || activePhones.has(p.parent_phone);
+    const activeFromProfile = p.is_premium && (!p.premium_expires_at || new Date(p.premium_expires_at) > new Date());
+    const paidTerms = activeTermsByPhone[p.parent_phone] || [];
+    const active = activeFromProfile || paidTerms.length > 0;
     return {
       parent_phone: p.parent_phone,
       parent_name: p.parent_name || 'Unknown',
       child_count: p.child_count,
-      paid: Boolean(active),
-      premium_expires_at: p.premium_expires_at
+      premium: Boolean(active),
+      premium_expires_at: p.premium_expires_at,
+      paid_terms: paidTerms,
+      amount_due: active ? 0 : pricePerChild * p.child_count
     };
   });
-  const paidParents = parentSummary.filter(p => p.paid).length;
+  const premiumParents = parentSummary.filter(p => p.premium).length;
 
   res.json({
     school: school[0],
@@ -442,7 +453,7 @@ router.get('/schools/:id/details', async (req, res) => {
     fees,
     teachers,
     students: studentCount[0]?.total || 0,
-    payment_summary: { terms: termSummary, parents: parentSummary, paid_parents: paidParents, total_parents: parentSummary.length }
+    payment_summary: { terms: termSummary, parents: parentSummary, paid_parents: premiumParents, total_parents: parentSummary.length }
   });
 });
 
@@ -539,16 +550,45 @@ router.delete('/teachers/:id', async (req, res) => {
 
 // Sales reps management (admin only)
 router.get('/sales-reps', async (req, res) => {
-  const [rows] = await req.db.execute('SELECT rep_id, full_name, phone, email, created_at FROM sales_reps ORDER BY full_name');
+  const [rows] = await req.db.execute(
+    `SELECT sr.rep_id, sr.full_name, sr.phone, sr.email, sr.commission_type, sr.commission_value,
+            sr.created_at, COUNT(sc.school_id) AS schools_count
+     FROM sales_reps sr
+     LEFT JOIN schools sc ON sc.sales_rep_id = sr.rep_id
+     GROUP BY sr.rep_id, sr.full_name, sr.phone, sr.email, sr.commission_type, sr.commission_value, sr.created_at
+     ORDER BY sr.full_name`);
   res.json({ sales_reps: rows });
 });
 
 router.post('/sales-reps', async (req, res) => {
-  const { full_name, phone, email } = req.body;
+  const { full_name, phone, email, commission_type, commission_value } = req.body;
   if (!full_name) return res.status(400).json({ error: 'full_name required' });
+  const type = commission_type === 'flat' ? 'flat' : 'percent';
+  const value = Math.max(0, parseFloat(commission_value) || 0);
   const repId = 'REP' + String(Math.floor(100000 + Math.random() * 900000));
-  await req.db.execute('INSERT INTO sales_reps (rep_id, full_name, phone, email) VALUES (?, ?, ?, ?)', [repId, full_name, phone || null, email || null]);
-  res.json({ rep_id: repId, full_name });
+  await req.db.execute(
+    'INSERT INTO sales_reps (rep_id, full_name, phone, email, commission_type, commission_value) VALUES (?, ?, ?, ?, ?, ?)',
+    [repId, full_name, phone || null, email || null, type, value]);
+  res.json({ rep_id: repId, full_name, commission_type: type, commission_value: value });
+});
+
+router.put('/sales-reps/:repId', async (req, res) => {
+  const { full_name, phone, email, commission_type, commission_value } = req.body;
+  const type = commission_type === 'flat' ? 'flat' : 'percent';
+  const value = Math.max(0, parseFloat(commission_value) || 0);
+  await req.db.execute(
+    'UPDATE sales_reps SET full_name = COALESCE(?, full_name), phone = COALESCE(?, phone), email = COALESCE(?, email), commission_type = ?, commission_value = ? WHERE rep_id = ?',
+    [full_name || null, phone || null, email || null, type, value, req.params.repId]);
+  res.json({ updated: true, rep_id: req.params.repId });
+});
+
+router.delete('/sales-reps/:repId', async (req, res) => {
+  const [used] = await req.db.execute('SELECT COUNT(*) AS c FROM schools WHERE sales_rep_id = ?', [req.params.repId]);
+  if (used[0]?.c > 0) {
+    return res.status(409).json({ error: `Rep is assigned to ${used[0].c} school(s). Reassign or delete those schools first.` });
+  }
+  await req.db.execute('DELETE FROM sales_reps WHERE rep_id = ?', [req.params.repId]);
+  res.json({ deleted: true });
 });
 
 // FEES
@@ -696,16 +736,16 @@ router.post('/settings', async (req, res) => {
   res.json({ updated: true });
 });
 
-// REVENUE
+// REVENUE — premium subscription revenue only (admin revenue, NOT school fees)
 router.get('/revenue', async (req, res) => {
   const [totals] = await req.db.execute(
-    "SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payment_ledger"
+    "SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM premium_subscriptions WHERE payment_status = 'paid'"
   );
   const [monthly] = await req.db.execute(
-    "SELECT DATE_FORMAT(logged_at, '%Y-%m') AS month, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payment_ledger GROUP BY month ORDER BY month DESC LIMIT 12"
+    "SELECT DATE_FORMAT(COALESCE(activated_at, created_at), '%Y-%m') AS month, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM premium_subscriptions WHERE payment_status = 'paid' GROUP BY month ORDER BY month DESC LIMIT 12"
   );
-  const [byMethod] = await req.db.execute(
-    "SELECT payment_method, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM payment_ledger GROUP BY payment_method"
+  const [byModel] = await req.db.execute(
+    "SELECT payment_model, COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM premium_subscriptions WHERE payment_status = 'paid' GROUP BY payment_model"
   );
   const [premium] = await req.db.execute(
     "SELECT COUNT(*) AS count FROM parent_profiles WHERE is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())"
@@ -713,22 +753,21 @@ router.get('/revenue', async (req, res) => {
   res.json({
     totals: { amount: totals[0]?.total || 0, transactions: totals[0]?.count || 0 },
     monthly: monthly || [],
-    byMethod: byMethod || [],
+    byModel: byModel || [],
     premiumParents: premium[0]?.count || 0
   });
 });
 
-// REVENUE BY SALES REP
+// REVENUE BY SALES REP — premium subscriptions per sales rep
 router.get('/revenue/sales-reps', async (req, res) => {
-  // Aggregate payments per sales rep (payments linked to students -> schools)
   const [rows] = await req.db.execute(
     `SELECT sr.rep_id, sr.full_name, sr.phone, sr.email,
-            COALESCE(SUM(pl.amount), 0) AS revenue,
+            COALESCE(SUM(ps.amount), 0) AS revenue,
+            COUNT(ps.subscription_id) AS transactions,
             COUNT(DISTINCT sc.school_id) AS schools_count
      FROM sales_reps sr
      LEFT JOIN schools sc ON sc.sales_rep_id = sr.rep_id
-     LEFT JOIN students st ON st.school_id = sc.school_id
-     LEFT JOIN payment_ledger pl ON pl.student_reference = st.student_id
+     LEFT JOIN premium_subscriptions ps ON ps.school_id = sc.school_id AND ps.payment_status = 'paid'
      GROUP BY sr.rep_id, sr.full_name, sr.phone, sr.email
      ORDER BY revenue DESC`
   );
@@ -736,7 +775,6 @@ router.get('/revenue/sales-reps', async (req, res) => {
 });
 
 // PREMIUM REVENUE BY SALES REP AND SCHOOL
-// Sums payments where the paying parent is currently premium (is_premium = true OR premium_expires_at > NOW())
 router.get('/revenue/premium-by-sales-rep', async (req, res) => {
   try {
     const [rows] = await req.db.execute(
@@ -744,14 +782,11 @@ router.get('/revenue/premium-by-sales-rep', async (req, res) => {
               sr.full_name AS rep_name,
               sc.school_id,
               sc.school_name,
-              COALESCE(SUM(pl.amount), 0) AS revenue,
-              COUNT(pl.txn_id) AS transactions
+              COALESCE(SUM(ps.amount), 0) AS revenue,
+              COUNT(ps.subscription_id) AS transactions
        FROM sales_reps sr
        JOIN schools sc ON sc.sales_rep_id = sr.rep_id
-       JOIN students st ON st.school_id = sc.school_id
-       JOIN payment_ledger pl ON pl.student_reference = st.student_id
-       JOIN parent_profiles pp ON pp.parent_phone = pl.parent_phone
-       WHERE (pp.is_premium = TRUE OR (pp.premium_expires_at IS NOT NULL AND pp.premium_expires_at > NOW()))
+       LEFT JOIN premium_subscriptions ps ON ps.school_id = sc.school_id AND ps.payment_status = 'paid'
        GROUP BY sr.rep_id, sr.full_name, sc.school_id, sc.school_name
        ORDER BY sr.full_name, sc.school_name`
     );
@@ -772,19 +807,23 @@ router.get('/revenue/premium-by-sales-rep', async (req, res) => {
   }
 });
 
-// Stats (for dashboard)
+// Stats (for dashboard) — revenue figures are premium subscription revenue, not school fees
 router.get('/_stats', async (req, res) => {
   async function cnt(table) { try { const [[r]] = await req.db.execute(`SELECT COUNT(*) AS c FROM \`${table}\``); return r.c; } catch { return '—'; } }
-  const [revenue] = await req.db.execute("SELECT COALESCE(SUM(amount), 0) AS total FROM payment_ledger");
+  const [revenue] = await req.db.execute("SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count FROM premium_subscriptions WHERE payment_status = 'paid'");
+  const [premium] = await req.db.execute(
+    "SELECT COUNT(*) AS count FROM parent_profiles WHERE is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())"
+  );
   res.json({
     schools: await cnt('schools'),
     teachers: await cnt('teachers'),
     students: await cnt('students'),
     parents: await cnt('parent_profiles'),
     attendance: await cnt('attendance_logs'),
-    payments: await cnt('payment_ledger'),
+    premium_subscriptions: revenue[0]?.count || 0,
     assessments: await cnt('assessments'),
     campaigns: await cnt('marketplace_campaigns'),
+    premium_parents: premium[0]?.count || 0,
     revenue: revenue[0]?.total || 0
   });
 });
