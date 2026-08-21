@@ -42,7 +42,7 @@ router.get('/:schoolId/teachers', async (req, res) => {
 // List classes for the school
 router.get('/:schoolId/classes', async (req, res) => {
   const [rows] = await req.db.execute(
-    'SELECT class_id, class_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
+    'SELECT class_id, class_name, stream, level_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
     [req.params.schoolId]
   );
   res.json({ classes: rows });
@@ -123,16 +123,25 @@ router.put('/:schoolId/classes/:classId', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return;
 
-  const { class_name, stream, level_name } = req.body;
+  const { class_name, stream, level_name, academic_year } = req.body;
   const fields = [];
   const params = [];
+  if (stream !== undefined) { fields.push('stream = ?'); params.push(stream || null); }
+  if (level_name !== undefined) {
+    fields.push('level_name = ?'); params.push(level_name || null);
+    // Keep the display name in sync with level/stream unless explicitly overridden
+    if (!class_name && level_name) {
+      fields.push('class_name = ?');
+      params.push(stream ? `${level_name} - ${stream}` : level_name);
+    }
+  }
   if (class_name) { fields.push('class_name = ?'); params.push(class_name); }
-  if (stream !== undefined) { fields.push('stream = ?'); params.push(stream); }
-  if (level_name !== undefined) { fields.push('level_name = ?'); params.push(level_name); }
+  if (academic_year) { fields.push('academic_year = ?'); params.push(academic_year); }
   if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
   params.push(req.params.classId, req.params.schoolId);
   await req.db.execute(`UPDATE classes SET ${fields.join(', ')} WHERE class_id = ? AND school_id = ?`, params);
-  res.json({ updated: true });
+  const [saved] = await req.db.execute('SELECT class_id, class_name, stream, level_name, academic_year FROM classes WHERE class_id = ?', [req.params.classId]);
+  res.json(saved[0]);
 });
 
 // Delete a class — only headteacher
