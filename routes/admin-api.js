@@ -129,54 +129,57 @@ router.get('/schools/:id/mpesa-callbacks', async (req, res) => {
 
 // GET /admin/api/schools/:id/mpesa — credentials + callback URLs + readiness for the portal UI
 router.get('/schools/:id/mpesa', async (req, res) => {
-  const [rows] = await req.db.execute(
-    `SELECT school_id, ${MPESA_CREDENTIAL_FIELDS.join(', ')}, mpesa_callback_key FROM schools WHERE school_id = ? LIMIT 1`,
-    [req.params.id]
-  );
-  if (rows.length === 0) return res.status(404).json({ error: 'School not found' });
-  const school = rows[0];
-  const r = await ensureMpesaCallbackKey(req.db, req.params.id);
-  if (r.error) return res.status(r.error === 'School not found' ? 404 : 500).json({ error: r.error });
-  res.json({
-    ...school,
-    mpesa_callback_key: r.key,
-    urls: buildCallbackUrls(r.key, req),
-    readiness: mpesaReadiness(school)
-  });
+  try {
+    // s.* so a missing optional column can never break the endpoint
+    const [rows] = await req.db.execute('SELECT * FROM schools WHERE school_id = ? LIMIT 1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'School not found' });
+    const school = rows[0];
+    const r = await ensureMpesaCallbackKey(req.db, req.params.id);
+    if (r.error) return res.status(r.error === 'School not found' ? 404 : 500).json({ error: r.error });
+    res.json({
+      ...school,
+      mpesa_callback_key: r.key,
+      urls: buildCallbackUrls(r.key, req),
+      readiness: mpesaReadiness(school)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // PUT /admin/api/schools/:id/mpesa — partial update of M-Pesa credentials (validated)
 router.put('/schools/:id/mpesa', async (req, res) => {
-  const updates = {};
-  for (const f of MPESA_CREDENTIAL_FIELDS) {
-    if (req.body[f] !== undefined) updates[f] = String(req.body[f]).trim();
-  }
-  if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
-
-  if (updates.mpesa_environment !== undefined && !['sandbox', 'production'].includes(updates.mpesa_environment)) {
-    return res.status(400).json({ error: 'mpesa_environment must be sandbox or production' });
-  }
-  if (updates.mpesa_paybill !== undefined && !/^[0-9]{5,20}$/.test(updates.mpesa_paybill)) {
-    return res.status(400).json({ error: 'Paybill must be 5-20 digits' });
-  }
-  for (const f of ['mpesa_consumer_key', 'mpesa_consumer_secret', 'mpesa_passkey']) {
-    if (updates[f] !== undefined && updates[f].length < 8) {
-      return res.status(400).json({ error: `${f.replace('mpesa_', '').replace('_', ' ')} looks too short — check the paste` });
+  try {
+    const updates = {};
+    for (const f of MPESA_CREDENTIAL_FIELDS) {
+      if (req.body[f] !== undefined) updates[f] = String(req.body[f]).trim();
     }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+
+    if (updates.mpesa_environment !== undefined && !['sandbox', 'production'].includes(updates.mpesa_environment)) {
+      return res.status(400).json({ error: 'mpesa_environment must be sandbox or production' });
+    }
+    if (updates.mpesa_paybill !== undefined && !/^[0-9]{5,20}$/.test(updates.mpesa_paybill)) {
+      return res.status(400).json({ error: 'Paybill must be 5-20 digits' });
+    }
+    for (const f of ['mpesa_consumer_key', 'mpesa_consumer_secret', 'mpesa_passkey']) {
+      if (updates[f] !== undefined && updates[f].length < 8) {
+        return res.status(400).json({ error: `${f.replace('mpesa_', '').replace('_', ' ')} looks too short — check the paste` });
+      }
+    }
+
+    const fields = Object.keys(updates);
+    await req.db.execute(
+      `UPDATE schools SET ${fields.map(f => `${f} = ?`).join(', ')} WHERE school_id = ?`,
+      [...fields.map(f => updates[f]), req.params.id]
+    );
+
+    const [rows] = await req.db.execute('SELECT * FROM schools WHERE school_id = ? LIMIT 1', [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'School not found' });
+    res.json({ success: true, school: rows[0], readiness: mpesaReadiness(rows[0]) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-
-  const fields = Object.keys(updates);
-  await req.db.execute(
-    `UPDATE schools SET ${fields.map(f => `${f} = ?`).join(', ')} WHERE school_id = ?`,
-    [...fields.map(f => updates[f]), req.params.id]
-  );
-
-  const [rows] = await req.db.execute(
-    `SELECT school_id, ${MPESA_CREDENTIAL_FIELDS.join(', ')} FROM schools WHERE school_id = ? LIMIT 1`,
-    [req.params.id]
-  );
-  if (rows.length === 0) return res.status(404).json({ error: 'School not found' });
-  res.json({ success: true, school: rows[0], readiness: mpesaReadiness(rows[0]) });
 });
 
 router.post('/schools', async (req, res) => {
