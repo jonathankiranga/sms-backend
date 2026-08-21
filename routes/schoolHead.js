@@ -39,6 +39,26 @@ router.get('/:schoolId/teachers', async (req, res) => {
   res.json({ teachers: rows });
 });
 
+// List classes for the school
+router.get('/:schoolId/classes', async (req, res) => {
+  const [rows] = await req.db.execute(
+    'SELECT class_id, class_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
+    [req.params.schoolId]
+  );
+  res.json({ classes: rows });
+});
+
+// List students for the school (optional ?class_id= filter)
+router.get('/:schoolId/students', async (req, res) => {
+  const { class_id } = req.query;
+  let sql = 'SELECT st.*, c.class_name FROM students st JOIN classes c ON st.class_id = c.class_id WHERE st.school_id = ?';
+  const params = [req.params.schoolId];
+  if (class_id) { sql += ' AND st.class_id = ?'; params.push(class_id); }
+  sql += ' ORDER BY c.class_name, st.full_name';
+  const [rows] = await req.db.execute(sql, params);
+  res.json({ students: rows });
+});
+
 // Create a teacher or bursar (only headteacher). Creating headteachers is restricted to admin only.
 router.post('/:schoolId/teachers', async (req, res) => {
   const head = await requireHead(req, res);
