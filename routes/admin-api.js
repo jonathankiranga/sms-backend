@@ -109,6 +109,35 @@ function buildCallbackUrls(key, req) {
 
 const MPESA_CREDENTIAL_FIELDS = ['mpesa_environment', 'mpesa_paybill', 'mpesa_consumer_key', 'mpesa_consumer_secret', 'mpesa_passkey'];
 
+// Self-healing: create any missing mpesa_* columns on schools (checked once per process)
+let _mpesaColumnsReady = false;
+async function ensureMpesaColumns(db) {
+  if (_mpesaColumnsReady) return;
+  const [cols] = await db.execute(
+    "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'schools' AND COLUMN_NAME LIKE 'mpesa_%'"
+  );
+  const have = new Set(cols.map(c => c.COLUMN_NAME));
+  const wanted = {
+    mpesa_consumer_key: 'VARCHAR(100) NULL',
+    mpesa_consumer_secret: 'VARCHAR(255) NULL',
+    mpesa_paybill: 'VARCHAR(20) NULL',
+    mpesa_passkey: 'VARCHAR(255) NULL',
+    mpesa_environment: "VARCHAR(20) DEFAULT 'sandbox'",
+    mpesa_callback_key: 'VARCHAR(64) NULL'
+  };
+  let addedKey = false;
+  for (const [col, def] of Object.entries(wanted)) {
+    if (!have.has(col)) {
+      await db.execute(`ALTER TABLE schools ADD COLUMN ${col} ${def}`);
+      if (col === 'mpesa_callback_key') addedKey = true;
+    }
+  }
+  if (addedKey || !have.has('mpesa_callback_key')) {
+    try { await db.execute('ALTER TABLE schools ADD UNIQUE INDEX uq_mpesa_callback_key (mpesa_callback_key)'); } catch (e) { /* index may already exist */ }
+  }
+  _mpesaColumnsReady = true;
+}
+
 function mpesaReadiness(school) {
   const missing = [];
   if (!school.mpesa_consumer_key) missing.push('Consumer Key');
@@ -130,6 +159,7 @@ router.get('/schools/:id/mpesa-callbacks', async (req, res) => {
 // GET /admin/api/schools/:id/mpesa — credentials + callback URLs + readiness for the portal UI
 router.get('/schools/:id/mpesa', async (req, res) => {
   try {
+    await ensureMpesaColumns(req.db);
     // s.* so a missing optional column can never break the endpoint
     const [rows] = await req.db.execute('SELECT * FROM schools WHERE school_id = ? LIMIT 1', [req.params.id]);
     if (rows.length === 0) return res.status(404).json({ error: 'School not found' });
@@ -150,6 +180,7 @@ router.get('/schools/:id/mpesa', async (req, res) => {
 // PUT /admin/api/schools/:id/mpesa — partial update of M-Pesa credentials (validated)
 router.put('/schools/:id/mpesa', async (req, res) => {
   try {
+    await ensureMpesaColumns(req.db);
     const updates = {};
     for (const f of MPESA_CREDENTIAL_FIELDS) {
       if (req.body[f] !== undefined) updates[f] = String(req.body[f]).trim();
