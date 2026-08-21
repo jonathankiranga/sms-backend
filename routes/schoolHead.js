@@ -104,11 +104,75 @@ router.post('/:schoolId/classes', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return;
 
-  const { class_name, academic_year } = req.body;
-  if (!class_name || !academic_year) return res.status(400).json({ error: 'class_name and academic_year required' });
+  const { class_name, academic_year, stream, level_name } = req.body;
+  const year = academic_year || new Date().getFullYear();
+  // Compose name from level/stream when the UI sends a placeholder
+  let name = (class_name && class_name !== 'auto') ? class_name : null;
+  if (!name && level_name) name = stream ? `${level_name} - ${stream}` : level_name;
+  if (!name) return res.status(400).json({ error: 'class_name or level_name required' });
 
-  const [r] = await req.db.execute('INSERT INTO classes (school_id, class_name, academic_year) VALUES (?, ?, ?)', [req.params.schoolId, class_name, academic_year]);
-  res.json({ class_id: r.insertId, class_name });
+  const [r] = await req.db.execute(
+    'INSERT INTO classes (school_id, class_name, stream, level_name, academic_year) VALUES (?, ?, ?, ?, ?)',
+    [req.params.schoolId, name, stream || null, level_name || null, year]
+  );
+  res.json({ class_id: r.insertId, class_name: name });
+});
+
+// Update a class — only headteacher
+router.put('/:schoolId/classes/:classId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  const { class_name, stream, level_name } = req.body;
+  const fields = [];
+  const params = [];
+  if (class_name) { fields.push('class_name = ?'); params.push(class_name); }
+  if (stream !== undefined) { fields.push('stream = ?'); params.push(stream); }
+  if (level_name !== undefined) { fields.push('level_name = ?'); params.push(level_name); }
+  if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+  params.push(req.params.classId, req.params.schoolId);
+  await req.db.execute(`UPDATE classes SET ${fields.join(', ')} WHERE class_id = ? AND school_id = ?`, params);
+  res.json({ updated: true });
+});
+
+// Delete a class — only headteacher
+router.delete('/:schoolId/classes/:classId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  await req.db.execute('DELETE FROM classes WHERE class_id = ? AND school_id = ?', [req.params.classId, req.params.schoolId]);
+  res.json({ deleted: true });
+});
+
+// List streams for the school
+router.get('/:schoolId/streams', async (req, res) => {
+  const [rows] = await req.db.execute(
+    'SELECT stream_id, stream_name, display_order FROM school_streams WHERE school_id = ? ORDER BY display_order, stream_name',
+    [req.params.schoolId]
+  );
+  res.json({ streams: rows });
+});
+
+// Add a stream — only headteacher
+router.post('/:schoolId/streams', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  const { stream_name } = req.body;
+  if (!stream_name) return res.status(400).json({ error: 'stream_name required' });
+  try {
+    const [r] = await req.db.execute('INSERT INTO school_streams (school_id, stream_name) VALUES (?, ?)', [req.params.schoolId, stream_name]);
+    res.json({ stream_id: r.insertId, stream_name });
+  } catch (err) {
+    if (err && err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Stream already exists' });
+    throw err;
+  }
+});
+
+// Delete a stream — only headteacher
+router.delete('/:schoolId/streams/:streamId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  await req.db.execute('DELETE FROM school_streams WHERE stream_id = ? AND school_id = ?', [req.params.streamId, req.params.schoolId]);
+  res.json({ deleted: true });
 });
 
 // Create a single student — only headteacher. Optional parent_phone/parent_name links the parent.
