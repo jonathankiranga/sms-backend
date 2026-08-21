@@ -5,7 +5,12 @@ const router = express.Router();
 router.get('/', async (req, res) => {
   const { school_id, term, year } = req.query;
   if (!school_id) return res.status(400).json({ error: 'school_id required' });
-  let sql = 'SELECT f.*, (SELECT COUNT(*) FROM fee_assignments WHERE fee_id = f.fee_id) AS assigned_count FROM fee_structures f WHERE f.school_id = ?';
+  let sql = `SELECT f.*,
+    (SELECT COUNT(*) FROM fee_assignments WHERE fee_id = f.fee_id) AS assigned_count,
+    (SELECT GROUP_CONCAT(DISTINCT c.class_name ORDER BY c.class_name SEPARATOR ', ')
+       FROM fee_assignments fa JOIN classes c ON fa.class_id = c.class_id
+      WHERE fa.fee_id = f.fee_id) AS assigned_classes
+  FROM fee_structures f WHERE f.school_id = ?`;
   const params = [school_id];
   if (term) { sql += ' AND f.term = ?'; params.push(term); }
   if (year) { sql += ' AND f.academic_year = ?'; params.push(year); }
