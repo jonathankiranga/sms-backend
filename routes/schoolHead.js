@@ -291,11 +291,16 @@ router.post('/:schoolId/academic-year/close', async (req, res) => {
       [req.params.schoolId]
     );
 
-    const ORDER = ['PP1', 'PP2', 'Pre-Primary', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6', 'Grade 7', 'Grade 8', 'Grade 9'];
+    const ORDER = ['PP1', 'PP2', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6', 'Grade 7', 'Grade 8', 'Grade 9'];
+    // Normalized lookup keys aligned with ORDER ("Pre-Primary" is a synonym of PP2)
+    const KEYS = ['pp1', 'pp2', 'grade1', 'grade2', 'grade3', 'grade4', 'grade5', 'grade6', 'grade7', 'grade8', 'grade9'];
+    const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
     const rankOf = c => {
       if (c.class_rank !== null && c.class_rank !== undefined) return Number(c.class_rank);
-      let i = ORDER.indexOf(c.level_name || '');
-      if (i < 0) i = ORDER.indexOf(String(c.class_name || '').split(' - ')[0]);
+      const raw = c.level_name || String(c.class_name || '').split(/\s*-\s*/)[0];
+      let key = norm(raw);
+      if (key === 'preprimary') key = 'pp2';
+      const i = KEYS.indexOf(key);
       return i >= 0 ? 100 + i : null;
     };
 
