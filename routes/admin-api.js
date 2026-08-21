@@ -182,7 +182,8 @@ router.delete('/schools/:id', async (req, res) => {
 // Body: {
 //   school_name, region, contact_name, contact_phone, contact_email,
 //   headteacher_name, headteacher_phone, headteacher_email,
-//   academic_year, class_names: ["PP1","PP2","Grade 1",...],  // optional, defaults to PP1-Grade 6
+//   academic_year, class_names: ["PP1","PP2","Grade 1",...],  // optional, defaults to PP1-Grade 9
+//   streams: ["East","West"],  // optional; one class per level x stream when provided
 //   premium_payment_model: "parent"|"school", premium_fee_per_term,
 //   fees: [{ name, amount, term }]  // optional
 // }
@@ -190,7 +191,7 @@ router.post('/schools/setup', async (req, res) => {
   const {
     school_name, region, contact_name, contact_phone, contact_email,
     headteacher_name, headteacher_phone, headteacher_email,
-    academic_year, class_names, premium_payment_model, premium_fee_per_term, fees
+    academic_year, class_names, streams, premium_payment_model, premium_fee_per_term, fees
   } = req.body;
 
   if (!school_name) return res.status(400).json({ error: 'school_name required' });
@@ -235,16 +236,38 @@ router.post('/schools/setup', async (req, res) => {
       [headId, headteacher_name, headteacher_phone, headteacher_email || null, 'head', schoolId]
     );
 
-    // Classes — default CBC progression if not provided
-    const defaultClasses = ['PP1', 'PP2', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6'];
+    // Classes — default CBC progression (PP1 → Grade 9) if not provided
+    const defaultClasses = ['PP1', 'PP2', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6', 'Grade 7', 'Grade 8', 'Grade 9'];
     const classes = Array.isArray(class_names) && class_names.length > 0 ? class_names : defaultClasses;
+
+    // Optional streams — one class per level × stream when provided
+    const streams = Array.isArray(streams) ? streams.map(s => String(s).trim()).filter(Boolean) : [];
+    for (let i = 0; i < streams.length; i++) {
+      await conn.execute('INSERT INTO school_streams (school_id, stream_name, display_order) VALUES (?, ?, ?)',
+        [schoolId, streams[i], i + 1]);
+    }
+
     const classRows = [];
-    for (let i = 0; i < classes.length; i++) {
-      const [r] = await conn.execute(
-        'INSERT INTO classes (school_id, class_name, academic_year, class_rank) VALUES (?, ?, ?, ?)',
-        [schoolId, classes[i], year, i + 1]
-      );
-      classRows.push({ class_id: r.insertId, class_name: classes[i] });
+    if (streams.length > 0) {
+      let rank = 0;
+      for (const level of classes) {
+        rank++;
+        for (const stream of streams) {
+          const [r] = await conn.execute(
+            'INSERT INTO classes (school_id, class_name, stream, level_name, academic_year, class_rank) VALUES (?, ?, ?, ?, ?, ?)',
+            [schoolId, `${level} - ${stream}`, stream, level, year, rank]
+          );
+          classRows.push({ class_id: r.insertId, class_name: `${level} - ${stream}` });
+        }
+      }
+    } else {
+      for (let i = 0; i < classes.length; i++) {
+        const [r] = await conn.execute(
+          'INSERT INTO classes (school_id, class_name, level_name, academic_year, class_rank) VALUES (?, ?, ?, ?, ?)',
+          [schoolId, classes[i], classes[i], year, i + 1]
+        );
+        classRows.push({ class_id: r.insertId, class_name: classes[i] });
+      }
     }
 
     // Learning areas + sub-areas per level
@@ -284,7 +307,41 @@ router.post('/schools/setup', async (req, res) => {
                    subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
                            'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
                            'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
-                           'Religious Education': ['Stories', 'Values'] } }
+                           'Religious Education': ['Stories', 'Values'] } },
+      // CBC Junior Secondary (Grades 7-9)
+      'Grade 7': { areas: ['English', 'Kiswahili', 'Mathematics', 'Integrated Science', 'Pre-Technical Studies', 'Social Studies', 'Religious Education', 'Business Studies', 'Agriculture', 'Creative Arts and Sports'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar in Use'],
+                           'Kiswahili': ['Kusikiliza na Kuzungumza', 'Kusoma', 'Kuandika', 'Sarufi'],
+                           'Mathematics': ['Numbers', 'Algebra', 'Measurements', 'Geometry', 'Data Handling'],
+                           'Integrated Science': ['Scientific Investigation', 'Mixtures and Separation', 'Living Things and Their Environment', 'Force and Energy'],
+                           'Pre-Technical Studies': ['Safety and Injury Prevention', 'Materials for Production', 'Technical Drawing', 'ICT and Digital Devices'],
+                           'Social Studies': ['Natural and Historical Built Environments', 'People, Population and Social Organizations', 'Resources and Economic Activities', 'Political Developments and Governance'],
+                           'Religious Education': ['Creation', 'The Bible', 'Faith and God\'s Promises', 'Christian Values'],
+                           'Business Studies': ['Business and Money Management Skills', 'Ethical Practices in Business', 'Record Keeping', 'Markets'],
+                           'Agriculture': ['Introduction to Agriculture', 'Crop Production', 'Livestock Production', 'Agribusiness'],
+                           'Creative Arts and Sports': ['Visual Arts', 'Performing Arts', 'Physical Fitness', 'Ball Games'] } },
+      'Grade 8': { areas: ['English', 'Kiswahili', 'Mathematics', 'Integrated Science', 'Pre-Technical Studies', 'Social Studies', 'Religious Education', 'Business Studies', 'Agriculture', 'Creative Arts and Sports'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar in Use'],
+                           'Kiswahili': ['Kusikiliza na Kuzungumza', 'Kusoma', 'Kuandika', 'Sarufi'],
+                           'Mathematics': ['Numbers', 'Algebra', 'Measurements', 'Geometry', 'Data Handling'],
+                           'Integrated Science': ['Scientific Investigation', 'Matter and Its Properties', 'Living Things and Their Environment', 'Force and Energy'],
+                           'Pre-Technical Studies': ['Safety and Injury Prevention', 'Materials for Production', 'Technical Drawing', 'Entrepreneurship and ICT'],
+                           'Social Studies': ['Natural and Historical Built Environments', 'People, Population and Social Organizations', 'Resources and Economic Activities', 'Political Developments and Governance'],
+                           'Religious Education': ['Creation', 'The Bible', 'Faith and God\'s Promises', 'Christian Values'],
+                           'Business Studies': ['Business and Money Management Skills', 'Ethical Practices in Business', 'Record Keeping', 'Markets'],
+                           'Agriculture': ['Introduction to Agriculture', 'Crop Production', 'Livestock Production', 'Agribusiness'],
+                           'Creative Arts and Sports': ['Visual Arts', 'Performing Arts', 'Physical Fitness', 'Ball Games'] } },
+      'Grade 9': { areas: ['English', 'Kiswahili', 'Mathematics', 'Integrated Science', 'Pre-Technical Studies', 'Social Studies', 'Religious Education', 'Business Studies', 'Agriculture', 'Creative Arts and Sports'],
+                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar in Use'],
+                           'Kiswahili': ['Kusikiliza na Kuzungumza', 'Kusoma', 'Kuandika', 'Sarufi'],
+                           'Mathematics': ['Numbers', 'Algebra', 'Measurements', 'Geometry', 'Data Handling'],
+                           'Integrated Science': ['Scientific Investigation', 'Matter and Its Interactions', 'Living Things and Their Environment', 'Force and Energy'],
+                           'Pre-Technical Studies': ['Safety and Career Opportunities', 'Materials for Production', 'Technical Drawing', 'Entrepreneurship and ICT'],
+                           'Social Studies': ['Natural and Historical Built Environments', 'People, Population and Social Organizations', 'Resources and Economic Activities', 'Political Developments and Governance'],
+                           'Religious Education': ['Creation', 'The Bible', 'Faith and God\'s Promises', 'Christian Values'],
+                           'Business Studies': ['Business and Money Management Skills', 'Ethical Practices in Business', 'Record Keeping', 'Markets'],
+                           'Agriculture': ['Introduction to Agriculture', 'Crop Production', 'Livestock Production', 'Agribusiness'],
+                           'Creative Arts and Sports': ['Visual Arts', 'Performing Arts', 'Physical Fitness', 'Ball Games'] } }
     };
 
     const areaIdCache = {};
