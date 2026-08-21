@@ -1,6 +1,146 @@
 const express = require('express');
 const router = express.Router();
 
+// GET /api/assessments/class-report/:class_id/:term?year=YYYY
+// Aggregated class report: per-student per-area averages from exam results,
+// levels, ranks, class aggregates and competency/value ratings.
+router.get('/class-report/:class_id/:term', async (req, res) => {
+  const year = parseInt(req.query.year) || new Date().getFullYear();
+  const term = req.params.term;
+
+  const [clsRows] = await req.db.execute(
+    'SELECT class_id, school_id, class_name, level_name FROM classes WHERE class_id = ?',
+    [req.params.class_id]
+  );
+  if (clsRows.length === 0) return res.status(404).json({ error: 'Class not found' });
+  const klass = clsRows[0];
+
+  const [students] = await req.db.execute(
+    "SELECT student_id, full_name FROM students WHERE class_id = ? AND enrollment_status = 'Active' ORDER BY full_name",
+    [klass.class_id]
+  );
+
+  // Learning areas for this class level (normalized match; Pre-Primary == PP2 alias)
+  const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  let levelKey = norm(klass.level_name || String(klass.class_name || '').split(/\s*-\s*/)[0]);
+  if (levelKey === 'preprimary') levelKey = 'pp2';
+  const [allAreas] = await req.db.execute(
+    'SELECT area_id, area_name, level_name FROM learning_areas WHERE school_id = ?',
+    [klass.school_id]
+  );
+  const learningAreas = allAreas.filter(a => {
+    let k = norm(a.level_name);
+    if (k === 'preprimary') k = 'pp2';
+    return k === levelKey;
+  });
+
+  // All exam scores for this class + term + year
+  const [scoreRows] = await req.db.execute(
+    `SELECT er.student_id, la.area_id, er.score, er.out_of
+     FROM exam_results er
+     JOIN exam_sessions es ON er.session_id = es.session_id
+     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+     JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE es.class_id = ? AND es.term = ? AND es.academic_year = ?`,
+    [klass.class_id, term, year]
+  );
+
+  // Accumulate score sums per student per area
+  const sums = {}; // sums[student_id][area_id] = { s, o }
+  for (const r of scoreRows) {
+    if (!sums[r.student_id]) sums[r.student_id] = {};
+    if (!sums[r.student_id][r.area_id]) sums[r.student_id][r.area_id] = { s: 0, o: 0 };
+    sums[r.student_id][r.area_id].s += parseFloat(r.score) || 0;
+    sums[r.student_id][r.area_id].o += parseFloat(r.out_of) || 0;
+  }
+
+  const levelOf = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
+
+  const studentRows = students.map(st => {
+    const areas = learningAreas.map(a => {
+      const acc = sums[st.student_id]?.[a.area_id];
+      const avg = acc && acc.o > 0 ? Math.round(acc.s / acc.o * 1000) / 10 : null;
+      return { area_id: a.area_id, avg_pct: avg };
+    });
+    const scored = areas.filter(x => x.avg_pct !== null);
+    const overall = scored.length > 0
+      ? Math.round(scored.reduce((t, x) => t + x.avg_pct, 0) / scored.length * 10) / 10
+      : null;
+    return {
+      student_id: st.student_id,
+      full_name: st.full_name,
+      areas,
+      overall_avg: overall,
+      level: overall !== null ? levelOf(overall) : null,
+      rank: null
+    };
+  });
+
+  studentRows.sort((a, b) => (b.overall_avg ?? -1) - (a.overall_avg ?? -1));
+  let rank = 0, prev = null;
+  studentRows.forEach((s, i) => {
+    if (s.overall_avg === null) { s.rank = null; return; }
+    if (s.overall_avg !== prev) { rank = i + 1; prev = s.overall_avg; }
+    s.rank = rank;
+  });
+
+  const assessed = studentRows.filter(s => s.overall_avg !== null);
+  const levelCounts = { EE: 0, ME: 0, AE: 0, BE: 0 };
+  assessed.forEach(s => { levelCounts[s.level]++; });
+  const totalStudents = students.length;
+
+  const areaAverages = learningAreas.map(a => {
+    const vals = studentRows
+      .map(s => s.areas.find(x => x.area_id === a.area_id)?.avg_pct)
+      .filter(v => v !== null && v !== undefined);
+    return {
+      area_id: a.area_id,
+      area_name: a.area_name,
+      class_avg: vals.length ? Math.round(vals.reduce((t, v) => t + v, 0) / vals.length * 10) / 10 : null,
+      student_count: vals.length
+    };
+  });
+
+  const aggregates = {
+    total_students: totalStudents,
+    class_average: assessed.length
+      ? Math.round(assessed.reduce((t, s) => t + s.overall_avg, 0) / assessed.length * 10) / 10
+      : null,
+    level_counts: levelCounts,
+    level_percentages: Object.fromEntries(
+      Object.entries(levelCounts).map(([k, v]) => [k, totalStudents ? Math.round(v / totalStudents * 100) : 0])
+    ),
+    area_averages: areaAverages,
+    top_performers: assessed.filter(s => s.level === 'EE').slice(0, 10)
+      .map(s => ({ student_id: s.student_id, full_name: s.full_name, overall_avg: s.overall_avg })),
+    bottom_performers: assessed.filter(s => s.level === 'BE').slice(-10).reverse()
+      .map(s => ({ student_id: s.student_id, full_name: s.full_name, overall_avg: s.overall_avg }))
+  };
+
+  // Competency & value ratings for the term
+  const [ratingRows] = await req.db.execute(
+    `SELECT scr.student_id, scr.competency_id, scr.rating
+     FROM student_competency_ratings scr
+     JOIN students st ON scr.student_id = st.student_id
+     WHERE st.class_id = ? AND scr.term = ?`,
+    [klass.class_id, term]
+  );
+  const studentRatings = {};
+  for (const r of ratingRows) {
+    if (!studentRatings[r.student_id]) studentRatings[r.student_id] = {};
+    studentRatings[r.student_id][r.competency_id] = r.rating;
+  }
+
+  res.json({
+    class: { class_id: klass.class_id, class_name: klass.class_name, academic_year: Number(year) },
+    term,
+    students: studentRows,
+    learning_areas: learningAreas.map(a => ({ area_id: a.area_id, area_name: a.area_name })),
+    aggregates,
+    competencies: { student_ratings: studentRatings }
+  });
+});
+
 // GET /api/assessments/areas?school_id=X&level=Grade 4
 router.get('/areas', async (req, res) => {
   const { school_id, level } = req.query;
