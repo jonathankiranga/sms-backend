@@ -209,6 +209,160 @@ router.post('/:schoolId/students', async (req, res) => {
   }
 });
 
+// Promote selected students to a class (manual, per-class flow)
+router.post('/:schoolId/students/promote', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  const { student_ids, to_class_id } = req.body;
+  if (!Array.isArray(student_ids) || student_ids.length === 0 || !to_class_id) {
+    return res.status(400).json({ error: 'student_ids and to_class_id required' });
+  }
+
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [c] = await conn.execute('SELECT class_id FROM classes WHERE class_id = ? AND school_id = ?', [to_class_id, req.params.schoolId]);
+    if (c.length === 0) throw new Error('Target class not found for this school');
+
+    for (const sid of student_ids) {
+      const [s] = await conn.execute('SELECT class_id FROM students WHERE student_id = ? AND school_id = ?', [sid, req.params.schoolId]);
+      if (s.length === 0) continue;
+      await conn.execute('UPDATE students SET class_id = ? WHERE student_id = ?', [to_class_id, sid]);
+      await conn.execute(
+        "INSERT INTO promotion_history (student_id, from_class_id, to_class_id, action, performed_by) VALUES (?, ?, ?, 'Promoted', ?)",
+        [sid, s[0].class_id ?? null, to_class_id, head.teacher_id]
+      );
+    }
+    await conn.commit();
+    res.json({ promoted: student_ids.length });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// Graduate selected students
+router.post('/:schoolId/students/graduate', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  const { student_ids } = req.body;
+  if (!Array.isArray(student_ids) || student_ids.length === 0) {
+    return res.status(400).json({ error: 'student_ids required' });
+  }
+
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+    for (const sid of student_ids) {
+      const [s] = await conn.execute('SELECT class_id FROM students WHERE student_id = ? AND school_id = ?', [sid, req.params.schoolId]);
+      if (s.length === 0) continue;
+      await conn.execute("UPDATE students SET enrollment_status = 'Graduated' WHERE student_id = ?", [sid]);
+      await conn.execute(
+        "INSERT INTO promotion_history (student_id, from_class_id, to_class_id, action, performed_by) VALUES (?, ?, NULL, 'Graduated', ?)",
+        [sid, s[0].class_id ?? null, head.teacher_id]
+      );
+    }
+    await conn.commit();
+    res.json({ graduated: student_ids.length });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// END OF YEAR CLOSE — promote every Active student up one class level; top level graduates.
+router.post('/:schoolId/academic-year/close', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  const { from_year } = req.body || {};
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [classes] = await conn.execute(
+      'SELECT class_id, class_name, stream, level_name, class_rank FROM classes WHERE school_id = ?',
+      [req.params.schoolId]
+    );
+
+    const ORDER = ['PP1', 'PP2', 'Pre-Primary', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6', 'Grade 7', 'Grade 8', 'Grade 9'];
+    const rankOf = c => {
+      if (c.class_rank !== null && c.class_rank !== undefined) return Number(c.class_rank);
+      let i = ORDER.indexOf(c.level_name || '');
+      if (i < 0) i = ORDER.indexOf(String(c.class_name || '').split(' - ')[0]);
+      return i >= 0 ? 100 + i : null;
+    };
+
+    const groups = [];
+    for (const c of classes) {
+      const r = rankOf(c);
+      if (r === null) continue;
+      let g = groups.find(x => x.rank === r);
+      if (!g) { g = { rank: r, classes: [] }; groups.push(g); }
+      g.classes.push(c);
+    }
+    groups.sort((a, b) => a.rank - b.rank);
+    if (groups.length < 2) throw new Error('Need at least two class levels to run year-end close');
+
+    const byId = {};
+    classes.forEach(c => { byId[c.class_id] = c; });
+
+    let promoted = 0, graduated = 0;
+    const details = [];
+    const note = `Year-end close${from_year ? ' ' + from_year : ''}`;
+
+    for (let gi = 0; gi < groups.length; gi++) {
+      const g = groups[gi];
+      const ids = g.classes.map(c => c.class_id);
+      const [students] = await conn.execute(
+        `SELECT student_id, class_id FROM students WHERE school_id = ? AND enrollment_status = 'Active' AND class_id IN (${ids.map(() => '?').join(',')})`,
+        [req.params.schoolId, ...ids]
+      );
+      if (students.length === 0) continue;
+      const isLast = gi === groups.length - 1;
+      const nextGroup = isLast ? null : groups[gi + 1];
+
+      for (const s of students) {
+        const src = byId[s.class_id];
+        if (isLast || !nextGroup) {
+          await conn.execute("UPDATE students SET enrollment_status = 'Graduated' WHERE student_id = ?", [s.student_id]);
+          await conn.execute(
+            "INSERT INTO promotion_history (student_id, from_class_id, to_class_id, action, performed_by, note) VALUES (?, ?, NULL, 'Graduated', ?, ?)",
+            [s.student_id, s.class_id ?? null, head.teacher_id, note]
+          );
+          graduated++;
+          details.push({ student_id: s.student_id, action: 'Graduated' });
+        } else {
+          const target =
+            nextGroup.classes.find(c => src?.stream && c.stream && String(c.stream) === String(src.stream)) ||
+            nextGroup.classes[0];
+          await conn.execute('UPDATE students SET class_id = ? WHERE student_id = ?', [target.class_id, s.student_id]);
+          await conn.execute(
+            "INSERT INTO promotion_history (student_id, from_class_id, to_class_id, action, performed_by, note) VALUES (?, ?, ?, 'Promoted', ?, ?)",
+            [s.student_id, s.class_id ?? null, target.class_id, head.teacher_id, note]
+          );
+          promoted++;
+          details.push({ student_id: s.student_id, action: 'Promoted', to: target.class_name });
+        }
+      }
+    }
+
+    await conn.commit();
+    res.json({ promoted, graduated, levels: groups.length, details });
+  } catch (err) {
+    await conn.rollback();
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 // CSV Import Students — school head can bulk-import into a class.
 // Format per line: student_id,full_name  OR  student_id,full_name,parent_phone,parent_name
 router.post('/:schoolId/students/import', async (req, res) => {
