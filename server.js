@@ -23,6 +23,7 @@ const lessonPlanRoutes = require('./routes/lessonPlans');
 const competencyRoutes = require('./routes/competencies');
 const bazarPayRoutes = require('./routes/bazarPay');
 const examSessionRoutes = require('./routes/examSessions');
+const reportsRoutes = require('./routes/reports');
 
 process.on('uncaughtException', (err) => {
   console.error('[CRASH-GUARD] uncaughtException:', err);
@@ -477,6 +478,7 @@ app.use('/api/lesson-plans', lessonPlanRoutes);
 app.use('/api/competencies', competencyRoutes);
 app.use('/api/bazar-pay', bazarPayRoutes);
 app.use('/api/exam-sessions', examSessionRoutes);
+app.use('/api/reports', reportsRoutes);
 
 app.get('/health', async (req, res) => {
   try {

@@ -484,4 +484,106 @@ router.post('/:schoolId/fee-reminder/:studentId', async (req, res) => {
   }
 });
 
+// ---------- Teacher ↔ Class assignments ----------
+async function ensureAssignmentsTable(db) {
+  await db.query(`CREATE TABLE IF NOT EXISTS teacher_class_assignments (
+    assignment_id INT PRIMARY KEY AUTO_INCREMENT,
+    teacher_id    CHAR(9) NOT NULL,
+    class_id      INT     NOT NULL,
+    assigned_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_teacher_class (teacher_id, class_id),
+    FOREIGN KEY (teacher_id) REFERENCES teachers(teacher_id),
+    FOREIGN KEY (class_id)  REFERENCES classes(class_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+
+// List all assignments for the school (head only)
+router.get('/:schoolId/assignments', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  try {
+    await ensureAssignmentsTable(req.db);
+    const [rows] = await req.db.execute(
+      `SELECT a.assignment_id, a.teacher_id, a.class_id, t.full_name AS teacher_name, c.class_name
+       FROM teacher_class_assignments a
+       JOIN teachers t ON a.teacher_id = t.teacher_id
+       JOIN classes c ON a.class_id = c.class_id
+       WHERE t.school_id = ?
+       ORDER BY t.full_name, c.class_rank, c.class_name`,
+      [req.params.schoolId]
+    );
+    res.json({ assignments: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Replace the class set for one teacher (head only)
+router.put('/:schoolId/assignments/:teacherId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  try {
+    await ensureAssignmentsTable(req.db);
+    const ids = Array.isArray(req.body.class_ids) ? req.body.class_ids.map(Number).filter(Boolean) : [];
+    // Teacher must belong to this school
+    const [t] = await req.db.execute('SELECT teacher_id FROM teachers WHERE teacher_id = ? AND school_id = ?', [req.params.teacherId, req.params.schoolId]);
+    if (t.length === 0) return res.status(404).json({ error: 'Teacher not found in this school' });
+    // Classes must belong to this school
+    if (ids.length > 0) {
+      const [c] = await req.db.execute(
+        `SELECT COUNT(*) AS n FROM classes WHERE school_id = ? AND class_id IN (${ids.map(() => '?').join(',')})`,
+        [req.params.schoolId, ...ids]
+      );
+      if (c[0].n !== ids.length) return res.status(400).json({ error: 'One or more classes do not belong to this school' });
+    }
+    const conn = await req.db.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.execute('DELETE FROM teacher_class_assignments WHERE teacher_id = ?', [req.params.teacherId]);
+      for (const cid of ids) {
+        await conn.execute('INSERT IGNORE INTO teacher_class_assignments (teacher_id, class_id) VALUES (?, ?)', [req.params.teacherId, cid]);
+      }
+      await conn.commit();
+    } catch (e) { await conn.rollback(); throw e; }
+    finally { conn.release(); }
+    res.json({ success: true, teacher_id: req.params.teacherId, class_ids: ids });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// The signed-in staff member's own assigned classes (teacher or head)
+router.get('/:schoolId/my-classes', async (req, res) => {
+  const auth = (req.headers.authorization || '').trim();
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing or invalid Authorization header' });
+  const sessionId = auth.split(' ')[1];
+  const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [sessionId]);
+  if (srows.length === 0) return res.status(401).json({ error: 'Invalid session' });
+  const sess = srows[0];
+  if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) return res.status(401).json({ error: 'Session not verified or expired' });
+  let trows;
+  if (sess.phone) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
+  if (!trows || trows.length === 0 && sess.email) {
+    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ?', [sess.email]);
+  }
+  if (!trows || trows.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  const me = trows[0];
+  if (me.school_id !== req.params.schoolId) return res.status(403).json({ error: 'Wrong school for this session' });
+
+  try {
+    await ensureAssignmentsTable(req.db);
+    let rows;
+    if (me.role === 'head') {
+      [rows] = await req.db.execute(
+        'SELECT class_id, class_name, stream, level_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
+        [req.params.schoolId]
+      );
+      return res.json({ role: 'head', classes: rows });
+    }
+    [rows] = await req.db.execute(
+      `SELECT c.class_id, c.class_name, c.stream, c.level_name, c.academic_year
+       FROM teacher_class_assignments a JOIN classes c ON a.class_id = c.class_id
+       WHERE a.teacher_id = ? ORDER BY c.class_rank, c.class_name`,
+      [me.teacher_id]
+    );
+    res.json({ role: me.role, classes: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = router;
