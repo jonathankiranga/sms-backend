@@ -209,6 +209,46 @@ router.post('/:schoolId/students', async (req, res) => {
   }
 });
 
+// Update a student (head only)
+router.put('/:schoolId/students/:studentId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  const { full_name, class_id, gender, date_of_birth, admission_number, admission_date,
+          guardian_name, guardian_phone, guardian_relationship, address,
+          religion, nationality, medical_notes, special_needs, previous_school } = req.body;
+
+  try {
+    if (class_id) {
+      const [c] = await req.db.execute('SELECT class_id FROM classes WHERE class_id = ? AND school_id = ?', [class_id, req.params.schoolId]);
+      if (c.length === 0) return res.status(400).json({ error: 'Class not found for this school' });
+    }
+    const fields = [], params = [];
+    for (const [key, val] of Object.entries({
+      full_name, class_id, gender, date_of_birth, admission_number, admission_date,
+      guardian_name, guardian_phone, guardian_relationship, address,
+      religion, nationality, medical_notes, special_needs, previous_school
+    })) {
+      if (val !== undefined) { fields.push(`${key} = ?`); params.push(val); }
+    }
+    if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
+    params.push(req.params.studentId, req.params.schoolId);
+    await req.db.execute(`UPDATE students SET ${fields.join(', ')} WHERE student_id = ? AND school_id = ?`, params);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Delete a student (head only)
+router.delete('/:schoolId/students/:studentId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  try {
+    await req.db.execute('DELETE FROM students WHERE student_id = ? AND school_id = ?', [req.params.studentId, req.params.schoolId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Promote selected students to a class (manual, per-class flow)
 router.post('/:schoolId/students/promote', async (req, res) => {
   const head = await requireHead(req, res);
