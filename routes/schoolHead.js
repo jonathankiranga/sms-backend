@@ -190,19 +190,30 @@ router.post('/:schoolId/students', async (req, res) => {
   if (!head) return;
 
   const { student_id, full_name, class_id, parent_phone, parent_name } = req.body;
-  if (!student_id || !full_name || !class_id) return res.status(400).json({ error: 'student_id, full_name, class_id required' });
+  if (!full_name || !class_id) return res.status(400).json({ error: 'full_name, class_id required' });
 
   // Verify class belongs to this school
   const [c] = await req.db.execute('SELECT class_id FROM classes WHERE class_id = ? AND school_id = ?', [class_id, req.params.schoolId]);
   if (c.length === 0) return res.status(400).json({ error: 'Class not found for this school' });
 
+  // Auto-generate student_id if not provided
+  let finalStudentId = student_id;
+  if (!finalStudentId) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = 'STU' + String(Math.floor(100000 + Math.random() * 900000));
+      const [exist] = await req.db.execute('SELECT student_id FROM students WHERE student_id = ?', [candidate]);
+      if (exist.length === 0) { finalStudentId = candidate; break; }
+    }
+    if (!finalStudentId) return res.status(500).json({ error: 'Failed to allocate student ID' });
+  }
+
   try {
-    await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id) VALUES (?, ?, ?, ?)', [student_id, full_name, class_id, req.params.schoolId]);
+    await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id) VALUES (?, ?, ?, ?)', [finalStudentId, full_name, class_id, req.params.schoolId]);
     if (parent_phone) {
       await req.db.execute('INSERT INTO parent_profiles (parent_phone, full_name, is_premium) VALUES (?, ?, FALSE) ON DUPLICATE KEY UPDATE full_name = COALESCE(NULLIF(?, \'\'), full_name)', [parent_phone, parent_name || null, parent_name || null]);
-      await req.db.execute('INSERT IGNORE INTO student_parent_map (student_id, parent_phone) VALUES (?, ?)', [student_id, parent_phone]);
+      await req.db.execute('INSERT IGNORE INTO student_parent_map (student_id, parent_phone) VALUES (?, ?)', [finalStudentId, parent_phone]);
     }
-    res.json({ student_id, full_name, parent_phone: parent_phone || null });
+    res.json({ student_id: finalStudentId, full_name, parent_phone: parent_phone || null });
   } catch (err) {
     if (err && err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Student ID already exists' });
     res.status(500).json({ error: err.message });
