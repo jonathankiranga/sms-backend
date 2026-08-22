@@ -2,6 +2,12 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 
+function genId(prefix) {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 5);
+  return `${prefix}${ts}${rand}`.toUpperCase();
+}
+
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'jonathankiranga@gmail.com';
 
@@ -304,20 +310,13 @@ router.post('/schools/setup', async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    // Generate unique school_id (SCH + 6 digits)
-    let schoolId = null;
-    for (let attempt = 0; attempt < 10; attempt++) {
-      const candidate = 'SCH' + String(Math.floor(100000 + Math.random() * 900000));
-      const [exist] = await conn.execute('SELECT school_id FROM schools WHERE school_id = ?', [candidate]);
-      if (exist.length === 0) { schoolId = candidate; break; }
-    }
-    if (!schoolId) return res.status(500).json({ error: 'Failed to allocate school id' });
+    const schoolId = genId('SCH');
 
     // Sales rep (reuse the admin's default rep or create a generic one)
     const [repRows] = await conn.execute("SELECT rep_id FROM sales_reps WHERE email = ? LIMIT 1", [headteacher_email || ADMIN_EMAIL]);
     let repId = repRows[0]?.rep_id || null;
     if (!repId) {
-      repId = 'REP' + String(Math.floor(100000 + Math.random() * 900000));
+      repId = genId('REP');
       await conn.execute('INSERT INTO sales_reps (rep_id, full_name, phone, email) VALUES (?, ?, ?, ?)',
         [repId, headteacher_name, headteacher_phone, headteacher_email || null]);
     }
@@ -332,7 +331,7 @@ router.post('/schools/setup', async (req, res) => {
     );
 
     // Headteacher
-    const headId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
+    const headId = genId('TCH');
     await conn.execute(
       'INSERT INTO teachers (teacher_id, full_name, phone, email, role, school_id) VALUES (?, ?, ?, ?, ?, ?)',
       [headId, headteacher_name, headteacher_phone, headteacher_email || null, 'head', schoolId]
@@ -788,7 +787,7 @@ router.post('/teachers', async (req, res) => {
   if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
-  const teacherId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
+  const teacherId = genId('TCH');
   await req.db.execute('INSERT INTO teachers (teacher_id, full_name, phone, email, school_id, role) VALUES (?, ?, ?, ?, ?, ?)', [teacherId, full_name, phone, email || null, school_id, role || 'teacher']);
   res.json({ teacher_id: teacherId, full_name });
 });
@@ -832,7 +831,7 @@ router.post('/sales-reps', async (req, res) => {
   if (!full_name) return res.status(400).json({ error: 'full_name required' });
   const type = commission_type === 'flat' ? 'flat' : 'percent';
   const value = Math.max(0, parseFloat(commission_value) || 0);
-  const repId = 'REP' + String(Math.floor(100000 + Math.random() * 900000));
+  const repId = genId('REP');
   await req.db.execute(
     'INSERT INTO sales_reps (rep_id, full_name, phone, email, commission_type, commission_value) VALUES (?, ?, ?, ?, ?, ?)',
     [repId, full_name, phone || null, email || null, type, value]);

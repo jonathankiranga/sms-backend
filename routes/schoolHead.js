@@ -2,7 +2,13 @@ const express = require('express');
 const router = express.Router();
 const { verifyToken } = require('../lib/auth');
 
-// requireHead using OTP sessions (session_id as bearer token). Verifies session exists and is verified.
+// Shared ID generator: prefix + base36(ms since epoch) + 3-char random (e.g., STU1Y8K7M2)
+function genId(prefix) {
+  const ts = Date.now().toString(36); // base36 timestamp
+  const rand = Math.random().toString(36).slice(2, 5);
+  return `${prefix}${ts}${rand}`.toUpperCase();
+}
+
 async function requireHead(req, res) {
   const auth = (req.headers.authorization || '').trim();
   if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
@@ -70,7 +76,7 @@ router.post('/:schoolId/teachers', async (req, res) => {
   if (cleanRole !== 'teacher' && cleanRole !== 'bursar') return res.status(400).json({ error: 'Invalid role. Must be teacher or bursar.' });
   if (!full_name || !phone) return res.status(400).json({ error: 'Name and phone required' });
 
-  const teacherId = 'TCH' + String(Math.floor(100000 + Math.random() * 900000));
+  const teacherId = genId('TCH');
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
   if (email) {
@@ -199,12 +205,7 @@ router.post('/:schoolId/students', async (req, res) => {
   // Auto-generate student_id if not provided
   let finalStudentId = student_id;
   if (!finalStudentId) {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      const candidate = 'STU' + String(Math.floor(100000 + Math.random() * 900000));
-      const [exist] = await req.db.execute('SELECT student_id FROM students WHERE student_id = ?', [candidate]);
-      if (exist.length === 0) { finalStudentId = candidate; break; }
-    }
-    if (!finalStudentId) return res.status(500).json({ error: 'Failed to allocate student ID' });
+    finalStudentId = genId('STU');
   }
 
   try {
