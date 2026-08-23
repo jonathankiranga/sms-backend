@@ -42,6 +42,29 @@ router.use(async (req, res, next) => {
   if (req.bursar) next();
 });
 
+// Self-healing indexes for payment_ledger so search/pagination stay fast at scale.
+let paymentIndexesEnsured = false;
+async function ensurePaymentIndexes(db) {
+  if (paymentIndexesEnsured) return;
+  try {
+    const wanted = [
+      ['idx_pl_school_logged', 'ALTER TABLE payment_ledger ADD INDEX idx_pl_school_logged (school_id, logged_at)'],
+      ['idx_pl_student', 'ALTER TABLE payment_ledger ADD INDEX idx_pl_student (student_reference)'],
+      ['idx_pl_school_year', 'ALTER TABLE payment_ledger ADD INDEX idx_pl_school_year (school_id, academic_year)'],
+    ];
+    for (const [name, ddl] of wanted) {
+      const [rows] = await db.query(
+        "SELECT COUNT(*) AS c FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'payment_ledger' AND INDEX_NAME = ?",
+        [name]
+      );
+      if ((rows[0]?.c || 0) === 0) await db.query(ddl);
+    }
+    paymentIndexesEnsured = true;
+  } catch (e) {
+    console.error('ensurePaymentIndexes failed (non-fatal):', e.message);
+  }
+}
+
 // GET /api/bazar-pay/fee-structures/:school_id — list fee items for a school
 router.get('/fee-structures/:school_id', async (req, res) => {
   const { school_id } = req.params;
@@ -168,10 +191,12 @@ router.post('/reverse-payment', async (req, res) => {
   res.json({ success: true, message: 'Payment reversed', transaction_reference });
 });
 
-// GET /api/bazar-pay/payments — list payments with filters
+// GET /api/bazar-pay/payments — list payments with filters + full-text-ish search
 router.get('/payments', async (req, res) => {
-  const { school_id, term, year, method, student_id, page = 1, limit = 50 } = req.query;
+  const { school_id, term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
   if (!school_id) return res.status(400).json({ error: 'school_id required' });
+
+  await ensurePaymentIndexes(req.db);
 
   let sql = `SELECT p.*, s.full_name AS student_name, c.class_name
              FROM payment_ledger p
@@ -184,6 +209,18 @@ router.get('/payments', async (req, res) => {
   if (year) { sql += ' AND p.academic_year = ?'; params.push(year); }
   if (method) { sql += ' AND p.payment_method = ?'; params.push(method); }
   if (student_id) { sql += ' AND p.student_reference = ?'; params.push(student_id); }
+  if (search && String(search).trim()) {
+    const q = String(search).trim();
+    const like = `%${q}%`;
+    const numeric = parseFloat(q.replace(/,/g, ''));
+    sql += ' AND (p.transaction_reference LIKE ? OR s.full_name LIKE ? OR p.parent_phone LIKE ? OR c.class_name LIKE ?';
+    params.push(like, like, like, like);
+    if (!isNaN(numeric)) {
+      sql += ' OR p.amount = ?';
+      params.push(numeric);
+    }
+    sql += ')';
+  }
 
   // Count total
   const [countResult] = await req.db.execute(
