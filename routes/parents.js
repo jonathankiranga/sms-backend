@@ -253,7 +253,7 @@ router.post('/upgrade', async (req, res) => {
       return res.json({
         transaction_ref: null,
         status: 'school_paid',
-        message: 'Your school covers the premium subscription. You already have access.'
+        message: 'Your school covers the subscription for you. You already have access.'
       });
     }
   }
@@ -280,7 +280,7 @@ router.post('/upgrade', async (req, res) => {
   if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE && process.env.MPESA_PASSKEY) {
     try {
       const mpesa = require('../services/mpesa');
-      const result = await mpesa.stkPush(phone, totalDue, txnRef, 'Education APP Premium');
+      const result = await mpesa.stkPush(phone, totalDue, txnRef, 'Education APP Subscription');
       if (result.ResponseCode === '0') {
         console.log(`[MPESA] STK push sent to ${phone} for KSh ${totalDue} ref ${txnRef}`);
         return res.json({
@@ -330,7 +330,7 @@ router.post('/upgrade', async (req, res) => {
   res.json({
     transaction_ref: txnRef,
     status: 'confirmed',
-    message: `Premium activated for KSh ${totalDue}/term for ${childCount || 1} child${childCount === 1 ? '' : 'ren'}`,
+    message: `Subscription activated for KSh ${totalDue}/term for ${childCount || 1} child${childCount === 1 ? '' : 'ren'}`,
     premium_due: totalDue,
     premium_children_count: childCount || 1
   });
