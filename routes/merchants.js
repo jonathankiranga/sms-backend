@@ -86,4 +86,86 @@ router.get('/schools', async (req, res) => {
   res.json({ schools: rows });
 });
 
+// ---------- School Market: searchable product catalog. The platform only
+// surfaces listings with the seller's contact; all dealing is direct. ----------
+let marketTablesReady = false;
+async function ensureMarketTables(db) {
+  if (marketTablesReady) return;
+  await db.execute(`CREATE TABLE IF NOT EXISTS products (
+    product_id VARCHAR(24) PRIMARY KEY,
+    merchant_id VARCHAR(24) NOT NULL,
+    name VARCHAR(140) NOT NULL,
+    description TEXT NULL,
+    category VARCHAR(60) NOT NULL DEFAULT 'Other',
+    price DECIMAL(10,2) NOT NULL DEFAULT 0,
+    image_url TEXT NULL,
+    target_school_id CHAR(9) NULL,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_products_merchant (merchant_id),
+    INDEX idx_products_category (category),
+    INDEX idx_products_active (active)
+  )`);
+  marketTablesReady = true;
+}
+
+// GET /api/market/products?q=&category= — searchable catalog for parents
+router.get('/market/products', async (req, res) => {
+  await ensureMarketTables(req.db);
+  const q = String(req.query.q || '').trim();
+  const category = String(req.query.category || '').trim();
+  let sql = `SELECT p.product_id, p.name, p.description, p.category, p.price, p.image_url,
+                    m.business_name, m.phone AS merchant_phone
+             FROM products p JOIN merchants m ON p.merchant_id = m.merchant_id
+             WHERE p.active = TRUE`;
+  const params = [];
+  if (category && category !== 'All') { sql += ' AND p.category = ?'; params.push(category); }
+  if (q) {
+    sql += ' AND (p.name LIKE ? OR p.description LIKE ? OR p.category LIKE ? OR m.business_name LIKE ?)';
+    const like = `%${q}%`;
+    params.push(like, like, like, like);
+  }
+  sql += ' ORDER BY p.created_at DESC LIMIT 100';
+  const [rows] = await req.db.execute(sql, params);
+  res.json({ products: rows });
+});
+
+// POST /api/merchants/products — merchant adds a listing
+router.post('/products', async (req, res) => {
+  await ensureMarketTables(req.db);
+  const { merchant_id, name, description, category, price, image_url } = req.body;
+  if (!merchant_id || !name) return res.status(400).json({ error: 'Merchant and product name required' });
+  const [m] = await req.db.execute('SELECT merchant_id FROM merchants WHERE merchant_id = ?', [merchant_id]);
+  if (m.length === 0) return res.status(404).json({ error: 'Merchant not found' });
+  const pid = 'PRD' + Date.now().toString(36).toUpperCase() + Math.floor(Math.random() * 36).toString(36).toUpperCase();
+  await req.db.execute(
+    'INSERT INTO products (product_id, merchant_id, name, description, category, price, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [pid, merchant_id, String(name).slice(0, 140), (description || '').slice(0, 2000) || null,
+     String(category || 'Other').slice(0, 60), Math.max(0, parseFloat(price) || 0), image_url || null]
+  );
+  res.json({ message: 'Product listed', product_id: pid });
+});
+
+// GET /api/merchants/products?merchant_id=X — merchant's own listings
+router.get('/products', async (req, res) => {
+  await ensureMarketTables(req.db);
+  const { merchant_id } = req.query;
+  if (!merchant_id) return res.status(400).json({ error: 'merchant_id required' });
+  const [rows] = await req.db.execute(
+    'SELECT product_id, name, description, category, price, active, created_at FROM products WHERE merchant_id = ? ORDER BY created_at DESC',
+    [merchant_id]
+  );
+  res.json({ products: rows });
+});
+
+// POST /api/merchants/products/deactivate — merchant hides a listing
+router.post('/products/deactivate', async (req, res) => {
+  await ensureMarketTables(req.db);
+  const { merchant_id, product_id } = req.body;
+  if (!merchant_id || !product_id) return res.status(400).json({ error: 'Missing fields' });
+  const [r] = await req.db.execute('UPDATE products SET active = FALSE WHERE product_id = ? AND merchant_id = ?', [product_id, merchant_id]);
+  if (r.affectedRows === 0) return res.status(404).json({ error: 'Product not found' });
+  res.json({ message: 'Listing hidden' });
+});
+
 module.exports = router;
