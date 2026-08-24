@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
+const { sendEmailOtp } = require('../services/messaging');
 
 // Accept 07.. / 7.. / +254.. / 254.. and store compare in canonical 254.. form
 function normalizePhone(raw) {
@@ -10,42 +11,86 @@ function normalizePhone(raw) {
   return p;
 }
 
+// Resolve the premium parent by phone OR email; returns canonical contact row.
+async function findPremiumParent(db, phone, email) {
+  if (phone) {
+    const [rows] = await db.execute(
+      "SELECT parent_phone FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
+      [phone]
+    );
+    if (rows.length > 0) return rows[0];
+  }
+  if (email) {
+    const [rows] = await db.execute(
+      "SELECT parent_phone FROM parent_profiles WHERE email = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
+      [String(email).trim().toLowerCase()]
+    );
+    if (rows.length > 0) return rows[0];
+  }
+  return null;
+}
+
 // POST /api/merchants/register
 router.post('/register', async (req, res) => {
-  const { business_name, email } = req.body;
-  const phone = normalizePhone(req.body.phone);
-  if (!business_name || !phone) return res.status(400).json({ error: 'Business name and phone required' });
+  const { business_name } = req.body;
+  const emailInput = String(req.body.email || '').trim();
+  const normPhone = normalizePhone(req.body.phone);
+  if (!business_name) return res.status(400).json({ error: 'Business name required' });
+  if (!normPhone && !emailInput) return res.status(400).json({ error: 'Phone or email required' });
 
-  // Must be a premium parent
-  const [parentCheck] = await req.db.execute(
-    "SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
-    [phone]
-  );
-  if (parentCheck.length === 0) return res.status(403).json({ error: 'Only premium parents can register as merchants. Upgrade first.' });
+  // Must be a premium parent — identified by phone OR email
+  const parent = await findPremiumParent(req.db, normPhone, emailInput);
+  if (!parent) return res.status(403).json({ error: 'Only premium parents can register as merchants. Upgrade first.' });
+
+  // Canonical contact number for the listing (what parents will call)
+  const phone = parent.parent_phone;
 
   const [existing] = await req.db.execute('SELECT merchant_id FROM merchants WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
   const mid = 'MER' + Date.now().toString(36).toUpperCase();
-  await req.db.execute('INSERT INTO merchants (merchant_id, business_name, phone, email) VALUES (?, ?, ?, ?)', [mid, business_name, phone, email || null]);
+  await req.db.execute('INSERT INTO merchants (merchant_id, business_name, phone, email) VALUES (?, ?, ?, ?)', [mid, business_name, phone, emailInput || null]);
 
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sid = crypto.randomBytes(32).toString('hex');
   await req.db.execute('INSERT INTO otp_sessions (session_id, phone, code, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))', [sid, phone, code]);
-  if (process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
-  res.json({ merchant_id: mid, session_id: sid, message: 'Registered. OTP sent.' });
+  let delivered = false;
+  try {
+    const mailTo = emailInput || null;
+    if (mailTo) { await sendEmailOtp(mailTo, code); delivered = true; }
+  } catch (e) { /* fall through */ }
+  if (!delivered && process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
+  res.json({ merchant_id: mid, session_id: sid, message: delivered ? 'Registered. OTP sent to your email.' : 'Registered. OTP sent.' });
 });
 
 // POST /api/merchants/request-otp
 router.post('/request-otp', async (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  if (!phone) return res.status(400).json({ error: 'Phone required' });
-  const [merchant] = await req.db.execute('SELECT merchant_id FROM merchants WHERE phone = ?', [phone]);
-  if (merchant.length === 0) return res.status(404).json({ error: 'Merchant not found. Register first.' });
+  const normPhone = normalizePhone(req.body.phone);
+  const emailInput = String(req.body.email || '').trim();
+  if (!normPhone && !emailInput) return res.status(400).json({ error: 'Phone or email required' });
+  let rows;
+  if (normPhone) {
+    [rows] = await req.db.execute('SELECT merchant_id, phone FROM merchants WHERE phone = ?', [normPhone]);
+  }
+  if ((!rows || rows.length === 0) && emailInput) {
+    [rows] = await req.db.execute('SELECT merchant_id, phone FROM merchants WHERE email = ?', [emailInput]);
+  }
+  if (!rows || rows.length === 0) return res.status(404).json({ error: 'Merchant not found. Register first.' });
+  const phone = rows[0].phone;
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sid = crypto.randomBytes(32).toString('hex');
   await req.db.execute('INSERT INTO otp_sessions (session_id, phone, code, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))', [sid, phone, code]);
-  if (process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
-  res.json({ session_id: sid, message: 'OTP sent' });
+  let delivered = false;
+  try {
+    const [mail] = await req.db.execute(
+      `SELECT COALESCE(m.email, pp.email) AS email
+       FROM merchants m LEFT JOIN parent_profiles pp ON pp.parent_phone = m.phone
+       WHERE m.merchant_id = ?`,
+      [rows[0].merchant_id]
+    );
+    if (mail.length > 0 && mail[0].email) { await sendEmailOtp(mail[0].email, code); delivered = true; }
+  } catch (e) { /* fall through */ }
+  if (!delivered && process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
+  res.json({ session_id: sid, message: delivered ? 'OTP sent to your email' : 'OTP sent' });
 });
 
 // POST /api/merchants/verify-otp
