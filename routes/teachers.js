@@ -21,7 +21,7 @@ router.post('/request-otp', async (req, res) => {
   // Store session with phone and/or email populated.
   // otp_sessions.phone is NOT NULL, so use '' (empty string) for email-only logins.
   await req.db.execute(
-    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE)',
+    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), FALSE)',
     [sessionId, phone || '', email || null, code]
   );
 
@@ -52,7 +52,17 @@ router.post('/verify-otp', async (req, res) => {
     [session_id, code]
   );
 
-  if (rows.length === 0) return res.status(401).json({ error: 'Invalid or expired code' });
+  if (rows.length === 0) {
+    // Distinguish an expired-but-correct code from a plain wrong one
+    const [expiredRows] = await req.db.execute(
+      'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE',
+      [session_id, code]
+    );
+    if (expiredRows.length > 0) {
+      return res.status(410).json({ error: 'Code expired - tap Resend to get a new one' });
+    }
+    return res.status(401).json({ error: 'Invalid or expired code' });
+  }
 
   // Mark OTP session as verified and extend session expiry to 4 hours so session_id can be used as bearer token
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?', [session_id]);
