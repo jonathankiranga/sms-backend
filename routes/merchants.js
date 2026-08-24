@@ -3,6 +3,18 @@ const crypto = require('crypto');
 const router = express.Router();
 const { sendEmailOtp } = require('../services/messaging');
 
+// Express 4 does not catch rejected promises from async handlers — without this
+// wrapper any thrown error leaves the request hanging forever.
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Hard cap on email delivery so a wedged provider can never stall a request.
+function deliverEmailOtp(email, code) {
+  return Promise.race([
+    sendEmailOtp(email, code),
+    new Promise(resolve => setTimeout(() => resolve({ provider: 'timeout' }), 8000))
+  ]);
+}
+
 // Accept 07.. / 7.. / +254.. / 254.. and store compare in canonical 254.. form
 function normalizePhone(raw) {
   let p = String(raw || '').replace(/[\s-]/g, '').replace(/^\+/, '');
@@ -31,7 +43,7 @@ async function findPremiumParent(db, phone, email) {
 }
 
 // POST /api/merchants/register
-router.post('/register', async (req, res) => {
+router.post('/register', wrap(async (req, res) => {
   const { business_name } = req.body;
   const emailInput = String(req.body.email || '').trim();
   const normPhone = normalizePhone(req.body.phone);
@@ -56,14 +68,14 @@ router.post('/register', async (req, res) => {
   let delivered = false;
   try {
     const mailTo = emailInput || parent.email || null;
-    if (mailTo) { await sendEmailOtp(mailTo, code); delivered = true; }
-  } catch (e) { /* fall through */ }
+    if (mailTo) { await deliverEmailOtp(mailTo, code); delivered = true; }
+  } catch (e) { console.error('[MER:Register] email failed:', e.message); }
   if (!delivered && process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
   res.json({ merchant_id: mid, session_id: sid, message: delivered ? 'Registered. OTP sent to your email.' : 'Registered. OTP sent.' });
-});
+}));
 
 // POST /api/merchants/request-otp
-router.post('/request-otp', async (req, res) => {
+router.post('/request-otp', wrap(async (req, res) => {
   const normPhone = normalizePhone(req.body.phone);
   const emailInput = String(req.body.email || '').trim();
   if (!normPhone && !emailInput) return res.status(400).json({ error: 'Phone or email required' });
@@ -87,14 +99,14 @@ router.post('/request-otp', async (req, res) => {
        WHERE m.merchant_id = ?`,
       [rows[0].merchant_id]
     );
-    if (mail.length > 0 && mail[0].email) { await sendEmailOtp(mail[0].email, code); delivered = true; }
+    if (mail.length > 0 && mail[0].email) { await deliverEmailOtp(mail[0].email, code); delivered = true; }
   } catch (e) { /* fall through */ }
   if (!delivered && process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
   res.json({ session_id: sid, message: delivered ? 'OTP sent to your email' : 'OTP sent' });
-});
+}));
 
 // POST /api/merchants/verify-otp
-router.post('/verify-otp', async (req, res) => {
+router.post('/verify-otp', wrap(async (req, res) => {
   const { session_id, code } = req.body;
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
   const [rows] = await req.db.execute('SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE', [session_id, code]);
@@ -102,20 +114,20 @@ router.post('/verify-otp', async (req, res) => {
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
   const [m] = await req.db.execute('SELECT merchant_id, business_name FROM merchants WHERE phone = ?', [normalizePhone(rows[0].phone)]);
   res.json({ merchant_id: m[0].merchant_id, business_name: m[0].business_name, verified: true });
-});
+}));
 
 // GET /api/merchants/campaigns?merchant_id=X
-router.get('/campaigns', async (req, res) => {
+router.get('/campaigns', wrap(async (req, res) => {
   const { merchant_id } = req.query;
   const [rows] = await req.db.execute(
     'SELECT ad_id, merchant_name AS business_name, merchant_phone, message, banner_image_url, target_link, status, start_date, end_date FROM marketplace_campaigns WHERE merchant_name IN (SELECT business_name FROM merchants WHERE merchant_id = ?) ORDER BY created_at DESC',
     [merchant_id]
   );
   res.json({ campaigns: rows });
-});
+}));
 
 // POST /api/merchants/campaigns
-router.post('/campaigns', async (req, res) => {
+router.post('/campaigns', wrap(async (req, res) => {
   const { merchant_id, message, target_school_id, days } = req.body;
   if (!merchant_id || !message || !target_school_id || !days) return res.status(400).json({ error: 'Missing fields' });
   const [m] = await req.db.execute('SELECT business_name, phone FROM merchants WHERE merchant_id = ?', [merchant_id]);
@@ -132,13 +144,13 @@ router.post('/campaigns', async (req, res) => {
   const campaignId = result.insertId;
 
   res.json({ message: 'Campaign created', campaign_id: campaignId, days: duration });
-});
+}));
 
 // GET /api/merchants/schools — list schools for targeting
-router.get('/schools', async (req, res) => {
+router.get('/schools', wrap(async (req, res) => {
   const [rows] = await req.db.execute('SELECT school_id, school_name, region FROM schools ORDER BY school_name');
   res.json({ schools: rows });
-});
+}));
 
 // ---------- School Market: searchable product catalog. The platform only
 // surfaces listings with the seller's contact; all dealing is direct. ----------
@@ -164,7 +176,7 @@ async function ensureMarketTables(db) {
 }
 
 // GET /api/market/products?q=&category= — searchable catalog for parents
-router.get('/market/products', async (req, res) => {
+router.get('/market/products', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const q = String(req.query.q || '').trim();
   const category = String(req.query.category || '').trim();
@@ -182,10 +194,10 @@ router.get('/market/products', async (req, res) => {
   sql += ' ORDER BY p.created_at DESC LIMIT 100';
   const [rows] = await req.db.execute(sql, params);
   res.json({ products: rows });
-});
+}));
 
 // POST /api/merchants/products — merchant adds a listing
-router.post('/products', async (req, res) => {
+router.post('/products', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const { merchant_id, name, description, category, price, image_url } = req.body;
   if (!merchant_id || !name) return res.status(400).json({ error: 'Merchant and product name required' });
@@ -198,10 +210,10 @@ router.post('/products', async (req, res) => {
      String(category || 'Other').slice(0, 60), Math.max(0, parseFloat(price) || 0), image_url || null]
   );
   res.json({ message: 'Product listed', product_id: pid });
-});
+}));
 
 // GET /api/merchants/products?merchant_id=X — merchant's own listings
-router.get('/products', async (req, res) => {
+router.get('/products', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const { merchant_id } = req.query;
   if (!merchant_id) return res.status(400).json({ error: 'merchant_id required' });
@@ -210,16 +222,16 @@ router.get('/products', async (req, res) => {
     [merchant_id]
   );
   res.json({ products: rows });
-});
+}));
 
 // POST /api/merchants/products/deactivate — merchant hides a listing
-router.post('/products/deactivate', async (req, res) => {
+router.post('/products/deactivate', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const { merchant_id, product_id } = req.body;
   if (!merchant_id || !product_id) return res.status(400).json({ error: 'Missing fields' });
   const [r] = await req.db.execute('UPDATE products SET active = FALSE WHERE product_id = ? AND merchant_id = ?', [product_id, merchant_id]);
   if (r.affectedRows === 0) return res.status(404).json({ error: 'Product not found' });
   res.json({ message: 'Listing hidden' });
-});
+}));
 
 module.exports = router;
