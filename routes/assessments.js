@@ -288,8 +288,35 @@ router.get('/results/:assessment_id', async (req, res) => {
 // GET /api/assessments/report/:student_id/:term
 router.get('/report/:student_id/:term', async (req, res) => {
   const { student_id, term } = req.params;
-  const { year } = req.query;
+  const { year, phone } = req.query;
   const reportYear = parseInt(year) || new Date().getFullYear();
+
+  // Subscription guard: report cards require an active subscription for the
+  // requesting parent (or a school-paid plan). Fee statements remain free.
+  const normPhone = String(phone || '').replace(/[\s-]/g, '').replace(/^\+/, '').replace(/^0([17]\d{8})$/, '254$1');
+  if (!normPhone) {
+    return res.status(400).json({ error: 'Parent phone is required to view report cards' });
+  }
+  const [link] = await req.db.execute(
+    `SELECT s.school_id,
+            p.is_premium, p.premium_expires_at,
+            sc.premium_payment_model
+     FROM student_parent_map m
+     JOIN students s ON m.student_id = s.student_id
+     JOIN schools sc ON s.school_id = sc.school_id
+     LEFT JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+     WHERE m.student_id = ? AND m.parent_phone = ?
+     LIMIT 1`,
+    [student_id, normPhone]
+  );
+  if (link.length === 0) {
+    return res.status(403).json({ error: 'This student is not linked to your phone. Ask the school to link you as a parent.' });
+  }
+  const schoolPays = link[0].premium_payment_model === 'school';
+  const subActive = Boolean(link[0].is_premium) && (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+  if (!schoolPays && !subActive) {
+    return res.status(402).json({ error: 'An active subscription is required to download report cards.' });
+  }
 
   const [student] = await req.db.execute(
     `SELECT s.student_id, s.full_name, c.class_name, s.school_id
