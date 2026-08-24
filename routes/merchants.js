@@ -15,14 +15,14 @@ function normalizePhone(raw) {
 async function findPremiumParent(db, phone, email) {
   if (phone) {
     const [rows] = await db.execute(
-      "SELECT parent_phone FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
+      "SELECT parent_phone, email FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
       [phone]
     );
     if (rows.length > 0) return rows[0];
   }
   if (email) {
     const [rows] = await db.execute(
-      "SELECT parent_phone FROM parent_profiles WHERE email = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
+      "SELECT parent_phone, email FROM parent_profiles WHERE email = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
       [String(email).trim().toLowerCase()]
     );
     if (rows.length > 0) return rows[0];
@@ -55,7 +55,7 @@ router.post('/register', async (req, res) => {
   await req.db.execute('INSERT INTO otp_sessions (session_id, phone, code, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))', [sid, phone, code]);
   let delivered = false;
   try {
-    const mailTo = emailInput || null;
+    const mailTo = emailInput || parent.email || null;
     if (mailTo) { await sendEmailOtp(mailTo, code); delivered = true; }
   } catch (e) { /* fall through */ }
   if (!delivered && process.env.NODE_ENV !== 'production') console.log('=== OTP for merchant', phone, ':', code, '===');
