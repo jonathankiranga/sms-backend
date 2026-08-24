@@ -118,7 +118,7 @@ async function handleStkCallback(req, res, school_id) {
     console.log(`[STK][${school_id || 'GLOBAL'}] ${phoneOrHash} paid KSh ${amount} — ref ${receipt} (${ref})`);
 
     const [pending] = await req.db.execute(
-      "SELECT parent_phone FROM payment_ledger WHERE transaction_reference = ? AND notes = 'STK_PENDING' LIMIT 1",
+      "SELECT parent_phone, school_id AS ledger_school_id FROM payment_ledger WHERE transaction_reference = ? AND notes = 'STK_PENDING' LIMIT 1",
       [ref]
     );
     const pendingParentPhone = pending.length > 0 ? pending[0].parent_phone : null;
@@ -139,15 +139,20 @@ async function handleStkCallback(req, res, school_id) {
     }
 
     if (ref.startsWith('UPG') || ref.startsWith('BAZPAY-')) {
+      // Allocate to the school tagged on the pending ledger row (per-school upgrade),
+      // then the callback route's school, then the parent's first linked student's school.
+      const ledgerSchoolId = pending.length > 0 ? pending[0].ledger_school_id : null;
       const [link] = await req.db.execute(
-        'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
+        'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? ORDER BY s.school_id LIMIT 1',
         [phone]
       );
+      const activeSchoolId = ledgerSchoolId || school_id || (link.length > 0 ? link[0].school_id : null);
+
       let expiresAt = new Date(Date.now() + 90 * 86400000);
-      if (link.length > 0) {
+      if (activeSchoolId) {
         const [termRow] = await req.db.execute(
           'SELECT MIN(start_date) AS next_start FROM school_terms WHERE school_id = ? AND start_date > CURDATE()',
-          [link[0].school_id]
+          [activeSchoolId]
         );
         if (termRow.length > 0 && termRow[0].next_start) {
           expiresAt = new Date(termRow[0].next_start);
@@ -160,7 +165,6 @@ async function handleStkCallback(req, res, school_id) {
 
       const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
       const currentYear = new Date().getFullYear();
-      const activeSchoolId = school_id || (link.length > 0 ? link[0].school_id : null);
       if (activeSchoolId) {
         await req.db.execute(
           `INSERT INTO premium_subscriptions

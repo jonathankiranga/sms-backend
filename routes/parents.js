@@ -144,31 +144,42 @@ router.get('/dashboard/:phone', async (req, res) => {
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const premiumPrice = parseInt(setting[0]?.setting_value || '100');
 
-  // Check if school pays for premium
+  // Multi-school support: summarize every school the parent has children in
+  const schoolMap = new Map();
+  for (const ch of children) {
+    if (!schoolMap.has(ch.school_id)) {
+      schoolMap.set(ch.school_id, { school_id: ch.school_id, school_name: ch.school_name, children_count: 0, school_pays: false });
+    }
+    schoolMap.get(ch.school_id).children_count++;
+  }
+
+  // Check if ANY linked school covers premium; auto-activate school-paid subscriptions per school
   let schoolPays = false;
   let schoolFee = premiumPrice;
-  if (schoolId) {
-    const [school] = await req.db.execute('SELECT premium_payment_model, premium_fee_per_term FROM schools WHERE school_id = ?', [schoolId]);
+  const { getCurrentTerm, getNextTermStart } = require('../lib/config');
+  for (const schoolEntry of schoolMap.values()) {
+    const sid = schoolEntry.school_id;
+    const [school] = await req.db.execute('SELECT premium_payment_model, premium_fee_per_term FROM schools WHERE school_id = ?', [sid]);
     if (school.length > 0 && school[0].premium_payment_model === 'school') {
       schoolPays = true;
       schoolFee = school[0].premium_fee_per_term || premiumPrice;
+      schoolEntry.school_pays = true;
       // Auto-activate premium for this parent if school pays and not already premium
-      const { getCurrentTerm, getNextTermStart } = require('../lib/config');
-      const currentTerm = await getCurrentTerm(req.db, schoolId);
+      const currentTerm = await getCurrentTerm(req.db, sid);
       const currentYear = new Date().getFullYear();
       const [existingSub] = await req.db.execute(
         'SELECT subscription_id FROM premium_subscriptions WHERE school_id = ? AND parent_phone = ? AND term = ? AND year = ? AND payment_status = ?',
-        [schoolId, phone, currentTerm, currentYear, 'paid']
+        [sid, phone, currentTerm, currentYear, 'paid']
       );
       if (existingSub.length === 0) {
         // Check school-paid subscription exists
         const [sub] = await req.db.execute(
           'SELECT subscription_id FROM premium_subscriptions WHERE school_id = ? AND parent_phone = ? AND term = ? AND year = ? AND payment_model = ?',
-          [schoolId, phone, currentTerm, currentYear, 'school']
+          [sid, phone, currentTerm, currentYear, 'school']
         );
         if (sub.length > 0) {
           // Activate this parent until next term starts
-          const expiresAt = await getNextTermStart(req.db, schoolId);
+          const expiresAt = await getNextTermStart(req.db, sid);
           await req.db.execute(
             "UPDATE premium_subscriptions SET payment_status = 'paid', activated_at = NOW(), expires_at = ? WHERE subscription_id = ?",
             [expiresAt, sub[0].subscription_id]
@@ -192,6 +203,7 @@ router.get('/dashboard/:phone', async (req, res) => {
   res.json({
     parent: parent[0] || { is_premium: false },
     school_id: schoolId,
+    schools: [...schoolMap.values()],
     children: payloadChildren,
     premium_price: schoolPays ? 0 : premiumPrice,
     premium_children_count: childCount,
@@ -204,18 +216,27 @@ router.get('/dashboard/:phone', async (req, res) => {
 });
 
 // POST /api/parents/upgrade — initiate premium upgrade (M-Pesa STK or simulated)
+// Accepts optional school_id so multi-school parents pay per school and the
+// payment is allocated to the correct school via the ledger row.
 router.post('/upgrade', async (req, res) => {
-  const { phone } = req.body;
+  const { phone, school_id } = req.body;
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 
-  // Prevent parent payment if school pays
-  const [childSchools] = await req.db.execute(
-    'SELECT DISTINCT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ?',
-    [phone]
+  // Scope to active children at the chosen school (or all schools when omitted)
+  const scopeSql = school_id ? ' AND s.school_id = ?' : '';
+  const scopeParams = school_id ? [school_id] : [];
+  const [childRows] = await req.db.execute(
+    `SELECT s.student_id, s.school_id, sc.premium_payment_model
+     FROM students s
+     JOIN student_parent_map m ON s.student_id = m.student_id
+     JOIN schools sc ON s.school_id = sc.school_id
+     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'${scopeSql}`,
+    [phone, ...scopeParams]
   );
-  for (const cs of childSchools) {
-    const [school] = await req.db.execute('SELECT premium_payment_model FROM schools WHERE school_id = ?', [cs.school_id]);
-    if (school.length > 0 && school[0].premium_payment_model === 'school') {
+
+  // Prevent parent payment if a covered school pays for premium (within scope)
+  for (const row of childRows) {
+    if (row.premium_payment_model === 'school') {
       return res.json({
         transaction_ref: null,
         status: 'school_paid',
@@ -224,11 +245,7 @@ router.post('/upgrade', async (req, res) => {
     }
   }
 
-  const [childCountRows] = await req.db.execute(
-    'SELECT COUNT(*) AS child_count FROM student_parent_map WHERE parent_phone = ?',
-    [phone]
-  );
-  const childCount = childCountRows[0]?.child_count || 0;
+  const childCount = childRows.length;
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const pricePerChild = parseInt(setting[0]?.setting_value || '100');
@@ -238,12 +255,12 @@ router.post('/upgrade', async (req, res) => {
   const phoneSuffix = phone.replace(/\D/g, '').slice(-6);
   const txnRef = 'UPG' + phoneSuffix + Date.now().toString(36).toUpperCase();
 
-  // Store the pending upgrade so we can match it in the callback
-  // even if Safaricom returns a hashed phone number
+  // Store the pending upgrade tagged with the target school so the STK callback
+  // allocates the subscription to the correct school
   await req.db.execute(
-    `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes)
-     VALUES (?, ?, ?, ?, 'M-Pesa-Pending', NOW(), 'STK_PENDING')`,
-    [txnRef, totalDue, phone, txnRef]
+    `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes, school_id)
+     VALUES (?, ?, ?, ?, 'M-Pesa-Pending', NOW(), 'STK_PENDING', ?)`,
+    [txnRef, totalDue, phone, txnRef, school_id || null]
   );
 
   // Try real M-Pesa STK push if credentials are configured
