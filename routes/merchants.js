@@ -2,9 +2,18 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 
+// Accept 07.. / 7.. / +254.. / 254.. and store compare in canonical 254.. form
+function normalizePhone(raw) {
+  let p = String(raw || '').replace(/[\s-]/g, '').replace(/^\+/, '');
+  if (/^0([17]\d{8})$/.test(p)) p = '254' + p.slice(1);
+  else if (/^[17]\d{8}$/.test(p)) p = '254' + p;
+  return p;
+}
+
 // POST /api/merchants/register
 router.post('/register', async (req, res) => {
-  const { business_name, phone, email } = req.body;
+  const { business_name, email } = req.body;
+  const phone = normalizePhone(req.body.phone);
   if (!business_name || !phone) return res.status(400).json({ error: 'Business name and phone required' });
 
   // Must be a premium parent
@@ -28,7 +37,7 @@ router.post('/register', async (req, res) => {
 
 // POST /api/merchants/request-otp
 router.post('/request-otp', async (req, res) => {
-  const { phone } = req.body;
+  const phone = normalizePhone(req.body.phone);
   if (!phone) return res.status(400).json({ error: 'Phone required' });
   const [merchant] = await req.db.execute('SELECT merchant_id FROM merchants WHERE phone = ?', [phone]);
   if (merchant.length === 0) return res.status(404).json({ error: 'Merchant not found. Register first.' });
@@ -46,7 +55,7 @@ router.post('/verify-otp', async (req, res) => {
   const [rows] = await req.db.execute('SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE', [session_id, code]);
   if (rows.length === 0) return res.status(401).json({ error: 'Invalid or expired code' });
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
-  const [m] = await req.db.execute('SELECT merchant_id, business_name FROM merchants WHERE phone = ?', [rows[0].phone]);
+  const [m] = await req.db.execute('SELECT merchant_id, business_name FROM merchants WHERE phone = ?', [normalizePhone(rows[0].phone)]);
   res.json({ merchant_id: m[0].merchant_id, business_name: m[0].business_name, verified: true });
 });
 
