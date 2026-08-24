@@ -21,7 +21,7 @@ router.post('/request-otp', async (req, res) => {
   // Store session with phone and/or email populated.
   // otp_sessions.phone is NOT NULL, so use '' (empty string) for email-only logins.
   await req.db.execute(
-    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 15 MINUTE), FALSE)',
+    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE)',
     [sessionId, phone || '', email || null, code]
   );
 
