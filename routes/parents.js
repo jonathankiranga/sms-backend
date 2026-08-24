@@ -149,7 +149,7 @@ router.get('/dashboard/:phone', async (req, res) => {
   const schoolId = children.length > 0 ? children[0].school_id : null;
 
   const [parent] = await req.db.execute(
-    'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+    'SELECT full_name AS parent_name, is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
     [phone]
   );
 
@@ -209,14 +209,14 @@ router.get('/dashboard/:phone', async (req, res) => {
   const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
   const premiumActive = schoolPays || (Boolean(parent[0]?.is_premium) && (!parent[0]?.premium_expires_at || new Date(parent[0].premium_expires_at) > new Date()));
 
-  const payloadChildren = premiumActive ? children : [];
+  // Children are always visible — premium gates alerts/features, not visibility
   const renewalRequired = !premiumActive;
 
   res.json({
     parent: parent[0] || { is_premium: false },
     school_id: schoolId,
     schools: [...schoolMap.values()],
-    children: payloadChildren,
+    children,
     premium_price: schoolPays ? 0 : premiumPrice,
     premium_children_count: childCount,
     premium_total: premiumTotal,
