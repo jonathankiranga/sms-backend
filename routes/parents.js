@@ -2,14 +2,26 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 
+// Normalize Kenyan mobile numbers to international format (2547XXXXXXXX / 2541XXXXXXXX)
+// so lookups match parent_profiles.parent_phone regardless of how the user types it
+function normalizePhone(raw) {
+  if (!raw) return raw;
+  const p = String(raw).replace(/[\s-]/g, '').replace(/^\+/, '');
+  if (/^0([17]\d{8})$/.test(p)) return '254' + p.slice(1);
+  if (/^([17]\d{8})$/.test(p)) return '254' + p;
+  if (/^254([17]\d{8})$/.test(p)) return p;
+  return p;
+}
+
 router.post('/request-otp', async (req, res) => {
   const { phone, email } = req.body;
   if (!phone && !email) return res.status(400).json({ error: 'Phone number or email required' });
+  const normPhone = phone ? normalizePhone(phone) : null;
 
   // Email login: resolve to the registered parent profile's phone up-front,
   // so every downstream phone-keyed flow keeps working after verification.
   let resolvedPhone = '';
-  if (!phone && email) {
+  if (!normPhone && email) {
     const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
     resolvedPhone = pp[0]?.parent_phone || '';
   }
@@ -19,22 +31,22 @@ router.post('/request-otp', async (req, res) => {
 
   await req.db.execute(
     'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))',
-    [sessionId, phone || resolvedPhone || '', email || null, code]
+    [sessionId, normPhone || resolvedPhone || '', email || null, code]
   );
 
   try {
-    if (email && !phone) {
+    if (email && !normPhone) {
       const messaging = require('../services/messaging');
       if (messaging.sendEmailOtp) await messaging.sendEmailOtp(email, code);
       else console.log('=== Email OTP for', email, ':', code, '===');
     } else {
       const { sendOtp } = require('../services/messaging');
-      await sendOtp(phone, code);
+      await sendOtp(normPhone, code);
     }
   } catch (e) {
     console.error('OTP send failed (non-blocking):', e.message);
-    if (email && !phone) console.log('=== Email OTP for', email, ':', code, '===');
-    else if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', phone, ':', code, '===');
+    if (email && !normPhone) console.log('=== Email OTP for', email, ':', code, '===');
+    else if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', normPhone, ':', code, '===');
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
@@ -97,7 +109,7 @@ router.post('/verify-otp', async (req, res) => {
 
 // GET /api/parents/my-schools/:phone — returns all schools a parent has children in
 router.get('/my-schools/:phone', async (req, res) => {
-  const { phone } = req.params;
+  const phone = normalizePhone(req.params.phone);
   const [rows] = await req.db.execute(
     `SELECT DISTINCT sc.school_id, sc.school_name, sc.region, sc.contact_phone,
             COUNT(s.student_id) AS children_count
@@ -113,7 +125,7 @@ router.get('/my-schools/:phone', async (req, res) => {
 });
 
 router.get('/dashboard/:phone', async (req, res) => {
-  const { phone } = req.params;
+  const phone = normalizePhone(req.params.phone);
   const { school_id: filterSchoolId } = req.query;
 
   const [children] = await req.db.execute(
@@ -219,8 +231,9 @@ router.get('/dashboard/:phone', async (req, res) => {
 // Accepts optional school_id so multi-school parents pay per school and the
 // payment is allocated to the correct school via the ledger row.
 router.post('/upgrade', async (req, res) => {
-  const { phone, school_id } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone required' });
+  const { phone: rawPhone, school_id } = req.body;
+  if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
+  const phone = normalizePhone(rawPhone);
 
   // Scope to active children at the chosen school (or all schools when omitted)
   const scopeSql = school_id ? ' AND s.school_id = ?' : '';
@@ -320,7 +333,7 @@ router.post('/upgrade', async (req, res) => {
 // GET /api/parents/premium-status/:phone
 // Lightweight endpoint used at login to show renewal/locked UI before OTP. Returns no children.
 router.get('/premium-status/:phone', async (req, res) => {
-  const phone = req.params.phone;
+  const phone = normalizePhone(req.params.phone);
   const [rows] = await req.db.execute(
     'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
     [phone]
@@ -376,8 +389,9 @@ router.get('/premium-status/:phone', async (req, res) => {
 
 // GET /api/parents/payment-status — poll after STK push to check if payment completed
 router.get('/payment-status', async (req, res) => {
-  const { checkout_request_id, phone } = req.query;
-  if (!checkout_request_id && !phone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
+  const { checkout_request_id, phone: rawPhone } = req.query;
+  if (!checkout_request_id && !rawPhone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
+  const phone = normalizePhone(rawPhone);
 
   // Check if the pending record was updated to STK_COMPLETED (callback arrived)
   const [rows] = await req.db.execute(
@@ -435,8 +449,9 @@ router.get('/payment-status', async (req, res) => {
 
 // POST /api/parents/fee-reminder — send fee balance to parent's WhatsApp
 router.post('/fee-reminder', async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone required' });
+  const { phone: rawPhone } = req.body;
+  if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
+  const phone = normalizePhone(rawPhone);
 
   const [children] = await req.db.execute(
     `SELECT s.student_id, s.full_name FROM students s
@@ -482,7 +497,7 @@ router.post('/fee-reminder', async (req, res) => {
 
 // GET /api/parents/academic-records/:phone — free endpoint, no premium check
 router.get('/academic-records/:phone', async (req, res) => {
-  const { phone } = req.params;
+  const phone = normalizePhone(req.params.phone);
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 
   const { getCurrentTerm, getRubricConfig, getLevel } = require('../lib/config');
