@@ -3,23 +3,38 @@ const crypto = require('crypto');
 const router = express.Router();
 
 router.post('/request-otp', async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  const { phone, email } = req.body;
+  if (!phone && !email) return res.status(400).json({ error: 'Phone number or email required' });
+
+  // Email login: resolve to the registered parent profile's phone up-front,
+  // so every downstream phone-keyed flow keeps working after verification.
+  let resolvedPhone = '';
+  if (!phone && email) {
+    const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
+    resolvedPhone = pp[0]?.parent_phone || '';
+  }
 
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');
 
   await req.db.execute(
-    'INSERT INTO otp_sessions (session_id, phone, code, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))',
-    [sessionId, phone, code]
+    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))',
+    [sessionId, phone || resolvedPhone || '', email || null, code]
   );
 
   try {
-    const { sendOtp } = require('../services/messaging');
-    await sendOtp(phone, code);
+    if (email && !phone) {
+      const messaging = require('../services/messaging');
+      if (messaging.sendEmailOtp) await messaging.sendEmailOtp(email, code);
+      else console.log('=== Email OTP for', email, ':', code, '===');
+    } else {
+      const { sendOtp } = require('../services/messaging');
+      await sendOtp(phone, code);
+    }
   } catch (e) {
     console.error('OTP send failed (non-blocking):', e.message);
-    if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', phone, ':', code, '===');
+    if (email && !phone) console.log('=== Email OTP for', email, ':', code, '===');
+    else if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', phone, ':', code, '===');
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
@@ -30,24 +45,54 @@ router.post('/verify-otp', async (req, res) => {
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
 
   const [rows] = await req.db.execute(
-    'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
+    'SELECT phone, email FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
     [session_id, code]
   );
 
-  if (rows.length === 0) return res.status(401).json({ error: 'Invalid or expired code' });
+  if (rows.length === 0) {
+    const [expiredRows] = await req.db.execute(
+      'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE',
+      [session_id, code]
+    );
+    if (expiredRows.length > 0) {
+      return res.status(410).json({ error: 'Code expired - tap Resend to get a new one' });
+    }
+    return res.status(401).json({ error: 'Invalid or expired code' });
+  }
 
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
 
-  const phone = rows[0].phone;
-  // Compare the OTP phone with registered parent profile and return a flag so the client can inform the user
-  const [parentRows] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
-  const registered = parentRows.length > 0;
+  const phone = rows[0].phone || '';
+  const email = rows[0].email || null;
 
-  // Also report how many active children are linked to this phone
-  const [childrenCountRows] = await req.db.execute('SELECT COUNT(*) AS cnt FROM student_parent_map m JOIN students s ON m.student_id = s.student_id WHERE m.parent_phone = ? AND s.enrollment_status = ?', [phone, 'Active']);
-  const linkedChildren = childrenCountRows[0]?.cnt || 0;
+  // Resolve the canonical parent phone (email-only sessions map through parent_profiles.email)
+  let effectivePhone = phone;
+  if (!effectivePhone && email) {
+    const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
+    effectivePhone = pp[0]?.parent_phone || '';
+  }
 
-  res.json({ phone, verified: true, registered, linked_children: linkedChildren });
+  // Compare against registered parent profiles (by phone or email) so the client can inform the user
+  let registered = false;
+  if (effectivePhone || email) {
+    const [parentRows] = await req.db.execute(
+      'SELECT parent_phone FROM parent_profiles WHERE parent_phone = ? OR (email IS NOT NULL AND email = ?)',
+      [effectivePhone || '__none__', email || '__none__']
+    );
+    registered = parentRows.length > 0;
+  }
+
+  // Report how many active children are linked to this parent's phone
+  let linkedChildren = 0;
+  if (effectivePhone) {
+    const [childrenCountRows] = await req.db.execute(
+      'SELECT COUNT(*) AS cnt FROM student_parent_map m JOIN students s ON m.student_id = s.student_id WHERE m.parent_phone = ? AND s.enrollment_status = ?',
+      [effectivePhone, 'Active']
+    );
+    linkedChildren = childrenCountRows[0]?.cnt || 0;
+  }
+
+  res.json({ phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
 });
 
 // GET /api/parents/my-schools/:phone — returns all schools a parent has children in
