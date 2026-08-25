@@ -86,7 +86,7 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       PartyB: shortcode,
       PhoneNumber: cleanPhone,
       CallBackURL: callbackUrl,
-      AccountReference: reference.slice(0, 12),
+      AccountReference: reference,
       TransactionDesc: (description || 'Education').slice(0, 13)
     })
   });

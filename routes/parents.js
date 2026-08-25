@@ -265,9 +265,7 @@ router.post('/upgrade', wrap(async (req, res) => {
   const pricePerChild = parseInt(setting[0]?.setting_value || '100');
   const totalDue = pricePerChild * Math.max(childCount, 1);
 
-  // Reference includes last 6 digits of phone + timestamp — unique per parent even if concurrent
-  const phoneSuffix = phone.replace(/\D/g, '').slice(-6);
-  const txnRef = 'UPG' + phoneSuffix + Date.now().toString(36).toUpperCase();
+  const txnRef = phone + '-' + Date.now().toString(36).toUpperCase();
 
   // Ensure parent profile exists (payment_ledger FK requires it)
   await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [phone]);
@@ -284,7 +282,7 @@ router.post('/upgrade', wrap(async (req, res) => {
   if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE && process.env.MPESA_PASSKEY) {
     try {
       const mpesa = require('../services/mpesa');
-      const result = await mpesa.stkPush(phone, totalDue, txnRef, 'Education APP Subscription');
+      const result = await mpesa.stkPush(phone, totalDue, phone, 'Education');
       if (result.ResponseCode === '0') {
         console.log(`[MPESA] STK push sent to ${phone} for KSh ${totalDue} ref ${txnRef}`);
         return res.json({
