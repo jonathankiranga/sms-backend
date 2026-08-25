@@ -80,7 +80,7 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       BusinessShortCode: shortcode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
+      TransactionType: 'CustomerBuyGoodsOnline',
       Amount: Math.round(amount),
       PartyA: cleanPhone,
       PartyB: shortcode,
