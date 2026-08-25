@@ -85,9 +85,7 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       PartyA: cleanPhone,
       PartyB: shortcode,
       PhoneNumber: cleanPhone,
-      CallBackURL: callbackUrl,
-      AccountReference: reference,
-      TransactionDesc: (description || 'Education').slice(0, 13)
+      CallBackURL: callbackUrl
     })
   });
   const text = await resp.text();
