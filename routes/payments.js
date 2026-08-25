@@ -99,6 +99,7 @@ async function handleStkCallback(req, res, school_id) {
     }
 
     const { ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
+    console.log(`[STK][RAW] ResultCode=${ResultCode} ResultDesc=${ResultDesc} Body=${JSON.stringify(Body.stkCallback)}`);
     if (ResultCode !== 0) {
       console.log(`[STK][${school_id || 'GLOBAL'}] Payment failed:`, ResultDesc);
       return res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
