@@ -86,7 +86,7 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       PartyB: shortcode,
       PhoneNumber: cleanPhone,
       CallBackURL: callbackUrl,
-      TransactionDesc: 'Merchant Payment'
+      Remarks: 'Merchant Payment'
     })
   });
   const text = await resp.text();
