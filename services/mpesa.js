@@ -80,13 +80,14 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       BusinessShortCode: shortcode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerBuyGoodsOnline',
+      TransactionType: 'CustomerPayBillOnline',
       Amount: Math.round(amount),
       PartyA: cleanPhone,
       PartyB: shortcode,
       PhoneNumber: cleanPhone,
       CallBackURL: callbackUrl,
-      Remarks: 'Merchant Payment'
+      AccountReference: String(reference).slice(0, 12),
+      TransactionDesc: 'Merchant Payment'
     })
   });
   const text = await resp.text();
