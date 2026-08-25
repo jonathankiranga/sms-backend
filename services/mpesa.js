@@ -76,16 +76,18 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       'Content-Type': 'application/json'
     },
     signal: AbortSignal.timeout(15000),
-    body: JSON.stringify({
+      body: JSON.stringify({
       BusinessShortCode: shortcode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerBuyGoodsOnline',
+      TransactionType: 'CustomerPayBillOnline',
       Amount: Math.round(amount),
       PartyA: cleanPhone,
       PartyB: shortcode,
       PhoneNumber: cleanPhone,
-      CallBackURL: callbackUrl
+      CallBackURL: callbackUrl,
+      AccountReference: String(reference).slice(0, 12),
+      TransactionDesc: 'Merchant Payment'
     })
   });
   const text = await resp.text();
