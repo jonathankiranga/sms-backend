@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
 // Normalize Kenyan mobile numbers to international format (2547XXXXXXXX / 2541XXXXXXXX)
 // so lookups match parent_profiles.parent_phone regardless of how the user types it
@@ -13,7 +14,7 @@ function normalizePhone(raw) {
   return p;
 }
 
-router.post('/request-otp', async (req, res) => {
+router.post('/request-otp', wrap(async (req, res) => {
   const { phone, email } = req.body;
   if (!phone && !email) return res.status(400).json({ error: 'Phone number or email required' });
   const normPhone = phone ? normalizePhone(phone) : null;
@@ -50,9 +51,9 @@ router.post('/request-otp', async (req, res) => {
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
-});
+}));
 
-router.post('/verify-otp', async (req, res) => {
+router.post('/verify-otp', wrap(async (req, res) => {
   const { session_id, code } = req.body;
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
 
@@ -105,10 +106,10 @@ router.post('/verify-otp', async (req, res) => {
   }
 
   res.json({ phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
-});
+}));
 
 // GET /api/parents/my-schools/:phone — returns all schools a parent has children in
-router.get('/my-schools/:phone', async (req, res) => {
+router.get('/my-schools/:phone', wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const [rows] = await req.db.execute(
     `SELECT DISTINCT sc.school_id, sc.school_name, sc.region, sc.contact_phone,
@@ -122,9 +123,9 @@ router.get('/my-schools/:phone', async (req, res) => {
     [phone]
   );
   res.json({ schools: rows });
-});
+}));
 
-router.get('/dashboard/:phone', async (req, res) => {
+router.get('/dashboard/:phone', wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const { school_id: filterSchoolId } = req.query;
 
@@ -225,12 +226,12 @@ router.get('/dashboard/:phone', async (req, res) => {
     renewal_required: renewalRequired,
     school_pays: schoolPays
   });
-});
+}));
 
 // POST /api/parents/upgrade — initiate premium upgrade (M-Pesa STK or simulated)
 // Accepts optional school_id so multi-school parents pay per school and the
 // payment is allocated to the correct school via the ledger row.
-router.post('/upgrade', async (req, res) => {
+router.post('/upgrade', wrap(async (req, res) => {
   const { phone: rawPhone, school_id } = req.body;
   if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
   const phone = normalizePhone(rawPhone);
@@ -334,11 +335,11 @@ router.post('/upgrade', async (req, res) => {
     premium_due: totalDue,
     premium_children_count: childCount || 1
   });
-});
+}));
 
 // GET /api/parents/premium-status/:phone
 // Lightweight endpoint used at login to show renewal/locked UI before OTP. Returns no children.
-router.get('/premium-status/:phone', async (req, res) => {
+router.get('/premium-status/:phone', wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const [rows] = await req.db.execute(
     'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
@@ -391,10 +392,10 @@ router.get('/premium-status/:phone', async (req, res) => {
     renewal_required: !active,
     school_pays: schoolPays
   });
-});
+}));
 
 // GET /api/parents/payment-status — poll after STK push to check if payment completed
-router.get('/payment-status', async (req, res) => {
+router.get('/payment-status', wrap(async (req, res) => {
   const { checkout_request_id, phone: rawPhone } = req.query;
   if (!checkout_request_id && !rawPhone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
   const phone = normalizePhone(rawPhone);
@@ -451,10 +452,10 @@ router.get('/payment-status', async (req, res) => {
   );
   const active = p[0]?.is_premium && (!p[0]?.premium_expires_at || new Date(p[0].premium_expires_at) > new Date());
   return res.json({ status: active ? 'completed' : 'pending' });
-});
+}));
 
 // GET /api/parents/academic-records/:phone — free endpoint, no premium check
-router.get('/academic-records/:phone', async (req, res) => {
+router.get('/academic-records/:phone', wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 
@@ -600,6 +601,6 @@ router.get('/academic-records/:phone', async (req, res) => {
   }
 
   res.json(result);
-});
+}));
 
 module.exports = router;
