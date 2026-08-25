@@ -400,20 +400,20 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
 router.get('/payment-status', wrap(async (req, res) => {
   const { checkout_request_id, phone: rawPhone } = req.query;
   if (!checkout_request_id && !rawPhone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
-  const phone = normalizePhone(rawPhone);
+  const phone = rawPhone ? normalizePhone(rawPhone) : null;
 
   // Check if the pending record was updated to STK_COMPLETED (callback arrived)
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
      WHERE (student_reference LIKE 'UPG%' OR transaction_reference LIKE 'UPG%' OR student_reference LIKE 'BAZPAY-%' OR transaction_reference LIKE 'BAZPAY-%')
-       AND parent_phone = ?
+       AND (parent_phone = ? OR transaction_reference LIKE ?)
        AND notes IN ('STK_COMPLETED', 'STK_PENDING')
      ORDER BY logged_at DESC LIMIT 1`,
-    [phone]
+    [phone || '', `%${checkout_request_id || ''}%`]
   );
 
   if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
-    // Also verify parent_profiles is_premium is now true
+    if (!phone) return res.json({ status: 'completed' });
     const [p] = await req.db.execute(
       'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
       [phone]
@@ -448,6 +448,7 @@ router.get('/payment-status', wrap(async (req, res) => {
   }
 
   // No pending record found — check if already premium (paid via another path)
+  if (!phone) return res.json({ status: 'pending' });
   const [p] = await req.db.execute(
     'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
     [phone]
