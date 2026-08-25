@@ -87,7 +87,7 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       PhoneNumber: cleanPhone,
       CallBackURL: callbackUrl,
       AccountReference: String(reference).slice(0, 12),
-      TransactionDesc: 'Merchant Payment'
+      TransactionDesc: 'SchoolMarket'
     })
   });
   const text = await resp.text();
