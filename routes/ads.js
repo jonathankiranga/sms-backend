@@ -21,7 +21,7 @@ router.get('/:school_id', async (req, res) => {
     const [rows] = await req.db.execute(
       `SELECT ad_id, banner_image_url, target_link, merchant_name, message
        FROM marketplace_campaigns
-       WHERE target_school_id = ? AND status = 'Active' AND end_date >= CURDATE()
+       WHERE (target_school_id = ? OR target_school_id IS NULL) AND status = 'Active' AND end_date >= CURDATE()
        ORDER BY RAND() LIMIT 1`,
       [req.params.school_id]
     );

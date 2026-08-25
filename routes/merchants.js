@@ -127,9 +127,10 @@ router.get('/campaigns', wrap(async (req, res) => {
 }));
 
 // POST /api/merchants/campaigns
+// Ads run across ALL schools — no targeting. target_school_id stays NULL.
 router.post('/campaigns', wrap(async (req, res) => {
-  const { merchant_id, message, target_school_id, days } = req.body;
-  if (!merchant_id || !message || !target_school_id || !days) return res.status(400).json({ error: 'Missing fields' });
+  const { merchant_id, message, days } = req.body;
+  if (!merchant_id || !message || !days) return res.status(400).json({ error: 'Missing fields' });
   const [m] = await req.db.execute('SELECT business_name, phone FROM merchants WHERE merchant_id = ?', [merchant_id]);
   if (m.length === 0) return res.status(404).json({ error: 'Merchant not found' });
   // Limit duration to a maximum of 60 days (approximately 2 months)
@@ -139,17 +140,11 @@ router.post('/campaigns', wrap(async (req, res) => {
 
   const [result] = await req.db.execute(
     'INSERT INTO marketplace_campaigns (target_school_id, merchant_name, merchant_phone, message, banner_image_url, target_link, status, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    [target_school_id, m[0].business_name, m[0].phone || null, message, '', '#', 'Active', startDate, endDate]
+    [null, m[0].business_name, m[0].phone || null, message, '', '#', 'Active', startDate, endDate]
   );
   const campaignId = result.insertId;
 
   res.json({ message: 'Campaign created', campaign_id: campaignId, days: duration });
-}));
-
-// GET /api/merchants/schools — list schools for targeting
-router.get('/schools', wrap(async (req, res) => {
-  const [rows] = await req.db.execute('SELECT school_id, school_name, region FROM schools ORDER BY school_name');
-  res.json({ schools: rows });
 }));
 
 // ---------- School Market: searchable product catalog. The platform only
