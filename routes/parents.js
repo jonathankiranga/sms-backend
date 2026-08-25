@@ -269,6 +269,9 @@ router.post('/upgrade', wrap(async (req, res) => {
   const phoneSuffix = phone.replace(/\D/g, '').slice(-6);
   const txnRef = 'UPG' + phoneSuffix + Date.now().toString(36).toUpperCase();
 
+  // Ensure parent profile exists (payment_ledger FK requires it)
+  await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [phone]);
+
   // Store the pending upgrade tagged with the target school so the STK callback
   // allocates the subscription to the correct school
   await req.db.execute(
