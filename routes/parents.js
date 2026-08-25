@@ -265,24 +265,25 @@ router.post('/upgrade', wrap(async (req, res) => {
   const pricePerChild = parseInt(setting[0]?.setting_value || '100');
   const totalDue = pricePerChild * Math.max(childCount, 1);
 
-  const txnRef = phone + '-' + Date.now().toString(36).toUpperCase();
+  const txnRef = 'TXN' + Date.now().toString(36).toUpperCase();
 
   // Ensure parent profile exists (payment_ledger FK requires it)
   await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [phone]);
 
   // Store the pending upgrade tagged with the target school so the STK callback
   // allocates the subscription to the correct school
-  await req.db.execute(
+  const [insertResult] = await req.db.execute(
     `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes, school_id)
      VALUES (?, ?, ?, ?, 'M-Pesa-Pending', NOW(), 'STK_PENDING', ?)`,
     [txnRef, totalDue, phone, txnRef, school_id || null]
   );
+  const accountRef = String(insertResult.insertId).padStart(10, '0');
 
   // Try real M-Pesa STK push only when ALL credentials are configured
   if (process.env.MPESA_CONSUMER_KEY && process.env.MPESA_CONSUMER_SECRET && process.env.MPESA_SHORTCODE && process.env.MPESA_PASSKEY) {
     try {
       const mpesa = require('../services/mpesa');
-      const result = await mpesa.stkPush(phone, totalDue, phone, 'Education');
+      const result = await mpesa.stkPush(phone, totalDue, accountRef, 'Education');
       if (result.ResponseCode === '0') {
         console.log(`[MPESA] STK push sent to ${phone} for KSh ${totalDue} ref ${txnRef}`);
         return res.json({
