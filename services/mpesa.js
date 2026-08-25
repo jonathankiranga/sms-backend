@@ -76,7 +76,7 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       'Content-Type': 'application/json'
     },
     signal: AbortSignal.timeout(15000),
-      body: JSON.stringify({
+    body: JSON.stringify({
       BusinessShortCode: shortcode,
       Password: password,
       Timestamp: timestamp,
@@ -90,7 +90,9 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       TransactionDesc: 'SchoolMarket'
     })
   });
+  console.log('[MPESA][STK] shortcode=' + shortcode + ' phone=' + cleanPhone + ' amount=' + amount + ' callback=' + callbackUrl);
   const text = await resp.text();
+  console.log('[MPESA][RAW] HTTP ' + resp.status + ': ' + text);
   try {
     return JSON.parse(text);
   } catch (e) {
