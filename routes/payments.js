@@ -326,6 +326,9 @@ router.post('/cb/:callback_key/s', async (req, res) => {
 });
 
 // STK Push callback (Safaricom → us after STK push)
+router.get('/callback', (req, res) => {
+  res.status(200).json({ ResultCode: 0, ResultDesc: 'Callback URL is active' });
+});
 router.post('/callback', async (req, res) => {
   return handleStkCallback(req, res, null);
 });
