@@ -350,7 +350,7 @@ router.post('/upgrade', wrap(async (req, res) => {
 router.get('/premium-status/:phone', wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const [rows] = await req.db.execute(
-    'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+    'SELECT is_premium, premium_expires_at, prepaid_balance FROM parent_profiles WHERE parent_phone = ?',
     [phone]
   );
 
@@ -379,7 +379,24 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
     }
   }
 
+  // If the parent has a prepaid balance that covers the term price, auto-activate
+  // the current term (consuming one term from the credit) so they don't have to pay again.
+  const prepaid = rows.length > 0 ? parseFloat(rows[0].prepaid_balance || 0) : 0;
+  if (rows.length > 0 && !schoolPays && prepaid > 0) {
+    const { autoActivateFromPrepaid } = require('../lib/subscriptions');
+    const l = childSchools.length > 0 ? childSchools[0].school_id : null;
+    await autoActivateFromPrepaid(req.db, phone, l);
+  }
+
   const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
+
+  let balanceForReturn = prepaid;
+  let activeRow = rows[0];
+  if (rows.length > 0) {
+    const [b] = await req.db.execute('SELECT is_premium, premium_expires_at, prepaid_balance FROM parent_profiles WHERE parent_phone = ?', [phone]);
+    activeRow = b[0];
+    balanceForReturn = parseFloat(b[0].prepaid_balance || 0);
+  }
   const registered = rows.length > 0;
 
   if (!registered) return res.json({
@@ -387,18 +404,20 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
     premium_children_count: childCount, premium_total: premiumTotal,
     premium_price: schoolPays ? 0 : premiumPrice,
     renewal_required: !schoolPays,
-    school_pays: schoolPays
+    school_pays: schoolPays,
+    prepaid_balance: 0
   });
-  const active = schoolPays || (rows[0].is_premium && (!rows[0].premium_expires_at || new Date(rows[0].premium_expires_at) > new Date()));
+  const active = schoolPays || (activeRow.is_premium && (!activeRow.premium_expires_at || new Date(activeRow.premium_expires_at) > new Date()));
   res.json({
     is_premium: active,
     registered: true,
-    expires_at: rows[0].premium_expires_at,
+    expires_at: activeRow.premium_expires_at,
     premium_children_count: childCount,
     premium_total: premiumTotal,
     premium_price: schoolPays ? 0 : premiumPrice,
     renewal_required: !active,
-    school_pays: schoolPays
+    school_pays: schoolPays,
+    prepaid_balance: balanceForReturn
   });
 }));
 

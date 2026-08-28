@@ -159,32 +159,8 @@ async function handleStkCallback(req, res, school_id) {
       );
       const activeSchoolId = ledgerSchoolId || school_id || (link.length > 0 ? link[0].school_id : null);
 
-      let expiresAt = new Date(Date.now() + 90 * 86400000);
-      if (activeSchoolId) {
-        const [termRow] = await req.db.execute(
-          'SELECT MIN(start_date) AS next_start FROM school_terms WHERE school_id = ? AND start_date > CURDATE()',
-          [activeSchoolId]
-        );
-        if (termRow.length > 0 && termRow[0].next_start) {
-          expiresAt = new Date(termRow[0].next_start);
-        }
-      }
-      await req.db.execute(
-        'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
-        [expiresAt, phone]
-      );
-
-      const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
-      const currentYear = new Date().getFullYear();
-      if (activeSchoolId) {
-        await req.db.execute(
-          `INSERT INTO premium_subscriptions
-           (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
-           VALUES (?, ?, ?, ?, 'parent', 'paid', ?, NOW(), ?)
-           ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(), expires_at = VALUES(expires_at), amount = VALUES(amount)`,
-          [activeSchoolId, phone, currentTerm, currentYear, amount, expiresAt]
-        );
-      }
+      const { applyParentPayment } = require('../lib/subscriptions');
+      await applyParentPayment(req.db, phone, amount, activeSchoolId);
 
       await req.db.execute(
         "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
