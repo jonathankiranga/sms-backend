@@ -150,9 +150,17 @@ router.get('/dashboard/:phone', wrap(async (req, res) => {
   const schoolId = children.length > 0 ? children[0].school_id : null;
 
   const [parent] = await req.db.execute(
-    'SELECT full_name AS parent_name, is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+    'SELECT full_name AS parent_name, is_premium, premium_expires_at, prepaid_balance FROM parent_profiles WHERE parent_phone = ?',
     [phone]
   );
+
+  // Auto-activate from prepaid balance when it covers a term and the parent is
+  // otherwise not active.
+  if ((!parent[0]?.is_premium || (parent[0]?.premium_expires_at && new Date(parent[0].premium_expires_at) <= new Date()))
+      && parseFloat(parent[0]?.prepaid_balance || 0) > 0) {
+    const { autoActivateFromPrepaid } = require('../lib/subscriptions');
+    await autoActivateFromPrepaid(req.db, phone, schoolId);
+  }
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const premiumPrice = parseInt(setting[0]?.setting_value || '100');
@@ -208,13 +216,20 @@ router.get('/dashboard/:phone', wrap(async (req, res) => {
 
   const childCount = children.length || 0;
   const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
-  const premiumActive = schoolPays || (Boolean(parent[0]?.is_premium) && (!parent[0]?.premium_expires_at || new Date(parent[0].premium_expires_at) > new Date()));
+
+  // Re-read profile so auto-activation from prepaid balance above is reflected.
+  const fresh = await req.db.execute(
+    'SELECT full_name AS parent_name, is_premium, premium_expires_at, prepaid_balance FROM parent_profiles WHERE parent_phone = ?',
+    [phone]
+  );
+  const freshParent = fresh[0] || parent[0] || { is_premium: false, prepaid_balance: 0 };
+  const premiumActive = schoolPays || (Boolean(freshParent.is_premium) && (!freshParent.premium_expires_at || new Date(freshParent.premium_expires_at) > new Date()));
 
   // Children are always visible — premium gates alerts/features, not visibility
   const renewalRequired = !premiumActive;
 
   res.json({
-    parent: parent[0] || { is_premium: false },
+    parent: freshParent,
     school_id: schoolId,
     schools: [...schoolMap.values()],
     children,
@@ -224,7 +239,8 @@ router.get('/dashboard/:phone', wrap(async (req, res) => {
     premium_active: premiumActive,
     premium_due: premiumActive ? 0 : premiumTotal,
     renewal_required: renewalRequired,
-    school_pays: schoolPays
+    school_pays: schoolPays,
+    prepaid_balance: parseFloat(freshParent.prepaid_balance || 0)
   });
 }));
 
