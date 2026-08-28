@@ -497,4 +497,135 @@ router.post('/sub-strands', async (req, res) => {
   res.json({ sub_strand_id: r.insertId, strand_id, sub_strand_name });
 });
 
+// GET /api/assessments/report/:student_id/cumulative/:year
+// Cumulative view: one column per CAT/exam session, one row per learning area.
+// The cell holds that session's normalized percentage for the area.
+router.get('/report/:student_id/cumulative/:year', async (req, res) => {
+  const { student_id } = req.params;
+  const reportYear = parseInt(req.params.year) || new Date().getFullYear();
+
+  // Teacher bypass (see /report/:student_id/:term) — teachers may view without a parent phone.
+  const auth = (req.headers.authorization || '').trim();
+  let isTeacher = false;
+  if (auth && auth.startsWith('Bearer ')) {
+    try {
+      const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [auth.split(' ')[1]]);
+      const sess = srows[0];
+      if (sess && sess.verified && sess.expires_at && new Date(sess.expires_at) > new Date()) {
+        let trows;
+        if (sess.phone) [trows] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [sess.phone]);
+        if (!trows || trows.length === 0) {
+          const [sr] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [auth.split(' ')[1]]);
+          if (sr[0] && sr[0].email) [trows] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ?', [sr[0].email]);
+        }
+        isTeacher = Boolean(trows && trows.length > 0);
+      }
+    } catch (_) { isTeacher = false; }
+  }
+
+  // Parent subscription guard (same as the single-term report)
+  const phone = req.query.phone;
+  const normPhone = String(phone || '').replace(/[\s-]/g, '').replace(/^\+/, '').replace(/^0([17]\d{8})$/, '254$1');
+  if (!isTeacher && !normPhone) {
+    return res.status(400).json({ error: 'Parent phone is required to view report cards' });
+  }
+  const [link] = await req.db.execute(
+    `SELECT sc.premium_payment_model, p.is_premium, p.premium_expires_at
+     FROM student_parent_map m
+     JOIN students s ON m.student_id = s.student_id
+     JOIN schools sc ON s.school_id = sc.school_id
+     LEFT JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+     WHERE m.student_id = ? AND m.parent_phone = ? LIMIT 1`,
+    [student_id, normPhone]
+  );
+  if (!isTeacher && link.length === 0) {
+    return res.status(403).json({ error: 'This student is not linked to your phone. Ask the school to link you as a parent.' });
+  }
+  const schoolPays = link.length === 0 ? false : link[0].premium_payment_model === 'school';
+  const subActive = link.length !== 0 && Boolean(link[0].is_premium) && (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+  if (!isTeacher && !schoolPays && !subActive) {
+    return res.status(402).json({ error: 'An active subscription is required to download report cards.' });
+  }
+
+  const [student] = await req.db.execute(
+    `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+     FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.student_id = ?`,
+    [student_id]
+  );
+  if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
+
+  // All exam sessions for the year (their class/program; use the sessions the school ran)
+  const [sessions] = await req.db.execute(
+    `SELECT es.session_id, es.exam_name, es.exam_type, es.term, es.academic_year, es.status,
+            es.open_date, es.close_date
+     FROM exam_sessions es
+     JOIN classes c ON es.class_id = c.class_id
+     JOIN students s ON s.class_id = c.class_id
+     WHERE s.student_id = ? AND es.academic_year = ?
+     ORDER BY es.open_date ASC, es.session_id ASC`,
+    [student_id, reportYear]
+  );
+
+  // Per-session per-area normalized percentages for this student
+  const [rows] = await req.db.execute(
+    `SELECT es.session_id, la.area_id, la.area_name,
+            ROUND(AVG(er.score / er.out_of) * 100, 1) AS pct
+     FROM exam_results er
+     JOIN exam_sessions es ON er.session_id = es.session_id
+     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+     JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE er.student_id = ? AND es.academic_year = ?
+     GROUP BY es.session_id, la.area_id, la.area_name
+     ORDER BY la.area_name`,
+    [student_id, reportYear]
+  );
+
+  // Shape into { sessions: [...], areas: [{ area_name, sessions: { session_id: pct } }] }
+  const areaMap = new Map();
+  const sessionMeta = sessions.map(s => ({
+    session_id: s.session_id,
+    label: s.exam_name || (s.exam_type + ' ' + s.term),
+    exam_type: s.exam_type,
+    term: s.term,
+    status: s.status,
+    open_date: s.open_date,
+    close_date: s.close_date
+  }));
+  for (const r of rows) {
+    if (!areaMap.has(r.area_name)) {
+      areaMap.set(r.area_name, { area_name: r.area_name, area_id: r.area_id, sessions: {} });
+    }
+    areaMap.get(r.area_name).sessions[r.session_id] = r.pct;
+  }
+  const areas = Array.from(areaMap.values());
+
+  // Attendance totals per term (derived from date since attendance_logs has no term column;
+  // Kenya calendar: Term 1 Jan-Apr, Term 2 May-Aug, Term 3 Sep-Dec)
+  const [attRows] = await req.db.execute(
+    `SELECT CASE
+              WHEN MONTH(a.attendance_date) IN (1,2,3,4) THEN 'Term 1'
+              WHEN MONTH(a.attendance_date) IN (5,6,7,8) THEN 'Term 2'
+              ELSE 'Term 3'
+            END AS term,
+            COUNT(*) AS total,
+            SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) AS present
+     FROM attendance_logs a
+     WHERE a.student_id = ? AND YEAR(a.attendance_date) = ?
+     GROUP BY term`,
+    [student_id, reportYear]
+  );
+
+  if (sessions.length === 0 && areas.length === 0) {
+    return res.status(404).json({ error: 'No previous term data found. Cumulative data not available.' });
+  }
+
+  res.json({
+    student: student[0],
+    year: reportYear,
+    sessions: sessionMeta,
+    areas,
+    attendance: attRows
+  });
+});
+
 module.exports = router;
