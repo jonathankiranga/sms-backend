@@ -42,6 +42,28 @@ async function findPremiumParent(db, phone, email) {
   return null;
 }
 
+// POST /api/merchants/auto-login — premium parent opens merchant portal without OTP.
+// Returns an existing merchant for their phone, or creates one with a default business name.
+router.post('/auto-login', wrap(async (req, res) => {
+  const normPhone = normalizePhone(req.body.phone);
+  if (!normPhone) return res.status(400).json({ error: 'Phone required' });
+  const parent = await findPremiumParent(req.db, normPhone, null);
+  if (!parent) return res.status(403).json({ error: 'Only premium parents can sell on the School Market.' });
+
+  let [merchant] = await req.db.execute('SELECT merchant_id, business_name FROM merchants WHERE phone = ?', [parent.parent_phone]);
+  if (merchant.length === 0) {
+    const [pp] = await req.db.execute('SELECT full_name FROM parent_profiles WHERE parent_phone = ?', [parent.parent_phone]);
+    const businessName = (pp[0]?.full_name ? pp[0].full_name + ' ' : '') + 'Store';
+    const mid = 'MER' + Date.now().toString(36).toUpperCase();
+    await req.db.execute(
+      'INSERT INTO merchants (merchant_id, business_name, phone, email) VALUES (?, ?, ?, ?)',
+      [mid, businessName.slice(0, 140), parent.parent_phone, parent.email || null]
+    );
+    merchant = [{ merchant_id: mid, business_name: businessName.slice(0, 140) }];
+  }
+  res.json({ merchant_id: merchant[0].merchant_id, business_name: merchant[0].business_name, auto_created: true });
+}));
+
 // POST /api/merchants/register
 router.post('/register', wrap(async (req, res) => {
   const { business_name } = req.body;
