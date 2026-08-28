@@ -228,23 +228,22 @@ router.put('/schools/:id/mpesa', async (req, res) => {
 });
 
 router.post('/schools', async (req, res) => {
-  const { school_id, school_name, region, sales_rep_id } = req.body;
-  if (!school_id || !school_name) return res.status(400).json({ error: 'school_id and school_name required' });
+  const { school_name, region, sales_rep_id } = req.body;
+  if (!school_name) return res.status(400).json({ error: 'school_name required' });
   if (!sales_rep_id) return res.status(400).json({ error: 'sales_rep_id required. Assign a sales representative when creating a school.' });
 
   // verify sales_rep exists
   const [rep] = await req.db.execute('SELECT rep_id FROM sales_reps WHERE rep_id = ?', [sales_rep_id]);
   if (rep.length === 0) return res.status(404).json({ error: 'Sales representative not found' });
 
-  // Prevent duplicate school_id
-  const [existingSchool] = await req.db.execute('SELECT school_id FROM schools WHERE school_id = ?', [school_id]);
-  if (existingSchool.length > 0) return res.status(409).json({ error: `school_id already exists: ${school_id}` });
+  // school_id is always auto-generated and guaranteed unique — no manual selection.
+  const schoolId = await generateUniqueId(req.db, 'SCH', 'schools', 'school_id');
 
   await req.db.execute(
     'INSERT INTO schools (school_id, school_name, region, sales_rep_id) VALUES (?, ?, ?, ?)',
-    [school_id, school_name, region || null, sales_rep_id]
+    [schoolId, school_name, region || null, sales_rep_id]
   );
-  res.json({ school_id, school_name, sales_rep_id });
+  res.json({ school_id: schoolId, school_name, sales_rep_id });
 });
 
 router.delete('/schools/:id', async (req, res) => {
