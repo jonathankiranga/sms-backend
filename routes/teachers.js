@@ -10,10 +10,11 @@ router.post('/request-otp', async (req, res) => {
 
   // Find teacher by phone or email
   const [teacher] = await req.db.execute(
-    'SELECT teacher_id, school_id, role FROM teachers WHERE phone = ? OR email = ? LIMIT 1',
+    'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? OR email = ? LIMIT 1',
     [phone || '', email || '']
   );
   if (teacher.length === 0) return res.status(404).json({ error: 'No teacher found with that phone or email' });
+  if (teacher[0].active === 0) return res.status(403).json({ error: 'Your account has been deactivated. Contact your school administrator.' });
 
   const code = Math.floor(1000 + Math.random() * 9000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');

@@ -39,7 +39,7 @@ async function requireHead(req, res) {
 // List teachers for the school (public-ish)
 router.get('/:schoolId/teachers', async (req, res) => {
   const [rows] = await req.db.execute(
-    'SELECT teacher_id, full_name, phone, email, role FROM teachers WHERE school_id = ? ORDER BY full_name',
+    'SELECT teacher_id, full_name, phone, email, role, active FROM teachers WHERE school_id = ? ORDER BY full_name',
     [req.params.schoolId]
   );
   res.json({ teachers: rows });

@@ -793,7 +793,7 @@ router.post('/teachers', async (req, res) => {
 });
 
 router.put('/teachers/:id', async (req, res) => {
-  const { full_name, phone, email, role } = req.body;
+  const { full_name, phone, email, role, active, school_id } = req.body;
   if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
   const fields = [];
   const params = [];
@@ -801,10 +801,24 @@ router.put('/teachers/:id', async (req, res) => {
   if (phone) { fields.push('phone = ?'); params.push(phone); }
   if (email !== undefined) { fields.push('email = ?'); params.push(email); }
   if (role) { fields.push('role = ?'); params.push(role); }
+  if (active !== undefined) { fields.push('active = ?'); params.push(active ? 1 : 0); }
+  if (school_id) { fields.push('school_id = ?'); params.push(school_id); }
   if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
   params.push(req.params.id);
   await req.db.execute(`UPDATE teachers SET ${fields.join(', ')} WHERE teacher_id = ?`, params);
   res.json({ updated: true });
+});
+
+// POST /admin/api/teachers/:id/activate — enable a teacher account
+router.post('/teachers/:id/activate', async (req, res) => {
+  await req.db.execute('UPDATE teachers SET active = 1 WHERE teacher_id = ?', [req.params.id]);
+  res.json({ active: true });
+});
+
+// POST /admin/api/teachers/:id/deactivate — disable a teacher account (e.g. left the school)
+router.post('/teachers/:id/deactivate', async (req, res) => {
+  await req.db.execute('UPDATE teachers SET active = 0 WHERE teacher_id = ?', [req.params.id]);
+  res.json({ active: false });
 });
 
 router.delete('/teachers/:id', async (req, res) => {
