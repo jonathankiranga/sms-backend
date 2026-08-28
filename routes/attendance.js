@@ -124,7 +124,7 @@ router.get('/students/:teacher_id', async (req, res) => {
     if (teacherRows.length === 0) return res.status(404).json({ error: 'Teacher not found' });
 
     const [students] = await req.db.execute(
-      'SELECT s.student_id, s.full_name, c.class_name FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ? AND s.enrollment_status = ? ORDER BY c.class_name, s.full_name',
+      'SELECT s.student_id, s.full_name, s.class_id, c.class_name FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ? AND s.enrollment_status = ? ORDER BY c.class_name, s.full_name',
       [teacherRows[0].school_id, 'Active']
     );
     res.json({ students });
