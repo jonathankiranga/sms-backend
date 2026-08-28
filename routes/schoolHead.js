@@ -1,12 +1,19 @@
 const express = require('express');
 const router = express.Router();
+const crypto = require('crypto');
 const { verifyToken } = require('../lib/auth');
 
-// Shared ID generator: prefix + base36(ms since epoch) + 3-char random (e.g., STU1Y8K7M2)
+// Shared ID generator: prefix + base36(ms) + high-entropy base36 suffix (e.g., STU1Y8K7M2QX4Z)
 function genId(prefix) {
-  const ts = Date.now().toString(36); // base36 timestamp
-  const rand = Math.random().toString(36).slice(2, 5);
-  return `${prefix}${ts}${rand}`.toUpperCase();
+  let entropy = crypto.randomBytes(6).toString('hex');
+  let n = BigInt('0x' + entropy);
+  let b36 = '';
+  while (n > 0n) {
+    b36 = '0123456789abcdefghijklmnopqrstuvwxyz'[Number(n % 36n)] + b36;
+    n = n / 36n;
+  }
+  const ts = Date.now().toString(36);
+  return `${prefix}${ts}${b36.padStart(9, '0')}`.toUpperCase();
 }
 
 async function requireHead(req, res) {

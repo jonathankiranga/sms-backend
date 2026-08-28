@@ -1,11 +1,18 @@
 const express = require('express');
 const crypto = require('crypto');
+const { generateUniqueId } = require('../lib/ids');
 const router = express.Router();
 
 function genId(prefix) {
+  let entropy = crypto.randomBytes(6).toString('hex');
+  let n = BigInt('0x' + entropy);
+  let b36 = '';
+  while (n > 0n) {
+    b36 = '0123456789abcdefghijklmnopqrstuvwxyz'[Number(n % 36n)] + b36;
+    n = n / 36n;
+  }
   const ts = Date.now().toString(36);
-  const rand = Math.random().toString(36).slice(2, 5);
-  return `${prefix}${ts}${rand}`.toUpperCase();
+  return `${prefix}${ts}${b36.padStart(9, '0')}`.toUpperCase();
 }
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
@@ -229,6 +236,10 @@ router.post('/schools', async (req, res) => {
   const [rep] = await req.db.execute('SELECT rep_id FROM sales_reps WHERE rep_id = ?', [sales_rep_id]);
   if (rep.length === 0) return res.status(404).json({ error: 'Sales representative not found' });
 
+  // Prevent duplicate school_id
+  const [existingSchool] = await req.db.execute('SELECT school_id FROM schools WHERE school_id = ?', [school_id]);
+  if (existingSchool.length > 0) return res.status(409).json({ error: `school_id already exists: ${school_id}` });
+
   await req.db.execute(
     'INSERT INTO schools (school_id, school_name, region, sales_rep_id) VALUES (?, ?, ?, ?)',
     [school_id, school_name, region || null, sales_rep_id]
@@ -310,7 +321,7 @@ router.post('/schools/setup', async (req, res) => {
   try {
     await conn.beginTransaction();
 
-    const schoolId = genId('SCH');
+    const schoolId = await generateUniqueId(conn, 'SCH', 'schools', 'school_id');
 
     // Sales rep (reuse the admin's default rep or create a generic one)
     const [repRows] = await conn.execute("SELECT rep_id FROM sales_reps WHERE email = ? LIMIT 1", [headteacher_email || ADMIN_EMAIL]);
