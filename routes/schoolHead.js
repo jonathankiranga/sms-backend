@@ -105,6 +105,24 @@ router.delete('/:schoolId/teachers/:teacherId', async (req, res) => {
   res.json({ deleted: true });
 });
 
+// Update a teacher (only headteacher of that school). Headteachers may toggle
+// a teacher active/deactivated. Reassigning a teacher to a different school is
+// restricted to the global admin (admin-api.js), since that changes their scope.
+router.patch('/:schoolId/teachers/:teacherId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+
+  const { active } = req.body;
+  if (active === undefined) return res.status(400).json({ error: 'Nothing to update' });
+
+  const [t] = await req.db.execute('SELECT role FROM teachers WHERE teacher_id = ? AND school_id = ?', [req.params.teacherId, req.params.schoolId]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found in this school' });
+  if (t[0].role === 'head') return res.status(403).json({ error: 'Cannot deactivate the school head' });
+
+  await req.db.execute('UPDATE teachers SET active = ? WHERE teacher_id = ?', [active ? 1 : 0, req.params.teacherId]);
+  res.json({ teacher_id: req.params.teacherId, active: active ? 1 : 0 });
+});
+
 // Create a class — only headteacher of the school may create classes
 router.post('/:schoolId/classes', async (req, res) => {
   const head = await requireHead(req, res);
