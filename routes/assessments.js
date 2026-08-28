@@ -291,10 +291,29 @@ router.get('/report/:student_id/:term', async (req, res) => {
   const { year, phone } = req.query;
   const reportYear = parseInt(year) || new Date().getFullYear();
 
-  // Subscription guard: report cards require an active subscription for the
-  // requesting parent (or a school-paid plan). Fee statements remain free.
+  // Report cards are protected: parents must be linked + subscribed (or school-paid).
+  // Teachers (authenticated via OTP bearer session) may view their students' report
+  // base info without a phone, e.g. to render a blank/empty template for new students.
+  const auth = (req.headers.authorization || '').trim();
+  let isTeacher = false;
+  if (auth && auth.startsWith('Bearer ')) {
+    try {
+      const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [auth.split(' ')[1]]);
+      const sess = srows[0];
+      if (sess && sess.verified && sess.expires_at && new Date(sess.expires_at) > new Date()) {
+        let trows;
+        if (sess.phone) [trows] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [sess.phone]);
+        if (!trows || trows.length === 0) {
+          const [sr] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [auth.split(' ')[1]]);
+          if (sr[0] && sr[0].email) [trows] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ?', [sr[0].email]);
+        }
+        isTeacher = Boolean(trows && trows.length > 0);
+      }
+    } catch (_) { isTeacher = false; }
+  }
+
   const normPhone = String(phone || '').replace(/[\s-]/g, '').replace(/^\+/, '').replace(/^0([17]\d{8})$/, '254$1');
-  if (!normPhone) {
+  if (!isTeacher && !normPhone) {
     return res.status(400).json({ error: 'Parent phone is required to view report cards' });
   }
   const [link] = await req.db.execute(
@@ -309,12 +328,12 @@ router.get('/report/:student_id/:term', async (req, res) => {
      LIMIT 1`,
     [student_id, normPhone]
   );
-  if (link.length === 0) {
+  if (!isTeacher && link.length === 0) {
     return res.status(403).json({ error: 'This student is not linked to your phone. Ask the school to link you as a parent.' });
   }
-  const schoolPays = link[0].premium_payment_model === 'school';
-  const subActive = Boolean(link[0].is_premium) && (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
-  if (!schoolPays && !subActive) {
+  const schoolPays = link.length === 0 ? false : link[0].premium_payment_model === 'school';
+  const subActive = link.length !== 0 && Boolean(link[0].is_premium) && (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+  if (!isTeacher && !schoolPays && !subActive) {
     return res.status(402).json({ error: 'An active subscription is required to download report cards.' });
   }
 
