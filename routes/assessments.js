@@ -344,57 +344,115 @@ router.get('/report/:student_id/:term', async (req, res) => {
   );
   if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
 
-  // Strand-based assessment results (formative)
-  const [strandAreas] = await req.db.execute(
+  // ---- Formative: strand -> sub-strand scores + recorded competency levels ----
+  // KNEC CBC report presents per-strand (and sub-strand) competency levels with the
+  // formative and summative scores. We keep the recorded performance_level as-is.
+  const [strandRows] = await req.db.execute(
     `SELECT la.area_id, la.area_name,
-            ROUND(AVG(r.score/a.max_score)*100, 1) AS avg_pct,
-            GROUP_CONCAT(DISTINCT CONCAT(s.strand_name, ':', r.performance_level) SEPARATOR ', ') AS strand_summary
+            s.strand_id, s.strand_name,
+            ss.sub_strand_id, ss.sub_strand_name,
+            r.score, a.max_score, r.performance_level
      FROM learning_areas la
      JOIN strands s ON la.area_id = s.area_id AND s.term = ?
      JOIN sub_strands ss ON s.strand_id = ss.strand_id
      JOIN assessments a ON ss.sub_strand_id = a.sub_strand_id
      JOIN assessment_results r ON a.assessment_id = r.assessment_id AND r.student_id = ?
      WHERE YEAR(a.date) = ?
-     GROUP BY la.area_id, la.area_name
-     ORDER BY la.area_name`,
+     ORDER BY la.area_name, s.strand_name, ss.sub_strand_name`,
     [term, student_id, reportYear]
   );
 
-  // Exam session results (CAT / End Term)
-  const [examAreas] = await req.db.execute(
+  // ---- Summative: CAT / End-Term papers per learning area ----
+  const [examRows] = await req.db.execute(
     `SELECT la.area_id, la.area_name,
-            ROUND(AVG(er.score / er.out_of) * 100, 1) AS avg_pct,
-            GROUP_CONCAT(DISTINCT CONCAT(es.exam_type, ':', er.performance_level) SEPARATOR ', ') AS strand_summary
+            es.session_id, es.exam_type, es.exam_name,
+            sla.sub_area_name, er.score, er.out_of, er.performance_level
      FROM exam_results er
      JOIN exam_sessions es ON er.session_id = es.session_id
      JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
      JOIN learning_areas la ON sla.area_id = la.area_id
      WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
-     GROUP BY la.area_id, la.area_name
-     ORDER BY la.area_name`,
+     ORDER BY la.area_name, es.open_date, es.session_id, sla.display_order`,
     [student_id, term, reportYear]
   );
 
-  // Merge both sources — exam results take priority if both exist for same area
-  const areaMap = new Map();
-  for (const a of strandAreas) {
-    areaMap.set(a.area_id, { ...a, source: 'assessment' });
-  }
-  for (const a of examAreas) {
-    if (areaMap.has(a.area_id)) {
-      // average both sources
-      const existing = areaMap.get(a.area_id);
-      areaMap.set(a.area_id, {
-        ...existing,
-        avg_pct: Math.round(((parseFloat(existing.avg_pct) || 0) + (parseFloat(a.avg_pct) || 0)) / 2 * 10) / 10,
-        strand_summary: [existing.strand_summary, a.strand_summary].filter(Boolean).join(', '),
-        source: 'both'
-      });
-    } else {
-      areaMap.set(a.area_id, { ...a, source: 'exam' });
+  // Group formative rows into learning areas -> strands -> sub-strands
+  const strandMap = new Map(); // area_id -> { area_id, area_name, strands: Map }
+  for (const r of strandRows) {
+    let area = strandMap.get(r.area_id);
+    if (!area) {
+      area = { area_id: r.area_id, area_name: r.area_name, strands: new Map() };
+      strandMap.set(r.area_id, area);
     }
+    let st = area.strands.get(r.strand_id);
+    if (!st) {
+      st = { strand_id: r.strand_id, strand_name: r.strand_name, sub_strands: [] };
+      area.strands.set(r.strand_id, st);
+    }
+    st.sub_strands.push({
+      sub_strand_name: r.sub_strand_name,
+      formative_score: r.score != null ? `${Number(r.score)}/${Number(r.max_score)}` : null,
+      performance_level: r.performance_level || null
+    });
   }
-  const areas = Array.from(areaMap.values()).sort((a, b) => a.area_name.localeCompare(b.area_name));
+
+  // Group summative rows per area
+  const examByArea = new Map(); // area_id -> [ {exam_type, exam_name, sub_area_name, score, out_of, level} ]
+  for (const r of examRows) {
+    if (!examByArea.has(r.area_id)) examByArea.set(r.area_id, []);
+    examByArea.get(r.area_id).push({
+      exam_type: r.exam_type,
+      exam_name: r.exam_name,
+      sub_area_name: r.sub_area_name,
+      summative_score: `${Number(r.score)}/${Number(r.out_of)}`,
+      performance_level: r.performance_level || null
+    });
+  }
+
+  // Build per-area record: strand-level structure + summative list + level summary
+  // (avg_pct / strand_summary retained for backward compatibility with class reports)
+  const areaMap = new Map();
+  for (const r of strandRows) areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name });
+  for (const r of examRows) {
+    if (!areaMap.has(r.area_id)) areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name });
+  }
+
+  const areas = Array.from(areaMap.values()).sort((a, b) => a.area_name.localeCompare(b.area_name)).map(areaBase => {
+    const strandArea = strandMap.get(areaBase.area_id);
+    const strands = strandArea ? Array.from(strandArea.strands.values()).map(s => ({
+      strand_id: s.strand_id,
+      strand_name: s.strand_name,
+      sub_strands: s.sub_strands
+    })) : [];
+    const summative = examByArea.get(areaBase.area_id) || [];
+
+    // Recorded level summary text (e.g. "Listening and Speaking:ME, Reading:EE")
+    const strand_summary = strands
+      .flatMap(s => s.sub_strands
+        .filter(sb => sb.formative_score != null)
+        .map(sb => `${s.strand_name}:${sb.performance_level}`))
+      .filter((v, i, arr) => v && arr.indexOf(v) === i)
+      .join(', ');
+    // Per-area percentage (formative average) kept for compatibility
+    let scored = 0, count = 0;
+    for (const s of strands) for (const sb of s.sub_strands) {
+      if (sb.formative_score) {
+        const [sc, mx] = sb.formative_score.split('/').map(Number);
+        if (mx) { scored += (sc / mx) * 100; }
+        count++;
+      }
+    }
+    const avg_pct = count ? Math.round((scored / count) * 10) / 10 : null;
+
+    return {
+      area_id: areaBase.area_id,
+      area_name: areaBase.area_name,
+      strands,
+      summative,
+      strand_summary: strand_summary || null,
+      avg_pct
+    };
+  });
 
   const [attendance] = await req.db.execute(
     `SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) AS present
