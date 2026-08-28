@@ -232,7 +232,7 @@ router.get('/dashboard/:phone', wrap(async (req, res) => {
 // Accepts optional school_id so multi-school parents pay per school and the
 // payment is allocated to the correct school via the ledger row.
 router.post('/upgrade', wrap(async (req, res) => {
-  const { phone: rawPhone, school_id } = req.body;
+  const { phone: rawPhone, school_id, amount: clientAmount } = req.body;
   if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
   const phone = normalizePhone(rawPhone);
 
@@ -263,7 +263,8 @@ router.post('/upgrade', wrap(async (req, res) => {
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
   const pricePerChild = parseInt(setting[0]?.setting_value || '100');
-  const totalDue = pricePerChild * Math.max(childCount, 1);
+  const defaultTotal = pricePerChild * Math.max(childCount, 1);
+  const totalDue = clientAmount ? parseInt(clientAmount, 10) : defaultTotal;
 
   const txnRef = 'TXN' + Date.now().toString(36).toUpperCase();
 
@@ -285,7 +286,12 @@ router.post('/upgrade', wrap(async (req, res) => {
       const mpesa = require('../services/mpesa');
       const result = await mpesa.stkPush(phone, totalDue, accountRef, 'Education');
       if (result.ResponseCode === '0') {
-        console.log(`[MPESA] STK push sent to ${phone} for KSh ${totalDue} ref ${txnRef}`);
+        // Store the CheckoutRequestID so the Buy Goods callback (no AccountReference) can match this ledger row
+        await req.db.execute(
+          "UPDATE payment_ledger SET student_reference = ? WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
+          [result.CheckoutRequestID, txnRef]
+        );
+        console.log(`[MPESA] STK push sent to ${phone} for KSh ${totalDue} ref ${txnRef} checkout ${result.CheckoutRequestID}`);
         return res.json({
           transaction_ref: txnRef,
           checkout_request_id: result.CheckoutRequestID,
@@ -405,11 +411,9 @@ router.get('/payment-status', wrap(async (req, res) => {
   // Check if the pending record was updated to STK_COMPLETED (callback arrived)
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
-     WHERE (student_reference LIKE 'UPG%' OR transaction_reference LIKE 'UPG%' OR student_reference LIKE 'BAZPAY-%' OR transaction_reference LIKE 'BAZPAY-%')
-       AND (parent_phone = ? OR transaction_reference LIKE ?)
-       AND notes IN ('STK_COMPLETED', 'STK_PENDING')
+     WHERE student_reference = ? OR transaction_reference = ?
      ORDER BY logged_at DESC LIMIT 1`,
-    [phone || '', `%${checkout_request_id || ''}%`]
+    [checkout_request_id || '', checkout_request_id || '']
   );
 
   if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
@@ -423,6 +427,10 @@ router.get('/payment-status', wrap(async (req, res) => {
       is_premium: p[0]?.is_premium || false,
       premium_expires_at: p[0]?.premium_expires_at || null
     });
+  }
+
+  if (rows.length > 0 && ['STK_CANCELLED', 'STK_TIMEOUT', 'STK_FAILED'].includes(rows[0].notes)) {
+    return res.json({ status: 'failed', reason: rows[0].notes === 'STK_CANCELLED' ? 'Cancelled by user' : 'Payment not completed. You did not enter your PIN in time.' });
   }
 
   if (rows.length > 0 && rows[0].notes === 'STK_PENDING') {

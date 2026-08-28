@@ -99,9 +99,18 @@ async function handleStkCallback(req, res, school_id) {
     }
 
     const { ResultCode, ResultDesc, CallbackMetadata } = Body.stkCallback;
-    console.log(`[STK][RAW] ResultCode=${ResultCode} ResultDesc=${ResultDesc} Body=${JSON.stringify(Body.stkCallback)}`);
+    const checkoutId = Body.stkCallback.CheckoutRequestID || '';
+    console.log(`[STK][RAW] ResultCode=${ResultCode} ResultDesc=${ResultDesc} Checkout=${checkoutId}`);
     if (ResultCode !== 0) {
-      console.log(`[STK][${school_id || 'GLOBAL'}] Payment failed:`, ResultDesc);
+      // Payment failed, cancelled, or timed out — mark the pending ledger row accordingly
+      const status = ResultCode === '1032' ? 'STK_CANCELLED' : ResultCode === '1037' || ResultCode === '2029' ? 'STK_TIMEOUT' : 'STK_FAILED';
+      if (checkoutId) {
+        await req.db.execute(
+          "UPDATE payment_ledger SET notes = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
+          [status, checkoutId]
+        );
+      }
+      console.log(`[STK][${school_id || 'GLOBAL'}] Payment ${status}:`, ResultDesc);
       return res.status(200).json({ ResultCode: 0, ResultDesc: 'Received' });
     }
 
@@ -114,13 +123,13 @@ async function handleStkCallback(req, res, school_id) {
     const phoneOrHash = (getVal('PhoneNumber') || '').toString();
     const amount = parseFloat(getVal('Amount') || 0);
     const receipt = (getVal('MpesaReceiptNumber') || '').toString();
-    const ref = (Body.stkCallback.AccountReference || '').toString();
+    const ref = (Body.stkCallback.AccountReference || checkoutId || '').toString();
 
     console.log(`[STK][${school_id || 'GLOBAL'}] ${phoneOrHash} paid KSh ${amount} — ref ${receipt} (${ref})`);
 
     const [pending] = await req.db.execute(
-      "SELECT parent_phone, school_id AS ledger_school_id FROM payment_ledger WHERE transaction_reference = ? AND notes = 'STK_PENDING' LIMIT 1",
-      [ref]
+      "SELECT parent_phone, school_id AS ledger_school_id FROM payment_ledger WHERE (transaction_reference = ? OR student_reference = ?) AND notes = 'STK_PENDING' LIMIT 1",
+      [ref, checkoutId]
     );
     const pendingParentPhone = pending.length > 0 ? pending[0].parent_phone : null;
 
@@ -139,7 +148,8 @@ async function handleStkCallback(req, res, school_id) {
       return res.status(200).json({ ResultCode: 0, ResultDesc: 'Success — pending manual reconciliation' });
     }
 
-    if (ref.startsWith('UPG') || ref.startsWith('BAZPAY-')) {
+    if (pending.length > 0) {
+      // Parent subscription upgrade — matched by transaction ref or checkout ID.
       // Allocate to the school tagged on the pending ledger row (per-school upgrade),
       // then the callback route's school, then the parent's first linked student's school.
       const ledgerSchoolId = pending.length > 0 ? pending[0].ledger_school_id : null;
@@ -177,8 +187,8 @@ async function handleStkCallback(req, res, school_id) {
       }
 
       await req.db.execute(
-        "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
-        [receipt, ref]
+        "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
+        [receipt, checkoutId || ref]
       );
     }
 
