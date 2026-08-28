@@ -85,7 +85,8 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       PartyA: cleanPhone,
       PartyB: process.env.MPESA_TILL_NUMBER || '1582954',
       PhoneNumber: cleanPhone,
-      CallBackURL: callbackUrl
+      CallBackURL: callbackUrl,
+      TransactionDesc: 'Payment'
     })
   });
   console.log('[MPESA][STK] shortcode=' + shortcode + ' phone=' + cleanPhone + ' amount=' + amount + ' callback=' + callbackUrl);
