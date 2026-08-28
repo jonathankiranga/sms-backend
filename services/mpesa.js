@@ -80,14 +80,12 @@ async function stkPush(phone, amount, reference, description, options = {}) {
       BusinessShortCode: shortcode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
+      TransactionType: 'CustomerBuyGoodsOnline',
       Amount: String(Math.round(amount)),
       PartyA: cleanPhone,
-      PartyB: shortcode,
+      PartyB: process.env.MPESA_TILL_NUMBER || '1582954',
       PhoneNumber: cleanPhone,
-      CallBackURL: callbackUrl,
-      AccountReference: String(reference).slice(0, 12),
-      TransactionDesc: 'SchoolMarket'
+      CallBackURL: callbackUrl
     })
   });
   console.log('[MPESA][STK] shortcode=' + shortcode + ' phone=' + cleanPhone + ' amount=' + amount + ' callback=' + callbackUrl);
