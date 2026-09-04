@@ -3,7 +3,7 @@
 // Bump VERSION when the terms change so an acceptance is required again.
 
 const TERMS = {
-  version: '2026.1',
+  version: '2026.2',
   effective_date: '2026-09-04',
   environment: 'cbcschool.app',
   company_name: 'Smarternow Data Venture',
@@ -68,7 +68,7 @@ const TERMS = {
     {
       id: 'subscription',
       heading: '12. Parent Subscription Programme',
-      body: `The school operates a Parent Subscription programme (formerly referred to as "premium"). This programme is provided to the school as a mandated service: the school requires each parent or guardian to subscribe for their child at a charge of KSh 100 per child per term. The subscription charge is paid directly by the parent or guardian via M-Pesa STK Push. The school does not collect the charge and does not owe the charge; parents subscribe directly to Smarternow Data Venture as the service provider. Subscription benefits include WhatsApp absence alerts, assessment result alerts, M-Pesa fee payment, downloadable PDF reports, and access to the school marketplace. The school may, at its discretion, pay for subscriptions on behalf of a parent.`
+      body: `The school operates a mandatory Parent Subscription programme. This programme is provided to the school as a mandated service: the school requires each parent or guardian to subscribe for their child at a charge of KSh 100 per child per term. The subscription charge is paid directly by the parent or guardian via M-Pesa STK Push. The school does not collect the charge and does not owe the charge; parents subscribe directly to Smarternow Data Venture as the service provider. Subscription benefits include WhatsApp absence alerts, assessment result alerts, M-Pesa fee payment, downloadable PDF reports, and access to the school marketplace. The school may, at its discretion, pay for subscriptions on behalf of a parent.`
     },
     {
       id: 'fees',
