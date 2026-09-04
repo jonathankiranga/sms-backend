@@ -480,13 +480,22 @@ app.use('/api/bazar-pay', bazarPayRoutes);
 app.use('/api/exam-sessions', examSessionRoutes);
 app.use('/api/reports', reportsRoutes);
 
-app.get('/health', async (req, res) => {
+// /health — instant liveness check. Responds immediately so Render wake-up
+// detection works without waiting for a DB round-trip. Frontends poll this
+// endpoint until they receive { status: 'ok' } before sending real requests.
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// /health/ready — deep readiness check (confirms DB is reachable too).
+// Use this when you specifically need to verify the database is up.
+app.get('/health/ready', async (req, res) => {
   try {
-    const [rows] = await req.db.execute('SELECT 1 AS ok');
+    await req.db.execute('SELECT 1');
     res.json({ status: 'ok', db: 'connected', timestamp: new Date().toISOString() });
   } catch (err) {
-    console.error('[HEALTH]', err.message);
-    res.status(500).json({ status: 'error', db: 'Database connection failed' });
+    console.error('[HEALTH/READY]', err.message);
+    res.status(503).json({ status: 'error', db: 'unavailable', timestamp: new Date().toISOString() });
   }
 });
 
