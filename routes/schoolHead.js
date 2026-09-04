@@ -664,3 +664,75 @@ router.get('/:schoolId/my-classes', async (req, res) => {
 });
 
 module.exports = router;
+
+
+// ─── School Terms ─────────────────────────────────────────────────────────────
+// GET  /:schoolId/terms        — list all terms (any authenticated staff)
+// POST /:schoolId/terms        — create a term (head only)
+// PUT  /:schoolId/terms/:id    — update a term (head only)
+// DELETE /:schoolId/terms/:id  — delete a term (head only)
+
+router.get('/:schoolId/terms', async (req, res) => {
+  try {
+    const [rows] = await req.db.execute(
+      'SELECT term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE school_id = ? ORDER BY academic_year DESC, start_date ASC',
+      [req.params.schoolId]
+    );
+    res.json({ terms: rows });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/:schoolId/terms', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  const { term_name, start_date, end_date, academic_year } = req.body;
+  if (!term_name || !start_date || !end_date || !academic_year) {
+    return res.status(400).json({ error: 'term_name, start_date, end_date, academic_year are all required' });
+  }
+  if (new Date(end_date) <= new Date(start_date)) {
+    return res.status(400).json({ error: 'end_date must be after start_date' });
+  }
+  try {
+    const [r] = await req.db.execute(
+      'INSERT INTO school_terms (school_id, term_name, start_date, end_date, academic_year) VALUES (?, ?, ?, ?, ?)',
+      [req.params.schoolId, term_name, start_date, end_date, parseInt(academic_year)]
+    );
+    res.json({ term_id: r.insertId, term_name, start_date, end_date, academic_year: parseInt(academic_year) });
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'A term with these dates already exists' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/:schoolId/terms/:termId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  const { term_name, start_date, end_date, academic_year } = req.body;
+  const fields = [], params = [];
+  if (term_name)    { fields.push('term_name = ?');    params.push(term_name); }
+  if (start_date)   { fields.push('start_date = ?');   params.push(start_date); }
+  if (end_date)     { fields.push('end_date = ?');     params.push(end_date); }
+  if (academic_year){ fields.push('academic_year = ?');params.push(parseInt(academic_year)); }
+  if (fields.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+  if (start_date && end_date && new Date(end_date) <= new Date(start_date)) {
+    return res.status(400).json({ error: 'end_date must be after start_date' });
+  }
+  params.push(req.params.termId, req.params.schoolId);
+  try {
+    await req.db.execute(`UPDATE school_terms SET ${fields.join(', ')} WHERE term_id = ? AND school_id = ?`, params);
+    const [saved] = await req.db.execute(
+      'SELECT term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE term_id = ?',
+      [req.params.termId]
+    );
+    res.json(saved[0] || {});
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/:schoolId/terms/:termId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
+  try {
+    await req.db.execute('DELETE FROM school_terms WHERE term_id = ? AND school_id = ?', [req.params.termId, req.params.schoolId]);
+    res.json({ deleted: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
