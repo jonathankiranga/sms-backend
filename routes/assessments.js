@@ -2,8 +2,8 @@ const express = require('express');
 const router = express.Router();
 
 // GET /api/assessments/class-report/:class_id/:term?year=YYYY
-// Aggregated class report: per-student per-area averages from exam results,
-// levels, ranks, class aggregates and competency/value ratings.
+// CBC-correct class report: one column per exam session, performance_level
+// taken directly from exam_results (not recalculated), plus class aggregates.
 router.get('/class-report/:class_id/:term', async (req, res) => {
   const year = parseInt(req.query.year) || new Date().getFullYear();
   const term = req.params.term;
@@ -20,104 +20,129 @@ router.get('/class-report/:class_id/:term', async (req, res) => {
     [klass.class_id]
   );
 
-  // Learning areas for this class level (normalized match; Pre-Primary == PP2 alias)
-  const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  let levelKey = norm(klass.level_name || String(klass.class_name || '').split(/\s*-\s*/)[0]);
-  if (levelKey === 'preprimary') levelKey = 'pp2';
-  const [allAreas] = await req.db.execute(
-    'SELECT area_id, area_name, level_name FROM learning_areas WHERE school_id = ?',
-    [klass.school_id]
-  );
-  const learningAreas = allAreas.filter(a => {
-    let k = norm(a.level_name);
-    if (k === 'preprimary') k = 'pp2';
-    return k === levelKey;
-  });
-
-  // All exam scores for this class + term + year
-  const [scoreRows] = await req.db.execute(
-    `SELECT er.student_id, la.area_id, er.score, er.out_of
-     FROM exam_results er
-     JOIN exam_sessions es ON er.session_id = es.session_id
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     JOIN learning_areas la ON sla.area_id = la.area_id
-     WHERE es.class_id = ? AND es.term = ? AND es.academic_year = ?`,
+  // All exam sessions for this class + term + year, ordered by open_date
+  const [sessions] = await req.db.execute(
+    `SELECT session_id, exam_name, exam_type, status, open_date, close_date
+     FROM exam_sessions
+     WHERE class_id = ? AND term = ? AND academic_year = ?
+     ORDER BY open_date ASC, session_id ASC`,
     [klass.class_id, term, year]
   );
 
-  // Accumulate score sums per student per area
-  const sums = {}; // sums[student_id][area_id] = { s, o }
-  for (const r of scoreRows) {
-    if (!sums[r.student_id]) sums[r.student_id] = {};
-    if (!sums[r.student_id][r.area_id]) sums[r.student_id][r.area_id] = { s: 0, o: 0 };
-    sums[r.student_id][r.area_id].s += parseFloat(r.score) || 0;
-    sums[r.student_id][r.area_id].o += parseFloat(r.out_of) || 0;
+  // Learning areas for this class (all areas that have sub_learning_areas with results)
+  const [allAreas] = await req.db.execute(
+    `SELECT DISTINCT la.area_id, la.area_name
+     FROM learning_areas la
+     JOIN sub_learning_areas sla ON la.area_id = sla.area_id
+     WHERE la.school_id = ?
+     ORDER BY la.area_name`,
+    [klass.school_id]
+  );
+
+  if (sessions.length === 0) {
+    // No sessions yet — return structure with empty data so UI can still render
+    return res.json({
+      class: { class_id: klass.class_id, class_name: klass.class_name, academic_year: year },
+      term,
+      sessions: [],
+      learning_areas: allAreas,
+      students: students.map(s => ({ ...s, sessions: {}, overall_level: null })),
+      aggregates: { total_students: students.length, session_stats: {} },
+      competencies: { student_ratings: {} }
+    });
   }
 
-  const levelOf = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
+  const sessionIds = sessions.map(s => s.session_id);
 
-  const studentRows = students.map(st => {
-    const areas = learningAreas.map(a => {
-      const acc = sums[st.student_id]?.[a.area_id];
-      const avg = acc && acc.o > 0 ? Math.round(acc.s / acc.o * 1000) / 10 : null;
-      return { area_id: a.area_id, avg_pct: avg };
-    });
-    const scored = areas.filter(x => x.avg_pct !== null);
-    const overall = scored.length > 0
-      ? Math.round(scored.reduce((t, x) => t + x.avg_pct, 0) / scored.length * 10) / 10
-      : null;
-    return {
-      student_id: st.student_id,
-      full_name: st.full_name,
-      areas,
-      overall_avg: overall,
-      level: overall !== null ? levelOf(overall) : null,
-      rank: null
-    };
-  });
+  // Fetch all exam results for these sessions in one query
+  // performance_level is already stored correctly via the rubric at save time — use it directly
+  const placeholders = sessionIds.map(() => '?').join(',');
+  const [resultRows] = await req.db.execute(
+    `SELECT er.session_id, er.student_id, la.area_id, la.area_name,
+            er.score, er.out_of, er.performance_level
+     FROM exam_results er
+     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+     JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE er.session_id IN (${placeholders})`,
+    sessionIds
+  );
 
-  studentRows.sort((a, b) => (b.overall_avg ?? -1) - (a.overall_avg ?? -1));
-  let rank = 0, prev = null;
-  studentRows.forEach((s, i) => {
-    if (s.overall_avg === null) { s.rank = null; return; }
-    if (s.overall_avg !== prev) { rank = i + 1; prev = s.overall_avg; }
-    s.rank = rank;
-  });
+  // Build lookup: student -> session -> area -> { totalScore, totalOutOf, levels[] }
+  // We aggregate sub_areas within an area per session to get a single area-level result
+  const lookup = {}; // lookup[student_id][session_id][area_id]
+  for (const r of resultRows) {
+    if (!lookup[r.student_id]) lookup[r.student_id] = {};
+    if (!lookup[r.student_id][r.session_id]) lookup[r.student_id][r.session_id] = {};
+    if (!lookup[r.student_id][r.session_id][r.area_id]) {
+      lookup[r.student_id][r.session_id][r.area_id] = {
+        area_name: r.area_name, s: 0, o: 0, levels: []
+      };
+    }
+    const cell = lookup[r.student_id][r.session_id][r.area_id];
+    if (r.score != null && r.out_of > 0) { cell.s += parseFloat(r.score); cell.o += parseFloat(r.out_of); }
+    if (r.performance_level) cell.levels.push(r.performance_level);
+  }
 
-  const assessed = studentRows.filter(s => s.overall_avg !== null);
-  const levelCounts = { EE: 0, ME: 0, AE: 0, BE: 0 };
-  assessed.forEach(s => { levelCounts[s.level]++; });
-  const totalStudents = students.length;
+  const { getRubricConfig, getLevel } = require('../lib/config');
+  const rubricConfig = await getRubricConfig(req.db, klass.school_id);
 
-  const areaAverages = learningAreas.map(a => {
-    const vals = studentRows
-      .map(s => s.areas.find(x => x.area_id === a.area_id)?.avg_pct)
-      .filter(v => v !== null && v !== undefined);
-    return {
-      area_id: a.area_id,
-      area_name: a.area_name,
-      class_avg: vals.length ? Math.round(vals.reduce((t, v) => t + v, 0) / vals.length * 10) / 10 : null,
-      student_count: vals.length
-    };
-  });
-
-  const aggregates = {
-    total_students: totalStudents,
-    class_average: assessed.length
-      ? Math.round(assessed.reduce((t, s) => t + s.overall_avg, 0) / assessed.length * 10) / 10
-      : null,
-    level_counts: levelCounts,
-    level_percentages: Object.fromEntries(
-      Object.entries(levelCounts).map(([k, v]) => [k, totalStudents ? Math.round(v / totalStudents * 100) : 0])
-    ),
-    area_averages: areaAverages,
-    top_performers: assessed.filter(s => s.level === 'EE').slice(0, 10)
-      .map(s => ({ student_id: s.student_id, full_name: s.full_name, overall_avg: s.overall_avg })),
-    bottom_performers: assessed.filter(s => s.level === 'BE').slice(-10).reverse()
-      .map(s => ({ student_id: s.student_id, full_name: s.full_name, overall_avg: s.overall_avg }))
+  const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+  // Resolve the dominant level from the stored levels array (highest = best achieved)
+  const dominantLevel = (levels) => {
+    if (!levels || levels.length === 0) return null;
+    return levels.reduce((best, l) => (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best);
   };
 
-  // Competency & value ratings for the term
+  // For each student, build their session × area grid
+  const studentRows = students.map(st => {
+    // sessions: { [session_id]: { [area_id]: { level, pct } } }
+    const sessionData = {};
+    for (const sess of sessions) {
+      sessionData[sess.session_id] = {};
+      for (const area of allAreas) {
+        const cell = lookup[st.student_id]?.[sess.session_id]?.[area.area_id];
+        if (!cell || cell.o === 0) {
+          sessionData[sess.session_id][area.area_id] = null;
+          continue;
+        }
+        const pct = Math.round(cell.s / cell.o * 1000) / 10;
+        // Prefer stored level; if absent recalculate from rubric
+        const level = dominantLevel(cell.levels) || (getLevel(pct / 100, rubricConfig)?.level_code || 'BE');
+        sessionData[sess.session_id][area.area_id] = { pct, level };
+      }
+    }
+
+    // Overall level for the student across all sessions: use the most recent closed session
+    const lastClosedSession = [...sessions].reverse().find(s => s.status === 'Closed') || sessions[sessions.length - 1];
+    const lastSessionAreas = sessionData[lastClosedSession?.session_id] || {};
+    const lastLevels = Object.values(lastSessionAreas).filter(Boolean).map(c => c.level);
+    const overallLevel = lastLevels.length > 0
+      ? (lastLevels.filter(l => l === 'EE').length > lastLevels.length / 2 ? 'EE'
+        : lastLevels.filter(l => l === 'ME').length > lastLevels.length / 2 ? 'ME'
+        : lastLevels.filter(l => l === 'AE').length > lastLevels.length / 2 ? 'AE'
+        : 'BE')
+      : null;
+
+    return { student_id: st.student_id, full_name: st.full_name, sessions: sessionData, overall_level: overallLevel };
+  });
+
+  // Aggregates: per session, distribution of levels across all students
+  const sessionStats = {};
+  for (const sess of sessions) {
+    const counts = { EE: 0, ME: 0, AE: 0, BE: 0 };
+    let assessed = 0;
+    for (const st of studentRows) {
+      const areas = Object.values(st.sessions[sess.session_id] || {}).filter(Boolean);
+      if (areas.length === 0) continue;
+      assessed++;
+      const levels = areas.map(a => a.level);
+      const dominant = dominantLevel(levels);
+      if (dominant && counts[dominant] !== undefined) counts[dominant]++;
+    }
+    sessionStats[sess.session_id] = { counts, assessed };
+  }
+
+  // Competency ratings
   const [ratingRows] = await req.db.execute(
     `SELECT scr.student_id, scr.competency_id, scr.rating
      FROM student_competency_ratings scr
@@ -132,11 +157,19 @@ router.get('/class-report/:class_id/:term', async (req, res) => {
   }
 
   res.json({
-    class: { class_id: klass.class_id, class_name: klass.class_name, academic_year: Number(year) },
+    class: { class_id: klass.class_id, class_name: klass.class_name, academic_year: year },
     term,
+    sessions: sessions.map(s => ({
+      session_id: s.session_id,
+      exam_name: s.exam_name,
+      exam_type: s.exam_type,
+      status: s.status,
+      open_date: s.open_date,
+      close_date: s.close_date
+    })),
+    learning_areas: allAreas,
     students: studentRows,
-    learning_areas: learningAreas.map(a => ({ area_id: a.area_id, area_name: a.area_name })),
-    aggregates,
+    aggregates: { total_students: students.length, session_stats: sessionStats },
     competencies: { student_ratings: studentRatings }
   });
 });

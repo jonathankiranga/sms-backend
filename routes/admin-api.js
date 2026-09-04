@@ -507,6 +507,32 @@ router.post('/schools/setup', async (req, res) => {
       }
     }
 
+    // Default exam sessions — seed CAT 1, CAT 2, End Term for every class × every term.
+    // Dates are approximate and aligned to standard Kenyan CBC calendar.
+    // Headteacher can adjust open/close dates from the CAT Management page.
+    const sessionDefs = [
+      // term,     exam_type,  exam_name,          approx open,        approx close
+      ['Term 1', 'CAT 1',    'CAT 1 Term 1',     `${year}-02-10`, `${year}-02-28`],
+      ['Term 1', 'CAT 2',    'CAT 2 Term 1',     `${year}-03-10`, `${year}-03-28`],
+      ['Term 1', 'End Term', 'End Term 1',        `${year}-03-31`, `${year}-04-04`],
+      ['Term 2', 'CAT 1',    'CAT 1 Term 2',     `${year}-06-09`, `${year}-06-27`],
+      ['Term 2', 'CAT 2',    'CAT 2 Term 2',     `${year}-07-07`, `${year}-07-25`],
+      ['Term 2', 'End Term', 'End Term 2',        `${year}-08-04`, `${year}-08-07`],
+      ['Term 3', 'CAT 1',    'CAT 1 Term 3',     `${year}-10-06`, `${year}-10-24`],
+      ['Term 3', 'CAT 2',    'CAT 2 Term 3',     `${year}-10-27`, `${year}-11-07`],
+      ['Term 3', 'End Term', 'End Term 3',        `${year}-11-17`, `${year}-11-20`],
+    ];
+    for (const cls of classRows) {
+      for (const [sessTerm, examType, examName, openDate, closeDate] of sessionDefs) {
+        await conn.execute(
+          `INSERT INTO exam_sessions
+            (school_id, class_id, term, academic_year, exam_name, exam_type, open_date, close_date, status, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled', ?)`,
+          [schoolId, cls.class_id, sessTerm, year, examName, examType, openDate, closeDate, headId]
+        );
+      }
+    }
+
     await conn.commit();
 
     res.json({
