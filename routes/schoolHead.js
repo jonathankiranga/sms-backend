@@ -675,7 +675,7 @@ module.exports = router;
 router.get('/:schoolId/terms', async (req, res) => {
   try {
     const [rows] = await req.db.execute(
-      'SELECT term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE school_id = ? ORDER BY academic_year DESC, start_date ASC',
+      'SELECT id AS term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE school_id = ? ORDER BY academic_year DESC, start_date ASC',
       [req.params.schoolId]
     );
     res.json({ terms: rows });
@@ -719,9 +719,9 @@ router.put('/:schoolId/terms/:termId', async (req, res) => {
   }
   params.push(req.params.termId, req.params.schoolId);
   try {
-    await req.db.execute(`UPDATE school_terms SET ${fields.join(', ')} WHERE term_id = ? AND school_id = ?`, params);
+    await req.db.execute(`UPDATE school_terms SET ${fields.join(', ')} WHERE id = ? AND school_id = ?`, params);
     const [saved] = await req.db.execute(
-      'SELECT term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE term_id = ?',
+      'SELECT id AS term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE id = ?',
       [req.params.termId]
     );
     res.json(saved[0] || {});
@@ -732,7 +732,7 @@ router.delete('/:schoolId/terms/:termId', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return;
   try {
-    await req.db.execute('DELETE FROM school_terms WHERE term_id = ? AND school_id = ?', [req.params.termId, req.params.schoolId]);
+    await req.db.execute('DELETE FROM school_terms WHERE id = ? AND school_id = ?', [req.params.termId, req.params.schoolId]);
     res.json({ deleted: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
