@@ -829,3 +829,155 @@ router.get('/:schoolId/year-end-status', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ─── HEADTEACHER TERMS & CONDITIONS ───────────────────────────────────────────
+
+// GET /api/school-head/:schoolId/terms/headteacher
+// Returns the current T&C content plus whether the current headteacher has accepted it.
+router.get('/:schoolId/terms/headteacher', async (req, res) => {
+  try {
+    const head = await requireHead(req, res);
+    if (!head) return;
+
+    const termsModule = require('../terms/headteacher');
+    const { TERMS } = termsModule;
+
+    // Ensure acceptance table exists (idempotent)
+    await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
+      teacher_id VARCHAR(40) NOT NULL,
+      version VARCHAR(20) NOT NULL,
+      accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ip_address VARCHAR(45) NULL,
+      PRIMARY KEY (teacher_id, version)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    const [accRows] = await req.db.execute(
+      'SELECT version, accepted_at FROM terms_acceptance WHERE teacher_id = ? AND version = ?',
+      [head.teacher_id, TERMS.version]
+    );
+
+    res.json({
+      version: TERMS.version,
+      effective_date: TERMS.effective_date,
+      title: 'Headteacher Terms & Conditions',
+      accepted: accRows.length > 0,
+      accepted_at: accRows.length > 0 ? accRows[0].accepted_at : null,
+      sections: TERMS.sections
+    });
+  } catch (err) {
+    console.error('[TERMS-GET]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/school-head/:schoolId/terms/accept
+// Records acceptance of the current T&C version and emails the headteacher a copy (with CC).
+router.post('/:schoolId/terms/accept', async (req, res) => {
+  try {
+    const head = await requireHead(req, res);
+    if (!head) return;
+
+    const termsModule = require('../terms/headteacher');
+    const { TERMS, renderHtml, renderText } = termsModule;
+
+    // Ensure acceptance table exists (idempotent)
+    await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
+      teacher_id VARCHAR(40) NOT NULL,
+      version VARCHAR(20) NOT NULL,
+      accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ip_address VARCHAR(45) NULL,
+      PRIMARY KEY (teacher_id, version)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    // Record acceptance (idempotent — re-accepting just refreshes nothing, PK prevents dupes)
+    await req.db.execute(
+      `INSERT INTO terms_acceptance (teacher_id, version, accepted_at, ip_address)
+       VALUES (?, ?, NOW(), ?)
+       ON DUPLICATE KEY UPDATE accepted_at = accepted_at`,
+      [head.teacher_id, TERMS.version, req.ip]
+    );
+
+    // Fetch headteacher + school details for the email
+    const [teacherRows] = await req.db.execute(
+      'SELECT full_name, email, phone FROM teachers WHERE teacher_id = ?',
+      [head.teacher_id]
+    );
+    const [schoolRows] = await req.db.execute(
+      'SELECT school_name FROM schools WHERE school_id = ?',
+      [head.school_id]
+    );
+    const headteacher = teacherRows[0] || {};
+    const school = schoolRows[0] || {};
+
+    const replacements = {
+      PRODUCT: TERMS.product_name,
+      COMPANY: TERMS.company_name,
+      ENV: TERMS.environment,
+      SUPPORT_EMAIL: TERMS.support_email,
+      HEADTEACHER_NAME: headteacher.full_name || headteacher.email || 'School Head',
+      SCHOOL_NAME: school.school_name || 'your school',
+      ACCEPTED_AT: new Date().toLocaleString('en-GB', { dateStyle: 'long', timeStyle: 'short' })
+    };
+
+    const html = renderHtml(replacements);
+    const text = renderText(replacements);
+    const cc = (process.env.TERMS_ACCEPTANCE_CC || TERMS.support_email).split(',').map(e => e.trim()).filter(Boolean);
+
+    const emailResult = await (async () => {
+      try {
+        const messaging = require('../services/messaging');
+        if (!messaging.sendTermsAcceptanceEmail) return null;
+        return await messaging.sendTermsAcceptanceEmail({
+          to: headteacher.email,
+          cc,
+          subject: `Accepted: Headteacher Terms & Conditions — ${TERMS.product_name} (v${TERMS.version})`,
+          html,
+          text
+        });
+      } catch (e) {
+        console.error('[TERMS-EMAIL]', e.message);
+        return { error: e.message };
+      }
+    })();
+
+    res.json({
+      success: true,
+      version: TERMS.version,
+      accepted_at: new Date(),
+      email_sent: !emailResult || emailResult.status !== 'failed',
+      email_receipt: emailResult && emailResult.id ? emailResult.id : undefined,
+      emailed_to: headteacher.email,
+      cc
+    });
+  } catch (err) {
+    console.error('[TERMS-ACCEPT]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/school-head/:schoolId/terms/status
+// Lightweight check used by the frontend login gate.
+router.get('/:schoolId/terms/status', async (req, res) => {
+  try {
+    const head = await requireHead(req, res);
+    if (!head) return;
+
+    const { TERMS } = require('../terms/headteacher');
+    await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
+      teacher_id VARCHAR(40) NOT NULL,
+      version VARCHAR(20) NOT NULL,
+      accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      ip_address VARCHAR(45) NULL,
+      PRIMARY KEY (teacher_id, version)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+    const [rows] = await req.db.execute(
+      'SELECT accepted_at FROM terms_acceptance WHERE teacher_id = ? AND version = ?',
+      [head.teacher_id, TERMS.version]
+    );
+    res.json({ version: TERMS.version, accepted: rows.length > 0, accepted_at: rows[0]?.accepted_at || null });
+  } catch (err) {
+    console.error('[TERMS-STATUS]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});

@@ -111,6 +111,37 @@ async function sendEmailOtp(email, code) {
   }
 }
 
+// Send the accepted Terms & Conditions copy to the headteacher, with a CC to the platform.
+// Uses Resend (SMTP is blocked on Render). Falls back to console log for local dev.
+async function sendTermsAcceptanceEmail({ to, cc, subject, html, text }) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM || 'cbcSchool App <noreply@smarternowapps.co.ke>';
+
+  if (!apiKey) {
+    console.log('[EMAIL][DEV] To', to, 'CC', cc || '(none)', '| Subject:', subject);
+    if (text) console.log(text.slice(0, 500));
+    return { provider: 'log', status: 'logged' };
+  }
+
+  try {
+    const payload = { from, to: [to], subject };
+    if (cc) payload.cc = Array.isArray(cc) ? cc : [cc];
+    if (html) payload.html = html;
+    if (text) payload.text = text;
+
+    const resp = await axios.post('https://api.resend.com/emails', payload, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      timeout: 15000
+    });
+    console.log(`[EMAIL] Terms copy sent to ${to} (cc: ${cc || 'none'}): ${resp.data?.id || 'ok'}`);
+    return { provider: 'resend', status: 'sent', id: resp.data?.id };
+  } catch (err) {
+    const detail = err.response?.data?.message || err.message;
+    console.error(`[EMAIL] Resend failed for terms copy to ${to}: ${detail}`);
+    return { provider: 'resend', status: 'failed', error: detail };
+  }
+}
+
 async function sendAssessmentAlert(parentPhone, studentName, subject, score, level) {
   return sendTemplate(parentPhone, process.env.WHATSAPP_TEMPLATE_ASSESSMENT || 'assessment_result', [
     studentName, subject, score.toString(), level
@@ -194,5 +225,5 @@ async function sendSms(phone, message, providerOverride) {
 module.exports = {
   sendAbsenceAlert, sendOtp, sendTemplate, sendSms, sendEmailOtp,
   sendAssessmentAlert, sendFeeReminder,
-  sendConsecutiveAbsenceAlert, sendBroadcast
+  sendConsecutiveAbsenceAlert, sendBroadcast, sendTermsAcceptanceEmail
 };

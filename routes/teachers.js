@@ -82,8 +82,36 @@ router.post('/verify-otp', async (req, res) => {
 
   if (!teacher || teacher.length === 0) return res.status(404).json({ error: 'Teacher not found' });
 
+  // For headteachers, include the Terms & Conditions acceptance status so the
+  // login flow can block access until the current version is accepted.
+  let terms = null;
+  if (teacher[0].role === 'head') {
+    try {
+      const { TERMS } = require('../terms/headteacher');
+      await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
+        teacher_id VARCHAR(40) NOT NULL,
+        version VARCHAR(20) NOT NULL,
+        accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        ip_address VARCHAR(45) NULL,
+        PRIMARY KEY (teacher_id, version)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+      const [termsRows] = await req.db.execute(
+        'SELECT version, accepted_at FROM terms_acceptance WHERE teacher_id = ? AND version = ?',
+        [teacher[0].teacher_id, TERMS.version]
+      );
+      terms = {
+        required: true,
+        version: TERMS.version,
+        accepted: termsRows.length > 0,
+        accepted_at: termsRows.length > 0 ? termsRows[0].accepted_at : null
+      };
+    } catch (e) {
+      console.error('[TERMS] Failed to read acceptance status:', e.message);
+    }
+  }
+
   // Return the opaque session_id (created during request-otp) as the bearer token. No server-side SECRET required.
-  res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, role: teacher[0].role, session_id, verified: true });
+  res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, role: teacher[0].role, session_id, verified: true, terms });
 });
 
 // Google sign-in for teachers. When GOOGLE_CLIENT_ID is configured, verify id_token with Google.
