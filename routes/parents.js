@@ -443,7 +443,8 @@ router.get('/payment-status', wrap(async (req, res) => {
   if (!checkout_request_id && !rawPhone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
   const phone = rawPhone ? normalizePhone(rawPhone) : null;
 
-  // Check if the pending record was updated to STK_COMPLETED (callback arrived)
+  // 1. Check payment_ledger — matches individual parent upgrade STK
+  //    (student_reference is set to CheckoutRequestID after the STK push)
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
      WHERE student_reference = ? OR transaction_reference = ?
@@ -468,6 +469,35 @@ router.get('/payment-status', wrap(async (req, res) => {
     return res.json({ status: 'failed', reason: rows[0].notes === 'STK_CANCELLED' ? 'Cancelled by user' : 'Payment not completed. You did not enter your PIN in time.' });
   }
 
+  // 2. Check premium_bulk_payments — matches bazar bulk/selected STK pushes.
+  //    The checkout_request_id is stored after the STK push is initiated.
+  if (checkout_request_id) {
+    const [bulk] = await req.db.execute(
+      `SELECT payment_status, school_id FROM premium_bulk_payments
+       WHERE transaction_reference IN (
+         SELECT transaction_reference FROM payment_ledger WHERE student_reference = ? OR transaction_reference = ? LIMIT 1
+       )
+       OR checkout_request_id = ?
+       ORDER BY created_at DESC LIMIT 1`,
+      [checkout_request_id, checkout_request_id, checkout_request_id]
+    ).catch(() => [[]]);  // table may not have checkout_request_id column on older DBs
+
+    if (bulk.length > 0 && bulk[0].payment_status === 'completed') {
+      if (phone) {
+        const [p] = await req.db.execute(
+          'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
+          [phone]
+        );
+        return res.json({
+          status: 'completed',
+          is_premium: p[0]?.is_premium || false,
+          premium_expires_at: p[0]?.premium_expires_at || null
+        });
+      }
+      return res.json({ status: 'completed' });
+    }
+  }
+
   if (rows.length > 0 && rows[0].notes === 'STK_PENDING') {
     // Check if Safaricom already confirmed via STK query
     if (process.env.MPESA_CONSUMER_KEY && checkout_request_id) {
@@ -490,7 +520,7 @@ router.get('/payment-status', wrap(async (req, res) => {
     return res.json({ status: 'pending' });
   }
 
-  // No pending record found — check if already premium (paid via another path)
+  // 3. No pending record found — check if already premium (paid via another path)
   if (!phone) return res.json({ status: 'pending' });
   const [p] = await req.db.execute(
     'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',

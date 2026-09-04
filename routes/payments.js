@@ -159,13 +159,22 @@ async function handleStkCallback(req, res, school_id) {
       );
       const activeSchoolId = ledgerSchoolId || school_id || (link.length > 0 ? link[0].school_id : null);
 
-      const { applyParentPayment } = require('../lib/subscriptions');
-      await applyParentPayment(req.db, phone, amount, activeSchoolId);
-
+      // Always mark ledger completed first so payment-status polling unblocks the
+      // parent UI even if subscription activation has a transient error.
       await req.db.execute(
         "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
         [receipt, checkoutId || ref]
       );
+
+      try {
+        const { applyParentPayment } = require('../lib/subscriptions');
+        await applyParentPayment(req.db, phone, amount, activeSchoolId);
+      } catch (subErr) {
+        // Subscription activation failed (e.g. missing school terms config) — log and
+        // continue so the callback still returns 200 to Safaricom. The ledger is already
+        // marked STK_COMPLETED so polling unblocks. A retry/admin fix can re-apply.
+        console.error(`[STK][SUBSCRIPTION] applyParentPayment failed for ${phone}:`, subErr.message);
+      }
     }
 
     if (ref.startsWith('BLK-')) {

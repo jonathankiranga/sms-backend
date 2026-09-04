@@ -521,6 +521,12 @@ router.post('/pay-bulk-subscriptions', async (req, res) => {
     await req.db.execute('UPDATE premium_bulk_payments SET transaction_reference = ? WHERE payment_id = ?', [reference, paymentId]);
 
     if (stk.ResponseCode === '0') {
+      // Store the CheckoutRequestID against the bulk payment record so
+      // payment-status polling can resolve it via premium_bulk_payments
+      await req.db.execute(
+        'UPDATE premium_bulk_payments SET checkout_request_id = ? WHERE payment_id = ?',
+        [stk.CheckoutRequestID, paymentId]
+      ).catch(() => {}); // non-fatal if column doesn't exist on older DB
       return res.json({ success: true, status: 'pending', checkout_request_id: stk.CheckoutRequestID, transaction_reference: reference, amount: totalAmount, total_students: totalStudents });
     }
 
@@ -626,6 +632,11 @@ router.post('/pay-selected-subscriptions', async (req, res) => {
     await req.db.execute('UPDATE premium_bulk_payments SET transaction_reference = ? WHERE payment_id = ?', [reference, paymentId]);
 
     if (stk.ResponseCode === '0') {
+      // Store the CheckoutRequestID so payment-status polling can resolve it
+      await req.db.execute(
+        'UPDATE premium_bulk_payments SET checkout_request_id = ? WHERE payment_id = ?',
+        [stk.CheckoutRequestID, paymentId]
+      ).catch(() => {});
       return res.json({ success: true, status: 'pending', checkout_request_id: stk.CheckoutRequestID, transaction_reference: reference, amount: totalAmount, total_students: totalStudents, parents: eligibleParentPhones.length });
     }
 
