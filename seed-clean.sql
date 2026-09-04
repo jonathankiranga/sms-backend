@@ -114,20 +114,28 @@ VALUES
 
 -- -------------------------------------------------------
 -- 3d. STUDENTS (2 per grade, male/female mix)
+--     Uses class_id lookups via variables (TiDB-safe)
 -- -------------------------------------------------------
-INSERT IGNORE INTO students (student_id, full_name, class_id, school_id, gender, enrollment_status)
-SELECT 'STU000001', 'Amina Hassan',    c.class_id, @SID, 'Female', 'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 1'
-UNION ALL SELECT 'STU000002', 'Brian Ochieng',   c.class_id, @SID, 'Male',   'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 1'
-UNION ALL SELECT 'STU000003', 'Cynthia Mwangi',  c.class_id, @SID, 'Female', 'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 2'
-UNION ALL SELECT 'STU000004', 'David Kamau',     c.class_id, @SID, 'Male',   'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 2'
-UNION ALL SELECT 'STU000005', 'Esther Njeri',    c.class_id, @SID, 'Female', 'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 3'
-UNION ALL SELECT 'STU000006', 'Francis Otieno',  c.class_id, @SID, 'Male',   'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 3'
-UNION ALL SELECT 'STU000007', 'Grace Akinyi',    c.class_id, @SID, 'Female', 'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 4'
-UNION ALL SELECT 'STU000008', 'Hassan Abdi',     c.class_id, @SID, 'Male',   'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 4'
-UNION ALL SELECT 'STU000009', 'Irene Waithera',  c.class_id, @SID, 'Female', 'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 5'
-UNION ALL SELECT 'STU000010', 'James Kariuki',   c.class_id, @SID, 'Male',   'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 5'
-UNION ALL SELECT 'STU000011', 'Kevin Mwangi',    c.class_id, @SID, 'Male',   'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 6'
-UNION ALL SELECT 'STU000012', 'Lydia Wanjiru',   c.class_id, @SID, 'Female', 'Active' FROM classes c WHERE c.school_id=@SID AND c.class_name='Grade 6';
+SET @G1 = (SELECT class_id FROM classes WHERE school_id=@SID AND class_name='Grade 1' LIMIT 1);
+SET @G2 = (SELECT class_id FROM classes WHERE school_id=@SID AND class_name='Grade 2' LIMIT 1);
+SET @G3 = (SELECT class_id FROM classes WHERE school_id=@SID AND class_name='Grade 3' LIMIT 1);
+SET @G4 = (SELECT class_id FROM classes WHERE school_id=@SID AND class_name='Grade 4' LIMIT 1);
+SET @G5 = (SELECT class_id FROM classes WHERE school_id=@SID AND class_name='Grade 5' LIMIT 1);
+SET @G6 = (SELECT class_id FROM classes WHERE school_id=@SID AND class_name='Grade 6' LIMIT 1);
+
+INSERT IGNORE INTO students (student_id, full_name, class_id, school_id, gender, enrollment_status) VALUES
+  ('STU000001', 'Amina Hassan',   @G1, @SID, 'Female', 'Active'),
+  ('STU000002', 'Brian Ochieng',  @G1, @SID, 'Male',   'Active'),
+  ('STU000003', 'Cynthia Mwangi', @G2, @SID, 'Female', 'Active'),
+  ('STU000004', 'David Kamau',    @G2, @SID, 'Male',   'Active'),
+  ('STU000005', 'Esther Njeri',   @G3, @SID, 'Female', 'Active'),
+  ('STU000006', 'Francis Otieno', @G3, @SID, 'Male',   'Active'),
+  ('STU000007', 'Grace Akinyi',   @G4, @SID, 'Female', 'Active'),
+  ('STU000008', 'Hassan Abdi',    @G4, @SID, 'Male',   'Active'),
+  ('STU000009', 'Irene Waithera', @G5, @SID, 'Female', 'Active'),
+  ('STU000010', 'James Kariuki',  @G5, @SID, 'Male',   'Active'),
+  ('STU000011', 'Kevin Mwangi',   @G6, @SID, 'Male',   'Active'),
+  ('STU000012', 'Lydia Wanjiru',  @G6, @SID, 'Female', 'Active');
 
 -- -------------------------------------------------------
 -- 3e. PARENT PROFILE (OTP via SMS/WhatsApp, not email)
