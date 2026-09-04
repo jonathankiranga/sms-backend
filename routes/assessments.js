@@ -534,13 +534,77 @@ router.post('/areas', async (req, res) => {
   const { school_id, level_name, area_name, teacher_id } = req.body;
   if (!school_id || !area_name || !teacher_id) return res.status(400).json({ error: 'school_id, area_name and teacher_id required' });
 
-  // Verify teacher is head of the school
   const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
   if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
   if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may create learning areas for this school' });
 
   const [r] = await req.db.execute('INSERT INTO learning_areas (school_id, level_name, area_name) VALUES (?, ?, ?)', [school_id, level_name || null, area_name]);
-  res.json({ area_id: r.insertId, school_id, area_name });
+  res.json({ area_id: r.insertId, school_id, area_name, level_name: level_name || null });
+});
+
+// PUT /api/assessments/areas/:id — rename a learning area (headteacher only)
+router.put('/areas/:id', async (req, res) => {
+  const { area_name, level_name, teacher_id } = req.body;
+  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+  if (!area_name && level_name === undefined) return res.status(400).json({ error: 'Nothing to update' });
+
+  const [areas] = await req.db.execute('SELECT area_id, school_id FROM learning_areas WHERE area_id = ?', [req.params.id]);
+  if (areas.length === 0) return res.status(404).json({ error: 'Learning area not found' });
+  const school_id = areas[0].school_id;
+
+  const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may update learning areas for this school' });
+
+  const fields = [], params = [];
+  if (area_name)          { fields.push('area_name = ?');  params.push(area_name); }
+  if (level_name !== undefined) { fields.push('level_name = ?'); params.push(level_name || null); }
+  params.push(req.params.id);
+  await req.db.execute(`UPDATE learning_areas SET ${fields.join(', ')} WHERE area_id = ?`, params);
+  const [saved] = await req.db.execute('SELECT area_id, school_id, area_name, level_name FROM learning_areas WHERE area_id = ?', [req.params.id]);
+  res.json(saved[0]);
+});
+
+// DELETE /api/assessments/areas/:id — delete a learning area (headteacher only, blocks if in use)
+router.delete('/areas/:id', async (req, res) => {
+  const { teacher_id } = req.query;
+  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+
+  const [areas] = await req.db.execute('SELECT area_id, school_id, area_name FROM learning_areas WHERE area_id = ?', [req.params.id]);
+  if (areas.length === 0) return res.status(404).json({ error: 'Learning area not found' });
+  const school_id = areas[0].school_id;
+
+  const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may delete learning areas for this school' });
+
+  // Check if in use — sub_learning_areas, strands, or exam_results reference this area
+  const [[subCount]]  = await req.db.execute('SELECT COUNT(*) AS n FROM sub_learning_areas WHERE area_id = ?', [req.params.id]);
+  const [[strandCount]] = await req.db.execute('SELECT COUNT(*) AS n FROM strands WHERE area_id = ?', [req.params.id]);
+  const [[examCount]] = await req.db.execute(
+    `SELECT COUNT(*) AS n FROM exam_results er
+     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+     WHERE sla.area_id = ?`, [req.params.id]
+  );
+  const [[assessCount]] = await req.db.execute(
+    `SELECT COUNT(*) AS n FROM assessment_results ar
+     JOIN assessments a ON ar.assessment_id = a.assessment_id
+     JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
+     JOIN strands st ON ss.strand_id = st.strand_id
+     WHERE st.area_id = ?`, [req.params.id]
+  );
+
+  const inUse = (subCount.n + strandCount.n + examCount.n + assessCount.n) > 0;
+  if (inUse) {
+    return res.status(409).json({
+      error: 'in_use',
+      message: `"${areas[0].area_name}" cannot be deleted — it has ${subCount.n} sub-area(s), ${strandCount.n} strand(s), ${examCount.n} exam result(s) and ${assessCount.n} assessment result(s) linked to it. Remove those first.`,
+      counts: { sub_areas: subCount.n, strands: strandCount.n, exam_results: examCount.n, assessment_results: assessCount.n }
+    });
+  }
+
+  await req.db.execute('DELETE FROM learning_areas WHERE area_id = ?', [req.params.id]);
+  res.json({ deleted: true, area_id: parseInt(req.params.id) });
 });
 
 // POST /api/assessments/strands — create a strand under a learning area (headteacher only)
