@@ -736,3 +736,96 @@ router.delete('/:schoolId/terms/:termId', async (req, res) => {
     res.json({ deleted: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+
+// ─── Year-End Status ──────────────────────────────────────────────────────────
+// GET /:schoolId/year-end-status
+// Returns whether the final term has ended AND year-end close has not yet run
+// for that year. Used by the headteacher dashboard to show a promotion reminder.
+
+router.get('/:schoolId/year-end-status', async (req, res) => {
+  try {
+    const schoolId = req.params.schoolId;
+    const today = new Date();
+    const todayStr = today.toISOString().slice(0, 10);
+
+    // Find the most recent academic year that has a Term 3 (or highest term) whose
+    // end_date has already passed.
+    const [termRows] = await req.db.execute(
+      `SELECT academic_year, term_name, end_date
+       FROM school_terms
+       WHERE school_id = ? AND end_date < ?
+       ORDER BY academic_year DESC, end_date DESC
+       LIMIT 10`,
+      [schoolId, todayStr]
+    );
+
+    if (termRows.length === 0) {
+      return res.json({ needs_close: false });
+    }
+
+    // Group by year and check if the latest ended term is the last term of its year
+    const yearMap = {};
+    for (const row of termRows) {
+      const y = Number(row.academic_year);
+      if (!yearMap[y]) yearMap[y] = [];
+      yearMap[y].push(row);
+    }
+
+    // Find all terms per year to know which is the last one
+    const years = Object.keys(yearMap).map(Number).sort((a, b) => b - a);
+    let triggerYear = null;
+    let lastTermEnd = null;
+
+    for (const year of years) {
+      // Get ALL terms for this year to determine the last one
+      const [allTerms] = await req.db.execute(
+        'SELECT term_name, end_date FROM school_terms WHERE school_id = ? AND academic_year = ? ORDER BY end_date ASC',
+        [schoolId, year]
+      );
+      if (allTerms.length === 0) continue;
+
+      const lastTerm = allTerms[allTerms.length - 1];
+      const lastEnd = new Date(lastTerm.end_date);
+
+      // Only flag if the last term of the year ended more than 1 day ago
+      // (give 1 day buffer so it doesn't fire on the final day itself)
+      if (lastEnd < today && (today - lastEnd) > 86400000) {
+        triggerYear = year;
+        lastTermEnd = lastTerm.end_date;
+        break;
+      }
+    }
+
+    if (!triggerYear) return res.json({ needs_close: false });
+
+    // Check if year-end close was already run for this year by looking at
+    // promotion_history for records dated after the last term ended
+    const [promoRows] = await req.db.execute(
+      `SELECT COUNT(*) AS cnt
+       FROM promotion_history ph
+       JOIN students s ON ph.student_id = s.student_id
+       WHERE s.school_id = ? AND ph.note LIKE ?`,
+      [schoolId, `Year-end close ${triggerYear}%`]
+    );
+
+    const alreadyRun = (promoRows[0]?.cnt || 0) > 0;
+
+    // Also check if there are any active students left to promote (in case all graduated)
+    const [activeRows] = await req.db.execute(
+      "SELECT COUNT(*) AS cnt FROM students WHERE school_id = ? AND enrollment_status = 'Active'",
+      [schoolId]
+    );
+    const hasActiveStudents = (activeRows[0]?.cnt || 0) > 0;
+
+    return res.json({
+      needs_close: !alreadyRun && hasActiveStudents,
+      year: triggerYear,
+      last_term_ended: lastTermEnd,
+      already_run: alreadyRun
+    });
+  } catch (err) {
+    console.error('[YEAR-END-STATUS]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
