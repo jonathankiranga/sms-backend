@@ -349,21 +349,21 @@ router.post('/schools/setup', async (req, res) => {
 
     // Classes — default CBC progression (PP1 → Grade 9) if not provided
     const defaultClasses = ['PP1', 'PP2', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6', 'Grade 7', 'Grade 8', 'Grade 9'];
-    const classes = Array.isArray(class_names) && class_names.length > 0 ? class_names : defaultClasses;
+    const classLevels = Array.isArray(class_names) && class_names.length > 0 ? class_names : defaultClasses;
 
     // Optional streams — one class per level × stream when provided
-    const streams = Array.isArray(streams) ? streams.map(s => String(s).trim()).filter(Boolean) : [];
-    for (let i = 0; i < streams.length; i++) {
+    const streamList = Array.isArray(streams) ? streams.map(s => String(s).trim()).filter(Boolean) : [];
+    for (let i = 0; i < streamList.length; i++) {
       await conn.execute('INSERT INTO school_streams (school_id, stream_name, display_order) VALUES (?, ?, ?)',
-        [schoolId, streams[i], i + 1]);
+        [schoolId, streamList[i], i + 1]);
     }
 
     const classRows = [];
-    if (streams.length > 0) {
+    if (streamList.length > 0) {
       let rank = 0;
-      for (const level of classes) {
+      for (const level of classLevels) {
         rank++;
-        for (const stream of streams) {
+        for (const stream of streamList) {
           const [r] = await conn.execute(
             'INSERT INTO classes (school_id, class_name, stream, level_name, academic_year, class_rank) VALUES (?, ?, ?, ?, ?, ?)',
             [schoolId, `${level} - ${stream}`, stream, level, year, rank]
@@ -372,166 +372,43 @@ router.post('/schools/setup', async (req, res) => {
         }
       }
     } else {
-      for (let i = 0; i < classes.length; i++) {
+      for (let i = 0; i < classLevels.length; i++) {
         const [r] = await conn.execute(
           'INSERT INTO classes (school_id, class_name, level_name, academic_year, class_rank) VALUES (?, ?, ?, ?, ?)',
-          [schoolId, classes[i], classes[i], year, i + 1]
+          [schoolId, classLevels[i], classLevels[i], year, i + 1]
         );
-        classRows.push({ class_id: r.insertId, class_name: classes[i] });
+        classRows.push({ class_id: r.insertId, class_name: classLevels[i] });
       }
     }
 
-    // Learning areas + sub-areas per level
-    const levelAreas = {
-      'PP1': { areas: ['Language Activities', 'Mathematical Activities', 'Environmental Activities', 'Psychomotor and Creative Activities', 'Religious Education'],
-               subs: { 'Language Activities': ['Listening', 'Speaking', 'Reading'], 'Mathematical Activities': ['Number Work', 'Measurement', 'Geometry'],
-                       'Environmental Activities': ['Our Environment', 'Living Things'], 'Psychomotor and Creative Activities': ['Creative Arts', 'Physical Activities'],
-                       'Religious Education': ['Bible Stories', 'Values'] } },
-      'PP2': { areas: ['Language Activities', 'Mathematical Activities', 'Environmental Activities', 'Psychomotor and Creative Activities', 'Religious Education'],
-               subs: { 'Language Activities': ['Listening', 'Speaking', 'Reading', 'Writing'], 'Mathematical Activities': ['Number Work', 'Measurement', 'Geometry'],
-                       'Environmental Activities': ['Our Environment', 'Living Things'], 'Psychomotor and Creative Activities': ['Creative Arts', 'Physical Activities'],
-                       'Religious Education': ['Bible Stories', 'Values'] } },
-      'Grade 1': { areas: ['English', 'Mathematics', 'Environmental Activities', 'Kiswahili', 'Creative Arts', 'Religious Education'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry'],
-                           'Environmental Activities': ['Our Environment', 'Living Things'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika'],
-                           'Creative Arts': ['Creative Arts', 'Physical Education'], 'Religious Education': ['Stories', 'Values'] } },
-      'Grade 2': { areas: ['English', 'Mathematics', 'Environmental Activities', 'Kiswahili', 'Creative Arts', 'Religious Education'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry'],
-                           'Environmental Activities': ['Our Environment', 'Living Things'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika'],
-                           'Creative Arts': ['Creative Arts', 'Physical Education'], 'Religious Education': ['Stories', 'Values'] } },
-      'Grade 3': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry'],
-                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika'],
-                           'Social Studies': ['Our Environment', 'Our Nation'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
-                           'Religious Education': ['Stories', 'Values'] } },
-      'Grade 4': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
-                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
-                           'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
-                           'Religious Education': ['Stories', 'Values'] } },
-      'Grade 5': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
-                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
-                           'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
-                           'Religious Education': ['Stories', 'Values'] } },
-      'Grade 6': { areas: ['English', 'Mathematics', 'Science and Technology', 'Kiswahili', 'Social Studies', 'Creative Arts', 'Religious Education'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar'], 'Mathematics': ['Numbers', 'Measurement', 'Geometry', 'Algebra'],
-                           'Science and Technology': ['Science', 'Technology'], 'Kiswahili': ['Kusikiliza', 'Kusoma', 'Kuandika', 'Sarufi'],
-                           'Social Studies': ['Our Environment', 'Our Nation', 'Our County'], 'Creative Arts': ['Creative Arts', 'Physical Education'],
-                           'Religious Education': ['Stories', 'Values'] } },
-      // CBC Junior Secondary (Grades 7-9)
-      'Grade 7': { areas: ['English', 'Kiswahili', 'Mathematics', 'Integrated Science', 'Pre-Technical Studies', 'Social Studies', 'Religious Education', 'Business Studies', 'Agriculture', 'Creative Arts and Sports'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar in Use'],
-                           'Kiswahili': ['Kusikiliza na Kuzungumza', 'Kusoma', 'Kuandika', 'Sarufi'],
-                           'Mathematics': ['Numbers', 'Algebra', 'Measurements', 'Geometry', 'Data Handling'],
-                           'Integrated Science': ['Scientific Investigation', 'Mixtures and Separation', 'Living Things and Their Environment', 'Force and Energy'],
-                           'Pre-Technical Studies': ['Safety and Injury Prevention', 'Materials for Production', 'Technical Drawing', 'ICT and Digital Devices'],
-                           'Social Studies': ['Natural and Historical Built Environments', 'People, Population and Social Organizations', 'Resources and Economic Activities', 'Political Developments and Governance'],
-                           'Religious Education': ['Creation', 'The Bible', 'Faith and God\'s Promises', 'Christian Values'],
-                           'Business Studies': ['Business and Money Management Skills', 'Ethical Practices in Business', 'Record Keeping', 'Markets'],
-                           'Agriculture': ['Introduction to Agriculture', 'Crop Production', 'Livestock Production', 'Agribusiness'],
-                           'Creative Arts and Sports': ['Visual Arts', 'Performing Arts', 'Physical Fitness', 'Ball Games'] } },
-      'Grade 8': { areas: ['English', 'Kiswahili', 'Mathematics', 'Integrated Science', 'Pre-Technical Studies', 'Social Studies', 'Religious Education', 'Business Studies', 'Agriculture', 'Creative Arts and Sports'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar in Use'],
-                           'Kiswahili': ['Kusikiliza na Kuzungumza', 'Kusoma', 'Kuandika', 'Sarufi'],
-                           'Mathematics': ['Numbers', 'Algebra', 'Measurements', 'Geometry', 'Data Handling'],
-                           'Integrated Science': ['Scientific Investigation', 'Matter and Its Properties', 'Living Things and Their Environment', 'Force and Energy'],
-                           'Pre-Technical Studies': ['Safety and Injury Prevention', 'Materials for Production', 'Technical Drawing', 'Entrepreneurship and ICT'],
-                           'Social Studies': ['Natural and Historical Built Environments', 'People, Population and Social Organizations', 'Resources and Economic Activities', 'Political Developments and Governance'],
-                           'Religious Education': ['Creation', 'The Bible', 'Faith and God\'s Promises', 'Christian Values'],
-                           'Business Studies': ['Business and Money Management Skills', 'Ethical Practices in Business', 'Record Keeping', 'Markets'],
-                           'Agriculture': ['Introduction to Agriculture', 'Crop Production', 'Livestock Production', 'Agribusiness'],
-                           'Creative Arts and Sports': ['Visual Arts', 'Performing Arts', 'Physical Fitness', 'Ball Games'] } },
-      'Grade 9': { areas: ['English', 'Kiswahili', 'Mathematics', 'Integrated Science', 'Pre-Technical Studies', 'Social Studies', 'Religious Education', 'Business Studies', 'Agriculture', 'Creative Arts and Sports'],
-                   subs: { 'English': ['Listening and Speaking', 'Reading', 'Writing', 'Grammar in Use'],
-                           'Kiswahili': ['Kusikiliza na Kuzungumza', 'Kusoma', 'Kuandika', 'Sarufi'],
-                           'Mathematics': ['Numbers', 'Algebra', 'Measurements', 'Geometry', 'Data Handling'],
-                           'Integrated Science': ['Scientific Investigation', 'Matter and Its Interactions', 'Living Things and Their Environment', 'Force and Energy'],
-                           'Pre-Technical Studies': ['Safety and Career Opportunities', 'Materials for Production', 'Technical Drawing', 'Entrepreneurship and ICT'],
-                           'Social Studies': ['Natural and Historical Built Environments', 'People, Population and Social Organizations', 'Resources and Economic Activities', 'Political Developments and Governance'],
-                           'Religious Education': ['Creation', 'The Bible', 'Faith and God\'s Promises', 'Christian Values'],
-                           'Business Studies': ['Business and Money Management Skills', 'Ethical Practices in Business', 'Record Keeping', 'Markets'],
-                           'Agriculture': ['Introduction to Agriculture', 'Crop Production', 'Livestock Production', 'Agribusiness'],
-                           'Creative Arts and Sports': ['Visual Arts', 'Performing Arts', 'Physical Fitness', 'Ball Games'] } }
-    };
-
-    const areaIdCache = {};
-    for (const cls of classes) {
-      const def = levelAreas[cls] || levelAreas['Grade 4'];
-      const areas = def.areas;
-      for (const areaName of areas) {
-        const [a] = await conn.execute(
-          'INSERT INTO learning_areas (school_id, level_name, area_name) VALUES (?, ?, ?)',
-          [schoolId, cls, areaName]
-        );
-        const subs = (def.subs[areaName] || []).map((s, idx) => ({ name: s, order: idx + 1 }));
-        for (const sub of subs) {
-          await conn.execute(
-            'INSERT INTO sub_learning_areas (area_id, sub_area_name, display_order) VALUES (?, ?, ?)',
-            [a.insertId, sub.name, sub.order]
-          );
-        }
-        areaIdCache[`${cls}|${areaName}`] = a.insertId;
-      }
-    }
+    // Learning areas + sub-areas per level — use shared CBC seed module
+    const { seedLearningAreas, seedTerms, seedRubric, seedExamSessions, seedFees } = require('../lib/cbcSeedData');
+    await seedLearningAreas(conn, schoolId);
 
     // School terms
-    const termDefs = [
-      ['Term 1', `${year}-01-06`, `${year}-04-04`],
-      ['Term 2', `${year}-05-04`, `${year}-08-07`],
-      ['Term 3', `${year}-09-07`, `${year}-11-20`]
-    ];
-    for (const [tname, start, end] of termDefs) {
-      await conn.execute('INSERT INTO school_terms (school_id, term_name, start_date, end_date, academic_year) VALUES (?, ?, ?, ?, ?)',
-        [schoolId, tname, start, end, year]);
-    }
+    await seedTerms(conn, schoolId, year);
 
     // Rubric
-    const rubric = [['EE',80,'Exceeding Expectations','#2E7D32'],['ME',60,'Meeting Expectations','#1565C0'],['AE',40,'Approaching Expectations','#E65100'],['BE',0,'Below Expectations','#C62828']];
-    for (const [code, min, label, color] of rubric) {
-      await conn.execute('INSERT INTO school_rubric_config (school_id, level_code, min_percent, label, color) VALUES (?, ?, ?, ?, ?)',
-        [schoolId, code, min, label, color]);
-    }
+    await seedRubric(conn, schoolId);
 
-    // Fee structures (optional) — spread across terms if term not specified
+    // Fee structures (optional body overrides; otherwise seed defaults)
     if (Array.isArray(fees) && fees.length > 0) {
       for (const fee of fees) {
         if (!fee.name || !fee.amount) continue;
-        const terms = fee.term ? [fee.term] : ['Term 1', 'Term 2', 'Term 3'];
-        for (const t of terms) {
+        const feeTerms = fee.term ? [fee.term] : ['Term 1', 'Term 2', 'Term 3'];
+        for (const t of feeTerms) {
           await conn.execute(
             'INSERT INTO fee_structures (school_id, fee_name, amount, term, academic_year, is_optional) VALUES (?, ?, ?, ?, ?, ?)',
             [schoolId, fee.name, fee.amount, t, year, fee.is_optional || false]
           );
         }
       }
+    } else {
+      await seedFees(conn, schoolId, year);
     }
 
-    // Default exam sessions — seed CAT 1, CAT 2, End Term for every class × every term.
-    // Dates are approximate and aligned to standard Kenyan CBC calendar.
-    // Headteacher can adjust open/close dates from the CAT Management page.
-    const sessionDefs = [
-      // term,     exam_type,  exam_name,          approx open,        approx close
-      ['Term 1', 'CAT 1',    'CAT 1 Term 1',     `${year}-02-10`, `${year}-02-28`],
-      ['Term 1', 'CAT 2',    'CAT 2 Term 1',     `${year}-03-10`, `${year}-03-28`],
-      ['Term 1', 'End Term', 'End Term 1',        `${year}-03-31`, `${year}-04-04`],
-      ['Term 2', 'CAT 1',    'CAT 1 Term 2',     `${year}-06-09`, `${year}-06-27`],
-      ['Term 2', 'CAT 2',    'CAT 2 Term 2',     `${year}-07-07`, `${year}-07-25`],
-      ['Term 2', 'End Term', 'End Term 2',        `${year}-08-04`, `${year}-08-07`],
-      ['Term 3', 'CAT 1',    'CAT 1 Term 3',     `${year}-10-06`, `${year}-10-24`],
-      ['Term 3', 'CAT 2',    'CAT 2 Term 3',     `${year}-10-27`, `${year}-11-07`],
-      ['Term 3', 'End Term', 'End Term 3',        `${year}-11-17`, `${year}-11-20`],
-    ];
-    for (const cls of classRows) {
-      for (const [sessTerm, examType, examName, openDate, closeDate] of sessionDefs) {
-        await conn.execute(
-          `INSERT INTO exam_sessions
-            (school_id, class_id, term, academic_year, exam_name, exam_type, open_date, close_date, status, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled', ?)`,
-          [schoolId, cls.class_id, sessTerm, year, examName, examType, openDate, closeDate, headId]
-        );
-      }
-    }
+    // Default exam sessions — CAT 1, CAT 2, End Term per class × term
+    await seedExamSessions(conn, schoolId, year, headId);
 
     await conn.commit();
 
@@ -548,6 +425,69 @@ router.post('/schools/setup', async (req, res) => {
   } catch (err) {
     await conn.rollback();
     console.error('[SCHOOL SETUP]', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// ─── SEED STRUCTURAL DATA FOR AN EXISTING SCHOOL ─────────────────────────────
+// POST /admin/api/schools/:id/seed-structure
+// Seeds CBC learning areas, sub-areas, terms, rubric, fee structures, and exam
+// sessions for a school that already has classes. Safe to re-run — skips anything
+// that already exists. No students/teachers are created.
+// Body: { year?: number }
+router.post('/schools/:id/seed-structure', async (req, res) => {
+  const schoolId = req.params.id;
+  const year = parseInt(req.body.year) || new Date().getFullYear();
+
+  // Verify school exists
+  const [schoolRows] = await req.db.execute('SELECT school_id, school_name FROM schools WHERE school_id = ?', [schoolId]);
+  if (schoolRows.length === 0) return res.status(404).json({ error: 'School not found' });
+
+  // Verify school has classes — we need level_name values to seed subjects
+  const [classCheck] = await req.db.execute(
+    'SELECT COUNT(*) AS cnt FROM classes WHERE school_id = ? AND level_name IS NOT NULL',
+    [schoolId]
+  );
+  if (classCheck[0].cnt === 0) {
+    return res.status(400).json({
+      error: 'No classes with level_name found for this school. Add classes first before seeding structure.'
+    });
+  }
+
+  const {
+    seedLearningAreas, seedTerms, seedRubric, seedExamSessions, seedFees
+  } = require('../lib/cbcSeedData');
+
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const areasResult    = await seedLearningAreas(conn, schoolId);
+    const termsResult    = await seedTerms(conn, schoolId, year);
+    const rubricResult   = await seedRubric(conn, schoolId);
+    const feesResult     = await seedFees(conn, schoolId, year);
+    const sessionsResult = await seedExamSessions(conn, schoolId, year, null);
+
+    await conn.commit();
+
+    res.json({
+      success: true,
+      school_id: schoolId,
+      school_name: schoolRows[0].school_name,
+      year,
+      summary: {
+        learning_areas:  areasResult,
+        terms:           termsResult,
+        rubric:          rubricResult,
+        fee_structures:  feesResult,
+        exam_sessions:   sessionsResult,
+      }
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error('[SEED STRUCTURE]', err.message);
     res.status(500).json({ error: err.message });
   } finally {
     conn.release();
