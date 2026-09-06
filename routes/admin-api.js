@@ -227,6 +227,137 @@ router.put('/schools/:id/mpesa', async (req, res) => {
   }
 });
 
+// PREMIUM — per-school premium management for the admin portal
+// (replaces the headteacher-portal premium page, whose API was never built)
+function currentPremiumTermYear() {
+  const now = new Date();
+  return { term: `Term ${Math.ceil((now.getMonth() + 1) / 4)}`, year: now.getFullYear() };
+}
+
+function premiumLockReason(model) {
+  return model === 'school'
+    ? 'Payment model is locked to School pays until the term ends.'
+    : 'Payment model is locked until the term ends.';
+}
+
+// GET /admin/api/schools/:id/premium?term=&year= — settings + subscriptions + bulk payments
+router.get('/schools/:id/premium', async (req, res) => {
+  try {
+    const [srows] = await req.db.execute('SELECT school_id, school_name, premium_payment_model, premium_fee_per_term, premium_payment_model_locked FROM schools WHERE school_id = ? LIMIT 1', [req.params.id]);
+    if (srows.length === 0) return res.status(404).json({ error: 'School not found' });
+    const school = srows[0];
+    const def = currentPremiumTermYear();
+    const term = req.query.term || def.term;
+    const year = parseInt(req.query.year) || def.year;
+    const [subs] = await req.db.execute(
+      `SELECT ps.subscription_id, ps.parent_phone, ps.payment_model, ps.payment_status, ps.amount, ps.term, ps.year,
+              (SELECT COUNT(*) FROM student_parent_map m JOIN students s ON m.student_id = s.student_id AND s.school_id = ps.school_id AND s.enrollment_status = 'Active' WHERE m.parent_phone = ps.parent_phone) AS children
+       FROM premium_subscriptions ps WHERE ps.school_id = ? AND ps.term = ? AND ps.year = ? ORDER BY ps.parent_phone`,
+      [req.params.id, term, year]
+    );
+    const [pays] = await req.db.execute(
+      'SELECT payment_id, term, year, amount, total_students, payment_status, paid_at FROM premium_bulk_payments WHERE school_id = ? ORDER BY payment_id DESC LIMIT 20',
+      [req.params.id]
+    );
+    const [sc] = await req.db.execute(
+      "SELECT COUNT(*) AS total FROM students WHERE school_id = ? AND enrollment_status = 'Active'",
+      [req.params.id]
+    );
+    res.json({
+      settings: {
+        premium_payment_model: school.premium_payment_model,
+        premium_fee_per_term: school.premium_fee_per_term,
+        locked: school.premium_payment_model_locked === 1,
+        lock_reason: school.premium_payment_model_locked === 1 ? premiumLockReason(school.premium_payment_model) : null
+      },
+      term, year, total_students: sc[0]?.total || 0, subscriptions: subs, payments: pays
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /admin/api/schools/:id/premium-settings — payment model + fee (model changes blocked while locked)
+router.put('/schools/:id/premium-settings', async (req, res) => {
+  try {
+    const { premium_payment_model, premium_fee_per_term, unlock } = req.body;
+    const [srows] = await req.db.execute('SELECT premium_payment_model, premium_payment_model_locked FROM schools WHERE school_id = ? LIMIT 1', [req.params.id]);
+    if (srows.length === 0) return res.status(404).json({ error: 'School not found' });
+    const school = srows[0];
+    const locked = school.premium_payment_model_locked === 1 && unlock !== true;
+    if (premium_payment_model !== undefined && !['parent', 'school'].includes(premium_payment_model)) {
+      return res.status(400).json({ error: 'premium_payment_model must be parent or school' });
+    }
+    if (premium_payment_model !== undefined && premium_payment_model !== school.premium_payment_model && locked) {
+      return res.status(403).json({ error: 'Payment model is locked until the term ends' });
+    }
+    const fields = [], params = [];
+    if (premium_payment_model !== undefined) { fields.push('premium_payment_model = ?'); params.push(premium_payment_model); }
+    if (premium_fee_per_term !== undefined) { fields.push('premium_fee_per_term = ?'); params.push(premium_fee_per_term === null ? null : parseFloat(premium_fee_per_term)); }
+    if (premium_payment_model === 'school') { fields.push('premium_payment_model_locked = 1'); }
+    if (unlock === true) { fields.push('premium_payment_model_locked = 0'); }
+    if (fields.length === 0) return res.status(400).json({ error: 'No valid fields to update' });
+    params.push(req.params.id);
+    await req.db.execute(`UPDATE schools SET ${fields.join(', ')} WHERE school_id = ?`, params);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /admin/api/schools/:id/premium/pay { phone } — bulk STK push for unpaid parents (current term)
+router.post('/schools/:id/premium/pay', async (req, res) => {
+  try {
+    const { phone } = req.body;
+    if (!phone) return res.status(400).json({ error: 'M-Pesa phone required' });
+    const def = currentPremiumTermYear();
+    const [existingPending] = await req.db.execute(
+      "SELECT COUNT(*) AS cnt FROM premium_bulk_payments WHERE school_id = ? AND term = ? AND year = ? AND payment_status = 'pending'",
+      [req.params.id, def.term, def.year]
+    );
+    if ((existingPending[0]?.cnt || 0) > 0) {
+      return res.status(409).json({ error: 'A pending bulk payment already exists for this school/term. Wait for it to complete first.' });
+    }
+    const [activeSubs] = await req.db.execute(
+      "SELECT parent_phone FROM premium_subscriptions WHERE school_id = ? AND term = ? AND year = ? AND payment_status = 'paid' AND (expires_at IS NULL OR expires_at > NOW())",
+      [req.params.id, def.term, def.year]
+    );
+    const active = new Set((activeSubs || []).map(s => s.parent_phone));
+    const [parents] = await req.db.execute(
+      `SELECT spm.parent_phone, COUNT(s.student_id) AS child_count
+       FROM student_parent_map spm
+       JOIN students s ON spm.student_id = s.student_id AND s.school_id = ? AND s.enrollment_status = 'Active'
+       LEFT JOIN parent_profiles pp ON spm.parent_phone = pp.parent_phone
+       GROUP BY spm.parent_phone HAVING (pp.is_premium IS NULL OR pp.is_premium = 0)`,
+      [req.params.id]
+    );
+    const unpaid = (parents || []).filter(p => !active.has(p.parent_phone));
+    if (unpaid.length === 0) return res.json({ response_code: '1', message: 'No unpaid parents found' });
+    const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
+    const price = parseInt(setting[0]?.setting_value || '100');
+    const totalStudents = unpaid.reduce((sum, p) => sum + (Number(p.child_count) || 1), 0);
+    const totalAmount = unpaid.reduce((sum, p) => sum + ((Number(p.child_count) || 1) * price), 0);
+    const [result] = await req.db.execute(
+      'INSERT INTO premium_bulk_payments (school_id, term, year, amount, total_students, initiated_by_phone, payment_status) VALUES (?, ?, ?, ?, ?, ?, \'pending\')',
+      [req.params.id, def.term, def.year, totalAmount, totalStudents, phone]
+    );
+    const reference = `BLK-${result.insertId}`;
+    const keyRes = await ensureMpesaCallbackKey(req.db, req.params.id);
+    if (keyRes.error) return res.status(500).json({ error: keyRes.error });
+    const mpesa = require('../services/mpesa');
+    let stk;
+    try {
+      stk = await mpesa.stkPush(phone, totalAmount, reference, 'School premium subscription payment', { callbackKey: keyRes.key });
+    } catch (e) {
+      await req.db.execute("UPDATE premium_bulk_payments SET payment_status = 'failed' WHERE payment_id = ?", [result.insertId]);
+      return res.status(502).json({ error: e.message || 'M-Pesa STK push failed' });
+    }
+    await req.db.execute('UPDATE premium_bulk_payments SET transaction_reference = ? WHERE payment_id = ?', [reference, result.insertId]);
+    if (stk.ResponseCode === '0') {
+      await req.db.execute('UPDATE premium_bulk_payments SET checkout_request_id = ? WHERE payment_id = ?', [stk.CheckoutRequestID, result.insertId]).catch(() => {});
+      return res.json({ response_code: '0', amount: totalAmount, total_students: totalStudents, term: def.term, year: def.year, transaction_reference: reference });
+    }
+    await req.db.execute("UPDATE premium_bulk_payments SET payment_status = 'failed' WHERE payment_id = ?", [result.insertId]);
+    return res.status(502).json({ error: 'M-Pesa STK push failed', detail: stk });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 router.post('/schools', async (req, res) => {
   const { school_name, region, sales_rep_id } = req.body;
   if (!school_name) return res.status(400).json({ error: 'school_name required' });
