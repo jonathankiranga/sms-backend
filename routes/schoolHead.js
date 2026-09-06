@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { verifyToken } = require('../lib/auth');
+const { nextTeacherId } = require('../lib/ids');
 
 // Shared ID generator: prefix + base36(ms) + high-entropy base36 suffix (e.g., STU1Y8K7M2QX4Z)
 function genId(prefix) {
@@ -83,7 +84,7 @@ router.post('/:schoolId/teachers', async (req, res) => {
   if (cleanRole !== 'teacher' && cleanRole !== 'bursar') return res.status(400).json({ error: 'Invalid role. Must be teacher or bursar.' });
   if (!full_name || !phone) return res.status(400).json({ error: 'Name and phone required' });
 
-  const teacherId = genId('TCH');
+  const teacherId = await nextTeacherId(req.db);
   const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
   if (email) {
