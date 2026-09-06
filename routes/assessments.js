@@ -774,12 +774,50 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
     return res.status(404).json({ error: 'No previous term data found. Cumulative data not available.' });
   }
 
+  // Derive the per-term view: group sessions by term, average each area's
+  // session percentages within the term; overall = average of term averages.
+  const pctBySessionArea = new Map();
+  for (const a of areas) {
+    for (const [sid, pct] of Object.entries(a.sessions || {})) {
+      pctBySessionArea.set(`${sid}|${a.area_name}`, Number(pct));
+    }
+  }
+  const avg = (xs) => xs.length ? Math.round(xs.reduce((x, y) => x + y, 0) / xs.length * 10) / 10 : null;
+  const areaNames = areas.map(a => a.area_name);
+  const sessionsByTerm = new Map();
+  for (const s of sessionMeta) {
+    if (!sessionsByTerm.has(s.term)) sessionsByTerm.set(s.term, []);
+    sessionsByTerm.get(s.term).push(s);
+  }
+  const terms = Array.from(sessionsByTerm.entries())
+    .sort(([a], [b]) => String(a).localeCompare(String(b)))
+    .map(([term, sess]) => {
+      const termAreas = areaNames.map(name => ({
+        area_name: name,
+        avg_pct: avg(sess.map(s => pctBySessionArea.get(`${s.session_id}|${name}`)).filter(v => v !== undefined && v !== null && !Number.isNaN(v)))
+      }));
+      const att = attRows.find(r => r.term === term);
+      return {
+        term,
+        areas: termAreas,
+        attendance: att ? { present: Number(att.present) || 0, total: Number(att.total) || 0 } : { present: 0, total: 0 }
+      };
+    });
+  const area_summary = areaNames.map(name => ({
+    area_name: name,
+    overall_avg: avg(terms.map(t => (t.areas.find(a => a.area_name === name) || {}).avg_pct).filter(v => v !== null && v !== undefined))
+  }));
+
   res.json({
     student: student[0],
     year: reportYear,
     sessions: sessionMeta,
     areas,
-    attendance: attRows
+    attendance: attRows,
+    // Per-term view for the headteacher cumulative tab (additive — the
+    // per-session keys above are kept for existing clients).
+    terms: terms.map(t => ({ term: t.term, areas: t.areas, attendance: t.attendance })),
+    area_summary
   });
 });
 

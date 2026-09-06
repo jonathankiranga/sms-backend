@@ -77,6 +77,19 @@ router.get('/:schoolId/students', async (req, res) => {
   res.json({ students: rows });
 });
 
+// Get one student (used by the report-card header for profile fields)
+router.get('/:schoolId/students/:studentId', async (req, res) => {
+  try {
+    const [rows] = await req.db.execute(
+      `SELECT st.*, c.class_name FROM students st JOIN classes c ON st.class_id = c.class_id
+       WHERE st.school_id = ? AND st.student_id = ? LIMIT 1`,
+      [req.params.schoolId, req.params.studentId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'Student not found' });
+    res.json({ student: rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // Create a teacher or bursar (only headteacher). Creating headteachers is restricted to admin only.
 router.post('/:schoolId/teachers', async (req, res) => {
   const head = await requireHead(req, res);
