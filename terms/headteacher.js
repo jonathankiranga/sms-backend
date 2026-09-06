@@ -1,6 +1,7 @@
 // Headteacher Terms & Conditions content.
 // Single source of truth for the in-app T&C and the emailed copy.
-// Bump VERSION when the terms change so an acceptance is required again.
+// VERSION is a document label for code updates only — acceptance is
+// recorded once per headteacher and is never asked again.
 
 const TERMS = {
   version: '2026.2',
@@ -8,7 +9,7 @@ const TERMS = {
   environment: 'cbcschool.app',
   company_name: 'Smarternow Data Venture',
   product_name: 'cbcSchool App (FreeSchool Platform)',
-  support_email: 'support@cbcschool.co.ke',
+  support_email: 'jonathankiranga@gmail.com',
   sections: [
     {
       id: 'intro',
@@ -103,7 +104,7 @@ const TERMS = {
     {
       id: 'changes',
       heading: '19. Changes to These Terms',
-      body: `We may update these Terms from time to time. When the Terms change, a new version is published and headteachers will be required to accept the updated version before continued use of the Headteacher Portal. Material changes will be communicated by email to the school's registered headteacher email address.`
+      body: `These Terms may be updated from time to time; the current Terms are always available in the Headteacher Portal.`
     },
     {
       id: 'termination',

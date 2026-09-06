@@ -92,21 +92,20 @@ router.post('/verify-otp', async (req, res) => {
   await req.db.execute('UPDATE otp_sessions SET teacher_id = ? WHERE session_id = ?', [teacher[0].teacher_id, session_id]);
 
   // For headteachers, include the Terms & Conditions acceptance status so the
-  // login flow can block access until the current version is accepted.
+  // login flow can block access until the terms are accepted (once ever).
   let terms = null;
   if (teacher[0].role === 'head') {
     try {
       const { TERMS } = require('../terms/headteacher');
       await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
         teacher_id VARCHAR(40) NOT NULL,
-        version VARCHAR(20) NOT NULL,
         accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         ip_address VARCHAR(45) NULL,
-        PRIMARY KEY (teacher_id, version)
+        PRIMARY KEY (teacher_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
       const [termsRows] = await req.db.execute(
-        'SELECT version, accepted_at FROM terms_acceptance WHERE teacher_id = ? AND version = ?',
-        [teacher[0].teacher_id, TERMS.version]
+        'SELECT accepted_at FROM terms_acceptance WHERE teacher_id = ?',
+        [teacher[0].teacher_id]
       );
       terms = {
         required: true,

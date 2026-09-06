@@ -855,15 +855,14 @@ router.get('/:schoolId/terms/headteacher', async (req, res) => {
     // Ensure acceptance table exists (idempotent)
     await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
       teacher_id VARCHAR(40) NOT NULL,
-      version VARCHAR(20) NOT NULL,
       accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       ip_address VARCHAR(45) NULL,
-      PRIMARY KEY (teacher_id, version)
+      PRIMARY KEY (teacher_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
     const [accRows] = await req.db.execute(
-      'SELECT version, accepted_at FROM terms_acceptance WHERE teacher_id = ? AND version = ?',
-      [head.teacher_id, TERMS.version]
+      'SELECT accepted_at FROM terms_acceptance WHERE teacher_id = ?',
+      [head.teacher_id]
     );
 
     res.json({
@@ -881,7 +880,7 @@ router.get('/:schoolId/terms/headteacher', async (req, res) => {
 });
 
 // POST /api/school-head/:schoolId/terms/accept
-// Records acceptance of the current T&C version and emails the headteacher a copy (with CC).
+// Records the headteacher's (one-time) acceptance and emails a copy (with CC).
 router.post('/:schoolId/terms/accept', async (req, res) => {
   try {
     const head = await requireHead(req, res);
@@ -893,18 +892,17 @@ router.post('/:schoolId/terms/accept', async (req, res) => {
     // Ensure acceptance table exists (idempotent)
     await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
       teacher_id VARCHAR(40) NOT NULL,
-      version VARCHAR(20) NOT NULL,
       accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       ip_address VARCHAR(45) NULL,
-      PRIMARY KEY (teacher_id, version)
+      PRIMARY KEY (teacher_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
     // Record acceptance (idempotent — re-accepting just refreshes nothing, PK prevents dupes)
     await req.db.execute(
-      `INSERT INTO terms_acceptance (teacher_id, version, accepted_at, ip_address)
-       VALUES (?, ?, NOW(), ?)
+      `INSERT INTO terms_acceptance (teacher_id, accepted_at, ip_address)
+       VALUES (?, NOW(), ?)
        ON DUPLICATE KEY UPDATE accepted_at = accepted_at`,
-      [head.teacher_id, TERMS.version, req.ip]
+      [head.teacher_id, req.ip]
     );
 
     // Fetch headteacher + school details for the email
@@ -982,8 +980,8 @@ router.get('/:schoolId/terms/status', async (req, res) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
     const [rows] = await req.db.execute(
-      'SELECT accepted_at FROM terms_acceptance WHERE teacher_id = ? AND version = ?',
-      [head.teacher_id, TERMS.version]
+      'SELECT accepted_at FROM terms_acceptance WHERE teacher_id = ?',
+      [head.teacher_id]
     );
     res.json({ version: TERMS.version, accepted: rows.length > 0, accepted_at: rows[0]?.accepted_at || null });
   } catch (err) {
