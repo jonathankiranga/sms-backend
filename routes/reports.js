@@ -12,9 +12,10 @@ async function requireStaff(req, res) {
   if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
 
   let trows;
-  if (sess.phone) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
+  if (sess.teacher_id) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
+  if ((!trows || trows.length === 0) && sess.phone) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? LIMIT 1', [sess.phone]);
   if (!trows || trows.length === 0) {
-    if (sess.email) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ?', [sess.email]);
+    if (sess.email) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ? LIMIT 1', [sess.email]);
   }
   if (!trows || trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
   const me = trows[0];
@@ -78,9 +79,11 @@ router.get('/level-distribution', async (req, res) => {
       [...classIds]
     );
 
-    // 2) Scores: exam_results → exam_sessions filtered by class + term + year
+    // 2) Results: exam_results → exam_sessions filtered by class + term + year.
+    // CBC reports levels, never averages: collect each result's recorded
+    // level (falling back to a threshold mapping of its own percentage).
     const [scoreRows] = await req.db.execute(
-      `SELECT er.student_id, es.class_id, la.area_id, er.score, er.out_of
+      `SELECT er.student_id, es.class_id, la.area_id, er.score, er.out_of, er.performance_level
        FROM exam_results er
        JOIN exam_sessions es ON er.session_id = es.session_id
        JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
@@ -89,13 +92,28 @@ router.get('/level-distribution', async (req, res) => {
       [...classIds, term, year]
     );
 
-    // Accumulate per student per area
-    const sums = {}; // sums[student_id][area_id] = {s, o}
+    // Accumulate recorded levels per student per area
+    const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+    const dominantLevel = (levels) => {
+      if (!levels || levels.length === 0) return null;
+      return levels.reduce((best, l) => (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best);
+    };
+    const levelOfDefault = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
+    // Overall = majority of constituent levels; ties resolve to the higher level
+    const majorityLevel = (levels) => {
+      const present = (levels || []).filter(Boolean);
+      if (present.length === 0) return null;
+      const counts = {};
+      for (const l of present) counts[l] = (counts[l] || 0) + 1;
+      return Object.keys(counts).sort((a, b) => (counts[b] - counts[a]) || (levelOrder[b] - levelOrder[a]))[0];
+    };
+    const levelsByStudentArea = {}; // levelsByStudentArea[student_id][area_id] = { levels[], pcts[] }
     for (const r of scoreRows) {
-      if (!sums[r.student_id]) sums[r.student_id] = {};
-      if (!sums[r.student_id][r.area_id]) sums[r.student_id][r.area_id] = { s: 0, o: 0 };
-      sums[r.student_id][r.area_id].s += parseFloat(r.score) || 0;
-      sums[r.student_id][r.area_id].o += parseFloat(r.out_of) || 0;
+      if (!levelsByStudentArea[r.student_id]) levelsByStudentArea[r.student_id] = {};
+      if (!levelsByStudentArea[r.student_id][r.area_id]) levelsByStudentArea[r.student_id][r.area_id] = { levels: [], pcts: [] };
+      const e = levelsByStudentArea[r.student_id][r.area_id];
+      if (r.performance_level) e.levels.push(r.performance_level);
+      if (r.score != null && Number(r.out_of) > 0) e.pcts.push((Number(r.score) / Number(r.out_of)) * 100);
     }
 
     // Learning areas present in these classes (by class's level_name)
@@ -145,9 +163,7 @@ router.get('/level-distribution', async (req, res) => {
       });
     }
 
-    // Per-student aggregates
-    const levelOf = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
-
+    // Per-student aggregates (levels only — CBC has no averages, positions or ranks)
     const studentsByClass = {};
     for (const s of stuRows) studentsByClass[s.class_id] = studentsByClass[s.class_id] || [];
 
@@ -155,78 +171,44 @@ router.get('/level-distribution', async (req, res) => {
     for (const s of stuRows) {
       const areas = classToAreas[s.class_id] || [];
       const areaDetails = areas.map(a => {
-        const acc = sums[s.student_id]?.[a.area_id];
-        const avg = acc && acc.o > 0 ? Math.round(acc.s / acc.o * 1000) / 10 : null;
-        return { area_id: a.area_id, area_name: a.area_name, avg_pct: avg };
+        const acc = levelsByStudentArea[s.student_id]?.[a.area_id];
+        const level = dominantLevel(acc?.levels) || dominantLevel((acc?.pcts || []).map(levelOfDefault));
+        return { area_id: a.area_id, area_name: a.area_name, level };
       });
-      const scored = areaDetails.filter(x => x.avg_pct !== null);
-      const overall = scored.length > 0
-        ? Math.round(scored.reduce((t, x) => t + x.avg_pct, 0) / scored.length * 10) / 10
-        : null;
+      const overall = majorityLevel(areaDetails.map(x => x.level));
       studentDetails.push({
         student_id: s.student_id,
         class_id: s.class_id,
         full_name: s.full_name,
         areas: areaDetails,
-        overall_avg: overall,
-        level: overall !== null ? levelOf(overall) : null
-      });
-    }
-
-    // Rank within each class
-    for (const cid of classIds) {
-      const clsStudents = studentDetails.filter(s => s.class_id === cid);
-      clsStudents.sort((a, b) => (b.overall_avg ?? -1) - (a.overall_avg ?? -1));
-      let rank = 0, prev = null;
-      clsStudents.forEach((s, i) => {
-        if (s.overall_avg === null) { s.rank = null; return; }
-        if (s.overall_avg !== prev) { rank = i + 1; prev = s.overall_avg; }
-        s.rank = rank;
+        overall_level: overall,
+        level: overall
       });
     }
 
     // Build per-class output + school rollup
     const classOutput = classMeta.map(c => {
       const clsStudents = studentDetails.filter(s => s.class_id === c.class_id);
-      const assessed = clsStudents.filter(s => s.overall_avg !== null);
+      const assessed = clsStudents.filter(s => s.overall_level !== null);
       const levelCounts = { EE: 0, ME: 0, AE: 0, BE: 0 };
       assessed.forEach(s => { levelCounts[s.level]++; });
       const total = clsStudents.length;
-
-      // Per-area class averages
-      const areaAverages = (classToAreas[c.class_id] || []).map(a => {
-        const vals = studentDetails
-          .filter(s => s.class_id === c.class_id)
-          .map(s => s.areas.find(x => x.area_id === a.area_id)?.avg_pct)
-          .filter(v => v !== null && v !== undefined);
-        return {
-          area_id: a.area_id,
-          area_name: a.area_name,
-          class_avg: vals.length ? Math.round(vals.reduce((t, v) => t + v, 0) / vals.length * 10) / 10 : null,
-          student_count: vals.length
-        };
-      });
 
       return {
         class_id: c.class_id,
         class_name: c.class_name,
         total_students: total,
         assessed_students: assessed.length,
-        class_average: assessed.length
-          ? Math.round(assessed.reduce((t, s) => t + s.overall_avg, 0) / assessed.length * 10) / 10
-          : null,
+        overall_level: majorityLevel(assessed.map(s => s.overall_level)),
         level_counts: levelCounts,
         level_percentages: Object.fromEntries(
           Object.entries(levelCounts).map(([k, v]) => [k, total ? Math.round(v / total * 100) : 0])
-        ),
-        area_averages: areaAverages,
-        top_performers: assessed.filter(s => s.level === 'EE').slice(0, 5).map(s => ({ student_id: s.student_id, full_name: s.full_name, overall_avg: s.overall_avg })),
-        bottom_performers: assessed.filter(s => s.level === 'BE').slice(-5).reverse().map(s => ({ student_id: s.student_id, full_name: s.full_name, overall_avg: s.overall_avg }))
+        )
       };
     });
 
     // School rollup
-    const allAssessed = studentDetails.filter(s => s.overall_avg !== null);
+    const allAssessed = studentDetails.filter(s => s.overall_level !== null);
     const schoolLevelCounts = { EE: 0, ME: 0, AE: 0, BE: 0 };
     allAssessed.forEach(s => { schoolLevelCounts[s.level]++; });
     const schoolTotal = studentDetails.length;
@@ -238,9 +220,7 @@ router.get('/level-distribution', async (req, res) => {
       school: {
         total_students: schoolTotal,
         assessed_students: allAssessed.length,
-        class_average: allAssessed.length
-          ? Math.round(allAssessed.reduce((t, s) => t + s.overall_avg, 0) / allAssessed.length * 10) / 10
-          : null,
+        overall_level: majorityLevel(allAssessed.map(s => s.overall_level)),
         level_counts: schoolLevelCounts,
         level_percentages: Object.fromEntries(
           Object.entries(schoolLevelCounts).map(([k, v]) => [k, schoolTotal ? Math.round(v / schoolTotal * 100) : 0])
@@ -274,10 +254,9 @@ router.get('/strand-performance', async (req, res) => {
     if (c.length === 0) return res.status(404).json({ error: 'Class not found' });
     if (c[0].school_id !== staff.school_id) return res.status(403).json({ error: 'Class not in your school' });
 
-    // Assessment scores: assessment_results → assessments → sub_strands → strands → learning_areas
-    // strands have term; assessments have date (YEAR = year)
+    // Assessment results with recorded levels (CBC reports levels, never averages)
     const [rows] = await req.db.execute(
-      `SELECT ar.student_id, ar.score, la.area_id, la.area_name,
+      `SELECT ar.student_id, ar.score, ar.performance_level, a.max_score, la.area_id, la.area_name,
               st.strand_id, st.strand_name,
               ss.sub_strand_id, ss.sub_strand_name
        FROM assessment_results ar
@@ -289,13 +268,23 @@ router.get('/strand-performance', async (req, res) => {
       [classId, term, year]
     );
 
-    // Accumulate per student per sub-strand
-    const acc = {}; // acc[student_id][sub_strand_id] = {s, o}
+    const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+    const dominantLevel = (levels) => {
+      if (!levels || levels.length === 0) return null;
+      return levels.reduce((best, l) => (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best);
+    };
+    const levelOfDefault = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
+    const emptyCounts = () => ({ EE: 0, ME: 0, AE: 0, BE: 0, total: 0 });
+
+    // Accumulate recorded levels per student per sub-strand
+    const acc = {}; // acc[student_id][sub_strand_id] = { levels[] }
     for (const r of rows) {
       if (!acc[r.student_id]) acc[r.student_id] = {};
-      if (!acc[r.student_id][r.sub_strand_id]) acc[r.student_id][r.sub_strand_id] = { s: 0, o: 0 };
-      acc[r.student_id][r.sub_strand_id].s += parseFloat(r.score) || 0;
-      acc[r.student_id][r.sub_strand_id].o += 100; // max_score is 100 default; could fetch from assessments but schema default 100
+      if (!acc[r.student_id][r.sub_strand_id]) acc[r.student_id][r.sub_strand_id] = { levels: [] };
+      if (r.performance_level) acc[r.student_id][r.sub_strand_id].levels.push(r.performance_level);
+      else if (r.score != null && Number(r.max_score) > 0) {
+        acc[r.student_id][r.sub_strand_id].levels.push(levelOfDefault((Number(r.score) / Number(r.max_score)) * 100));
+      }
     }
 
     // Group into area → strand → sub_strand structure
@@ -318,15 +307,14 @@ router.get('/strand-performance', async (req, res) => {
       }
     }
 
-    // Per-student per-sub-strand avg
+    // Per-student per-sub-strand level (dominant of recorded levels)
     for (const [sid, subs] of Object.entries(acc)) {
       for (const [ssid, vals] of Object.entries(subs)) {
         // find which area/strand this sub_strand belongs to
         for (const area of Object.values(areaMap)) {
           for (const strand of Object.values(area.strands)) {
             if (strand.sub_strands[ssid]) {
-              const pct = vals.o > 0 ? Math.round(vals.s / vals.o * 1000) / 10 : null;
-              strand.sub_strands[ssid].students[sid] = { avg_pct: pct };
+              strand.sub_strands[ssid].students[sid] = { level: dominantLevel(vals.levels) };
             }
           }
         }
@@ -335,37 +323,52 @@ router.get('/strand-performance', async (req, res) => {
 
     const levelOf = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
 
-    // Build response hierarchy with aggregates
+    // Build response hierarchy with level aggregates (counts only, no averages)
+    const countInto = (counts, level) => { if (level) { counts[level]++; counts.total++; } };
+    // Dominant level of a counts object (ties resolve to the higher level)
+    const topLevel = (counts) => {
+      let best = null;
+      for (const l of ['EE', 'ME', 'AE', 'BE']) {
+        if (counts[l] > 0 && (!best || counts[l] > counts[best])) best = l;
+      }
+      return best;
+    };
     const areasOut = [];
     for (const area of Object.values(areaMap)) {
       const strandsOut = [];
+      const areaCounts = emptyCounts();
       for (const strand of Object.values(area.strands)) {
         const subsOut = [];
-        let strandScoreSum = 0, strandScoreCount = 0;
+        const strandCounts = emptyCounts();
         for (const sub of Object.values(strand.sub_strands)) {
-          const assessed = Object.entries(sub.students).filter(([, v]) => v.avg_pct !== null);
-          const subAvg = assessed.length
-            ? Math.round(assessed.reduce((t, [, v]) => t + v.avg_pct, 0) / assessed.length * 10) / 10
-            : null;
+          const assessed = Object.entries(sub.students).filter(([, v]) => v.level);
+          const subCounts = emptyCounts();
+          assessed.forEach(([, v]) => countInto(subCounts, v.level));
           subsOut.push({
             sub_strand_id: sub.sub_strand_id,
             sub_strand_name: sub.sub_strand_name,
-            class_avg: subAvg,
+            level: dominantLevel(assessed.map(([, v]) => v.level)),
+            counts: subCounts,
             student_count: assessed.length
           });
-          if (subAvg !== null) { strandScoreSum += subAvg; strandScoreCount++; }
+          for (const k of ['EE', 'ME', 'AE', 'BE']) strandCounts[k] += subCounts[k];
+          strandCounts.total += subCounts.total;
         }
-        const strandAvg = strandScoreCount ? Math.round(strandScoreSum / strandScoreCount * 10) / 10 : null;
         strandsOut.push({
           strand_id: strand.strand_id,
           strand_name: strand.strand_name,
-          class_avg: strandAvg,
+          level: topLevel(strandCounts),
+          counts: strandCounts,
           sub_strands: subsOut
         });
+        for (const k of ['EE', 'ME', 'AE', 'BE']) areaCounts[k] += strandCounts[k];
+        areaCounts.total += strandCounts.total;
       }
       areasOut.push({
         area_id: area.area_id,
         area_name: area.area_name,
+        level: topLevel(areaCounts),
+        counts: areaCounts,
         strands: strandsOut
       });
     }

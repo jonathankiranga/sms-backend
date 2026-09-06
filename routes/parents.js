@@ -552,57 +552,72 @@ router.get('/academic-records/:phone', wrap(async (req, res) => {
     const currentTerm = await getCurrentTerm(req.db, child.school_id);
     const currentYear = new Date().getFullYear();
 
-    // Current term — assessment results by learning area
+    // Current term — assessment results by learning area (recorded levels, never averages)
     const [currentAreas] = await req.db.execute(
-      `SELECT la.area_id, la.area_name,
-              AVG(ar.score / a.max_score) * 100 AS avg_pct
+      `SELECT la.area_id, la.area_name, ar.performance_level, ar.score, a.max_score
        FROM assessment_results ar
        JOIN assessments a ON ar.assessment_id = a.assessment_id
        JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
        JOIN strands st ON ss.strand_id = st.strand_id
        JOIN learning_areas la ON st.area_id = la.area_id
        WHERE ar.student_id = ? AND st.term = ? AND YEAR(a.date) = ?
-       GROUP BY la.area_id, la.area_name
        ORDER BY la.area_name`,
       [child.student_id, currentTerm, currentYear]
     );
 
-    // Current term — exam results by learning area
+    // Current term — exam results by learning area (recorded levels, never averages)
     const [currentExamAreas] = await req.db.execute(
-      `SELECT la.area_id, la.area_name,
-              AVG(er.score / er.out_of) * 100 AS avg_pct
+      `SELECT la.area_id, la.area_name, er.performance_level, er.score, er.out_of
        FROM exam_results er
        JOIN exam_sessions es ON er.session_id = es.session_id
        JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
        JOIN learning_areas la ON sla.area_id = la.area_id
        WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
-       GROUP BY la.area_id, la.area_name
        ORDER BY la.area_name`,
       [child.student_id, currentTerm, currentYear]
     );
 
+    const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+    const dominantLevel = (levels) => {
+      if (!levels || levels.length === 0) return null;
+      return levels.reduce((best, l) => (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best);
+    };
+    const DEFAULT_LABELS = {
+      EE: { label: 'Exceeding Expectations', color: '#2E7D32' },
+      ME: { label: 'Meeting Expectations', color: '#1565C0' },
+      AE: { label: 'Approaching Expectations', color: '#E65100' },
+      BE: { label: 'Below Expectations', color: '#C62828' }
+    };
+    const levelMeta = (code) => {
+      const found = (rubricConfig || []).find(r => r.level_code === code);
+      if (found) return { level: code, label: found.label, color: found.color };
+      const d = DEFAULT_LABELS[code] || DEFAULT_LABELS.BE;
+      return { level: code, label: d.label, color: d.color };
+    };
+    // Map one result row to its level: recorded first, else threshold-map its own percentage
+    const rowLevel = (row, score, outOf) => {
+      if (row.performance_level) return row.performance_level;
+      if (score != null && Number(outOf) > 0) {
+        const m = getLevel((Number(score) / Number(outOf)), rubricConfig);
+        if (m) return m.level_code;
+      }
+      return null;
+    };
+
     // Merge assessment + exam results
     const areaMap = new Map();
     for (const a of currentAreas) {
-      areaMap.set(a.area_name, { area_id: a.area_id, area_name: a.area_name, avg_pct: parseFloat(a.avg_pct) || 0 });
+      if (!areaMap.has(a.area_name)) areaMap.set(a.area_name, { area_id: a.area_id, area_name: a.area_name, levels: [] });
+      areaMap.get(a.area_name).levels.push(rowLevel(a, a.score, a.max_score));
     }
     for (const a of currentExamAreas) {
-      if (areaMap.has(a.area_name)) {
-        areaMap.get(a.area_name).avg_pct = Math.max(areaMap.get(a.area_name).avg_pct, parseFloat(a.avg_pct) || 0);
-      } else {
-        areaMap.set(a.area_name, { area_id: a.area_id, area_name: a.area_name, avg_pct: parseFloat(a.avg_pct) || 0 });
-      }
+      if (!areaMap.has(a.area_name)) areaMap.set(a.area_name, { area_id: a.area_id, area_name: a.area_name, levels: [] });
+      areaMap.get(a.area_name).levels.push(rowLevel(a, a.score, a.out_of));
     }
     const currentAreasList = [];
     for (const entry of areaMap.values()) {
-      const matched = getLevel(entry.avg_pct / 100, rubricConfig);
-      currentAreasList.push({
-        area_name: entry.area_name,
-        avg_pct: Math.round(entry.avg_pct * 10) / 10,
-        level: matched ? matched.level_code : 'BE',
-        label: matched ? matched.label : 'Below Expectations',
-        color: matched ? matched.color : '#C62828'
-      });
+      const code = dominantLevel((entry.levels || []).filter(Boolean)) || 'BE';
+      currentAreasList.push({ area_name: entry.area_name, ...levelMeta(code) });
     }
 
     // Archive — distinct years/terms with data (excluding current)
@@ -632,31 +647,28 @@ router.get('/academic-records/:phone', wrap(async (req, res) => {
     for (const [year, terms] of yearMap) {
       const termData = [];
       for (const term of terms) {
-        // Area averages for this archived term
+        // Area levels for this archived term (recorded levels, never averages)
         const [areas] = await req.db.execute(
-          `SELECT la.area_name,
-                  AVG(ar.score / a.max_score) * 100 AS avg_pct
+          `SELECT la.area_name, ar.performance_level, ar.score, a.max_score
            FROM assessment_results ar
            JOIN assessments a ON ar.assessment_id = a.assessment_id
            JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id
            JOIN strands st ON ss.strand_id = st.strand_id
            JOIN learning_areas la ON st.area_id = la.area_id
            WHERE ar.student_id = ? AND st.term = ? AND YEAR(a.date) = ?
-           GROUP BY la.area_name
            ORDER BY la.area_name`,
           [child.student_id, term, year]
         );
+        const byArea = new Map();
+        for (const a of areas) {
+          if (!byArea.has(a.area_name)) byArea.set(a.area_name, []);
+          byArea.get(a.area_name).push(rowLevel(a, a.score, a.max_score));
+        }
         termData.push({
           term,
-          areas: areas.map(a => {
-            const matched = getLevel((parseFloat(a.avg_pct) || 0) / 100, rubricConfig);
-            return {
-              area_name: a.area_name,
-              avg_pct: Math.round((parseFloat(a.avg_pct) || 0) * 10) / 10,
-              level: matched ? matched.level_code : 'BE',
-              label: matched ? matched.label : 'Below Expectations',
-              color: matched ? matched.color : '#C62828'
-            };
+          areas: Array.from(byArea.entries()).map(([area_name, levels]) => {
+            const code = dominantLevel(levels.filter(Boolean)) || 'BE';
+            return { area_name, ...levelMeta(code) };
           })
         });
       }

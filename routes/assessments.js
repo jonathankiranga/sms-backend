@@ -443,7 +443,6 @@ router.get('/report/:student_id/:term', async (req, res) => {
   }
 
   // Build per-area record: strand-level structure + summative list + level summary
-  // (avg_pct / strand_summary retained for backward compatibility with class reports)
   const areaMap = new Map();
   for (const r of strandRows) areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name });
   for (const r of examRows) {
@@ -466,24 +465,13 @@ router.get('/report/:student_id/:term', async (req, res) => {
         .map(sb => `${s.strand_name}:${sb.performance_level}`))
       .filter((v, i, arr) => v && arr.indexOf(v) === i)
       .join(', ');
-    // Per-area percentage (formative average) kept for compatibility
-    let scored = 0, count = 0;
-    for (const s of strands) for (const sb of s.sub_strands) {
-      if (sb.formative_score) {
-        const [sc, mx] = sb.formative_score.split('/').map(Number);
-        if (mx) { scored += (sc / mx) * 100; }
-        count++;
-      }
-    }
-    const avg_pct = count ? Math.round((scored / count) * 10) / 10 : null;
 
     return {
       area_id: areaBase.area_id,
       area_name: areaBase.area_name,
       strands,
       summative,
-      strand_summary: strand_summary || null,
-      avg_pct
+      strand_summary: strand_summary || null
     };
   });
 
@@ -721,22 +709,43 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
     [student_id, reportYear]
   );
 
-  // Per-session per-area normalized percentages for this student
+  // Per-result rows: recorded levels are the evidence (CBC reports levels,
+  // never averages). Percentages below are only a fallback mapping input.
   const [rows] = await req.db.execute(
     `SELECT es.session_id, la.area_id, la.area_name,
-            ROUND(AVG(er.score / er.out_of) * 100, 1) AS pct
+            er.performance_level, er.score, er.out_of
      FROM exam_results er
      JOIN exam_sessions es ON er.session_id = es.session_id
      JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
      JOIN learning_areas la ON sla.area_id = la.area_id
      WHERE er.student_id = ? AND es.academic_year = ?
-     GROUP BY es.session_id, la.area_id, la.area_name
      ORDER BY la.area_name`,
     [student_id, reportYear]
   );
 
-  // Shape into { sessions: [...], areas: [{ area_name, sessions: { session_id: pct } }] }
+  const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+  // Dominant level = highest achieved (matches the class-report route).
+  const dominantLevel = (levels) => {
+    if (!levels || levels.length === 0) return null;
+    return levels.reduce((best, l) => (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best);
+  };
+  const levelOfDefault = pct => pct >= 80 ? 'EE' : pct >= 60 ? 'ME' : pct >= 40 ? 'AE' : 'BE';
+
+  // Shape into per (session, area) cells: { area_id, area_name, levels[], pcts[] }
+  const cellMap = new Map();
+  for (const r of rows) {
+    const k = `${r.session_id}|${r.area_id}`;
+    if (!cellMap.has(k)) cellMap.set(k, { area_id: r.area_id, area_name: r.area_name, levels: [], pcts: [] });
+    const e = cellMap.get(k);
+    if (r.performance_level) e.levels.push(r.performance_level);
+    if (r.score != null && Number(r.out_of) > 0) e.pcts.push((Number(r.score) / Number(r.out_of)) * 100);
+  }
+  // Cell level: recorded levels win; otherwise map each fallback pct then take dominant
+  const cellLevel = (e) => dominantLevel(e.levels) || dominantLevel(e.pcts.map(levelOfDefault));
   const areaMap = new Map();
+  for (const e of cellMap.values()) {
+    if (!areaMap.has(e.area_name)) areaMap.set(e.area_name, { area_id: e.area_id, area_name: e.area_name, sessions: {} });
+  }
   const sessionMeta = sessions.map(s => ({
     session_id: s.session_id,
     label: s.exam_name || (s.exam_type + ' ' + s.term),
@@ -746,11 +755,12 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
     open_date: s.open_date,
     close_date: s.close_date
   }));
-  for (const r of rows) {
-    if (!areaMap.has(r.area_name)) {
-      areaMap.set(r.area_name, { area_name: r.area_name, area_id: r.area_id, sessions: {} });
+  const cellLevelByKey = new Map();
+  for (const [k, e] of cellMap) cellLevelByKey.set(k, cellLevel(e));
+  for (const s of sessions) {
+    for (const a of areaMap.values()) {
+      a.sessions[s.session_id] = cellLevelByKey.get(`${s.session_id}|${a.area_id}`) || null;
     }
-    areaMap.get(r.area_name).sessions[r.session_id] = r.pct;
   }
   const areas = Array.from(areaMap.values());
 
@@ -774,15 +784,7 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
     return res.status(404).json({ error: 'No previous term data found. Cumulative data not available.' });
   }
 
-  // Derive the per-term view: group sessions by term, average each area's
-  // session percentages within the term; overall = average of term averages.
-  const pctBySessionArea = new Map();
-  for (const a of areas) {
-    for (const [sid, pct] of Object.entries(a.sessions || {})) {
-      pctBySessionArea.set(`${sid}|${a.area_name}`, Number(pct));
-    }
-  }
-  const avg = (xs) => xs.length ? Math.round(xs.reduce((x, y) => x + y, 0) / xs.length * 10) / 10 : null;
+  // Derive the per-term view from cell levels (no averaging anywhere):
   const areaNames = areas.map(a => a.area_name);
   const sessionsByTerm = new Map();
   for (const s of sessionMeta) {
@@ -794,7 +796,10 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
     .map(([term, sess]) => {
       const termAreas = areaNames.map(name => ({
         area_name: name,
-        avg_pct: avg(sess.map(s => pctBySessionArea.get(`${s.session_id}|${name}`)).filter(v => v !== undefined && v !== null && !Number.isNaN(v)))
+        level: dominantLevel(sess.map(s => {
+          const a = areas.find(x => x.area_name === name);
+          return a ? a.sessions[s.session_id] : null;
+        }).filter(Boolean)) || null
       }));
       const att = attRows.find(r => r.term === term);
       return {
@@ -805,7 +810,7 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
     });
   const area_summary = areaNames.map(name => ({
     area_name: name,
-    overall_avg: avg(terms.map(t => (t.areas.find(a => a.area_name === name) || {}).avg_pct).filter(v => v !== null && v !== undefined))
+    overall_level: dominantLevel(terms.map(t => ((t.areas.find(a => a.area_name === name) || {}).level)).filter(Boolean)) || null
   }));
 
   res.json({
