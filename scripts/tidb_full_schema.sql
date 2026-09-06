@@ -67,13 +67,15 @@ CREATE TABLE IF NOT EXISTS classes (
 CREATE TABLE IF NOT EXISTS teachers (
   teacher_id      CHAR(9)      PRIMARY KEY,
   full_name       VARCHAR(100) NOT NULL,
-  phone           VARCHAR(20)  UNIQUE NOT NULL,
-  email           VARCHAR(120) UNIQUE NULL,
-  role            ENUM('teacher','head') DEFAULT 'teacher',
+  phone           VARCHAR(20)  NOT NULL,
+  email           VARCHAR(120) NULL,
+  role            ENUM('teacher','head','bursar') DEFAULT 'teacher',
   school_id       CHAR(9)      NOT NULL,
   subjects_taught JSON         NULL,
   push_subscription JSON       NULL,
   password_hash   VARCHAR(255) NULL,
+  UNIQUE KEY uq_phone_role (phone, role),
+  UNIQUE KEY uq_email_role (email, role),
   FOREIGN KEY (school_id) REFERENCES schools(school_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

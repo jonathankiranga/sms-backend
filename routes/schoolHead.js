@@ -85,11 +85,11 @@ router.post('/:schoolId/teachers', async (req, res) => {
   if (!full_name || !phone) return res.status(400).json({ error: 'Name and phone required' });
 
   const teacherId = await nextTeacherId(req.db);
-  const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [phone]);
-  if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered' });
+  const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ? AND role = ?', [phone, cleanRole]);
+  if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered for this role' });
   if (email) {
-    const [emailExisting] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ?', [email]);
-    if (emailExisting.length > 0) return res.status(409).json({ error: 'Email already registered' });
+    const [emailExisting] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ? AND role = ?', [email, cleanRole]);
+    if (emailExisting.length > 0) return res.status(409).json({ error: 'Email already registered for this role' });
   }
 
   await req.db.execute(

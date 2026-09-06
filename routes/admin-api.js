@@ -779,26 +779,11 @@ router.post('/teachers', async (req, res) => {
     if (!school_id || !full_name || !phone) return res.status(400).json({ error: 'school_id, full_name, phone required' });
     if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
     const requestedRole = role || 'teacher';
-    const [existing] = await req.db.execute('SELECT teacher_id, full_name, role, school_id FROM teachers WHERE phone = ?', [phone]);
-    if (existing.length > 0) {
-      const current = existing[0];
-      if (current.role === requestedRole) {
-        return res.status(409).json({ error: `Phone ${phone} is already registered to another teacher` });
-      }
-      // Same contact, different role: convert the existing record instead of rejecting.
-      if (email) {
-        const [emailOwner] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ? AND teacher_id != ?', [email, current.teacher_id]);
-        if (emailOwner.length > 0) return res.status(409).json({ error: `Email ${email} is already registered to another teacher` });
-      }
-      await req.db.execute(
-        'UPDATE teachers SET full_name = ?, email = ?, school_id = ?, role = ?, active = 1 WHERE teacher_id = ?',
-        [full_name, email || null, school_id, requestedRole, current.teacher_id]
-      );
-      return res.json({ teacher_id: current.teacher_id, full_name, converted: true, previous_role: current.role, role: requestedRole });
-    }
+    const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ? AND role = ?', [phone, requestedRole]);
+    if (existing.length > 0) return res.status(409).json({ error: `Phone ${phone} is already registered as ${requestedRole}` });
     if (email) {
-      const [emailOwner] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ? LIMIT 1', [email]);
-      if (emailOwner.length > 0) return res.status(409).json({ error: `Email ${email} is already registered to another teacher` });
+      const [emailOwner] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ? AND role = ? LIMIT 1', [email, requestedRole]);
+      if (emailOwner.length > 0) return res.status(409).json({ error: `Email ${email} is already registered as ${requestedRole}` });
     }
     // Teacher ID — global TCH + 6-digit sequence (fits CHAR(9))
     const teacherId = await nextTeacherId(req.db);
