@@ -125,7 +125,8 @@ CREATE TABLE IF NOT EXISTS otp_sessions (
   email      VARCHAR(120) NULL,
   code       CHAR(4)      NOT NULL,
   expires_at DATETIME     NOT NULL,
-  verified   BOOLEAN      DEFAULT FALSE
+  verified   BOOLEAN      DEFAULT FALSE,
+  teacher_id CHAR(9)      NOT NULL DEFAULT ''
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS attendance_logs (

@@ -22,20 +22,24 @@ async function requireHead(req, res) {
   if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
   const sessionId = auth.split(' ')[1];
   // Look up otp_sessions to validate the session token
-  const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [sessionId]);
+  const [srows] = await req.db.execute('SELECT phone, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ?', [sessionId]);
   if (srows.length === 0) { res.status(401).json({ error: 'Invalid session' }); return null; }
   const sess = srows[0];
   if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
-  // Resolve teacher by phone; if phone is empty (email-only login) resolve by email
+  // Resolve teacher: prefer the teacher stamped at login; fall back to the
+  // head row for this contact (older sessions predate the stamp)
   let trows;
-  if (sess.phone) {
-    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
+  if (sess.teacher_id) {
+    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
+  }
+  if ((!trows || trows.length === 0) && sess.phone) {
+    [trows] = await req.db.execute("SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? AND role = 'head' LIMIT 1", [sess.phone]);
   }
   if (!trows || trows.length === 0) {
     const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [sessionId]);
     const email = (sessRows[0] && sessRows[0].email) || null;
     if (email) {
-      [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ?', [email]);
+      [trows] = await req.db.execute("SELECT teacher_id, role, school_id FROM teachers WHERE email = ? AND role = 'head' LIMIT 1", [email]);
     }
   }
   if (!trows || trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
@@ -631,14 +635,19 @@ router.get('/:schoolId/my-classes', async (req, res) => {
   const auth = (req.headers.authorization || '').trim();
   if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing or invalid Authorization header' });
   const sessionId = auth.split(' ')[1];
-  const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [sessionId]);
+  const [srows] = await req.db.execute('SELECT phone, email, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ?', [sessionId]);
   if (srows.length === 0) return res.status(401).json({ error: 'Invalid session' });
   const sess = srows[0];
   if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) return res.status(401).json({ error: 'Session not verified or expired' });
   let trows;
-  if (sess.phone) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ?', [sess.phone]);
-  if (!trows || trows.length === 0 && sess.email) {
-    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ?', [sess.email]);
+  if (sess.teacher_id) {
+    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
+  }
+  if ((!trows || trows.length === 0) && sess.phone) {
+    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? LIMIT 1', [sess.phone]);
+  }
+  if ((!trows || trows.length === 0) && sess.email) {
+    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ? LIMIT 1', [sess.email]);
   }
   if (!trows || trows.length === 0) return res.status(404).json({ error: 'Teacher not found' });
   const me = trows[0];

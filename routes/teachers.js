@@ -4,16 +4,20 @@ const axios = require('axios');
 const router = express.Router();
 
 // Request OTP using phone or email. Teachers and headteachers may sign in with email or phone.
+// Each portal passes its own role (one door per role): teacher, head or bursar.
+const STAFF_LOGIN_ROLES = ['teacher', 'head', 'bursar'];
 router.post('/request-otp', async (req, res) => {
   const { phone, email } = req.body;
+  const role = (req.body.role || '').toLowerCase();
   if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
+  if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required (teacher, head or bursar)' });
 
-  // Find teacher by phone or email
+  // Find teacher by phone or email within the requested role
   const [teacher] = await req.db.execute(
-    'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? OR email = ? LIMIT 1',
-    [phone || '', email || '']
+    'SELECT teacher_id, school_id, role, active FROM teachers WHERE (phone = ? OR email = ?) AND role = ? LIMIT 1',
+    [phone || '', email || '', role]
   );
-  if (teacher.length === 0) return res.status(404).json({ error: 'No teacher found with that phone or email' });
+  if (teacher.length === 0) return res.status(404).json({ error: 'No staff account with that phone or email for this role' });
   if (teacher[0].active === 0) return res.status(403).json({ error: 'Your account has been deactivated. Contact your school administrator.' });
 
   const code = Math.floor(1000 + Math.random() * 9000).toString();
@@ -46,7 +50,9 @@ router.post('/request-otp', async (req, res) => {
 // Verify OTP (works for phone or email-backed sessions). Returns session_id as bearer token for 4 hours.
 router.post('/verify-otp', async (req, res) => {
   const { session_id, code } = req.body;
+  const role = (req.body.role || '').toLowerCase();
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
+  if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required (teacher, head or bursar)' });
 
   const [rows] = await req.db.execute(
     'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
@@ -69,18 +75,21 @@ router.post('/verify-otp', async (req, res) => {
   await req.db.execute('UPDATE otp_sessions SET verified = TRUE, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?', [session_id]);
 
   const phone = rows[0].phone;
-  // Try to resolve teacher by phone first; if not found, try by email mapping in otp_sessions
-  let [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE phone = ?', [phone]);
+  // Resolve the teacher within the requested role; fall back to email mapping in otp_sessions
+  let [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE phone = ? AND role = ? LIMIT 1', [phone, role]);
   if (!teacher || teacher.length === 0) {
     // If no phone mapping, try to read email from otp_sessions (migration adds email column)
     const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [session_id]);
     const email = (sessRows[0] && sessRows[0].email) ? sessRows[0].email : null;
     if (email) {
-      [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE email = ?', [email]);
+      [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE email = ? AND role = ? LIMIT 1', [email, role]);
     }
   }
 
-  if (!teacher || teacher.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (!teacher || teacher.length === 0) return res.status(404).json({ error: 'Staff account not found for this role' });
+
+  // Stamp the resolved teacher into the session so later calls resolve deterministically
+  await req.db.execute('UPDATE otp_sessions SET teacher_id = ? WHERE session_id = ?', [teacher[0].teacher_id, session_id]);
 
   // For headteachers, include the Terms & Conditions acceptance status so the
   // login flow can block access until the current version is accepted.
