@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const crypto = require('crypto');
 const { generateUniqueId, nextTeacherId } = require('../lib/ids');
 const router = express.Router();
@@ -1339,4 +1339,341 @@ router.post('/promote', async (req, res) => {
   }
 });
 
+
+// ============================================================
+// COMMISSION MANAGEMENT
+// ============================================================
+
+// Helper: calculate commission for a rep for a given term/year
+async function calcRepCommission(db, repId, term, year) {
+  const [rows] = await db.execute(
+    `SELECT
+       sc.school_id,
+       sc.school_name,
+       sr.commission_type,
+       sr.commission_value,
+       COALESCE(SUM(ps.amount), 0) AS revenue,
+       COUNT(ps.subscription_id)   AS transactions
+     FROM schools sc
+     JOIN sales_reps sr ON sc.sales_rep_id = sr.rep_id
+     LEFT JOIN premium_subscriptions ps
+            ON ps.school_id = sc.school_id
+           AND ps.payment_status = 'paid'
+           AND ps.term = ?
+           AND ps.year = ?
+     WHERE sc.sales_rep_id = ?
+     GROUP BY sc.school_id, sc.school_name, sr.commission_type, sr.commission_value`,
+    [term, year, repId]
+  );
+
+  let totalRevenue = 0;
+  let totalCommission = 0;
+  const breakdown = [];
+
+  for (const row of rows) {
+    const rev = Number(row.revenue);
+    const comm = row.commission_type === 'flat'
+      ? Number(row.commission_value) * Number(row.transactions)
+      : rev * (Number(row.commission_value) / 100);
+    totalRevenue += rev;
+    totalCommission += comm;
+    breakdown.push({
+      school_id:    row.school_id,
+      school_name:  row.school_name,
+      revenue:      rev,
+      transactions: Number(row.transactions),
+      commission:   Math.round(comm * 100) / 100
+    });
+  }
+
+  return {
+    rep_id:            repId,
+    term,
+    year,
+    revenue_base:      Math.round(totalRevenue * 100) / 100,
+    commission_amount: Math.round(totalCommission * 100) / 100,
+    breakdown
+  };
+}
+
+// GET /admin/api/commission/terms
+// Returns distinct term+year combos for which premium payments exist
+router.get('/commission/terms', async (req, res) => {
+  try {
+    const [rows] = await req.db.execute(
+      `SELECT DISTINCT term, year
+       FROM premium_subscriptions
+       WHERE payment_status = 'paid'
+       ORDER BY year DESC, term DESC`
+    );
+    res.json({ terms: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /admin/api/commission/calculate?rep_id=&term=&year=
+// Preview commission for a rep in a term (does not save)
+router.get('/commission/calculate', async (req, res) => {
+  const { rep_id, term, year } = req.query;
+  if (!rep_id || !term || !year) return res.status(400).json({ error: 'rep_id, term, year required' });
+  try {
+    const result = await calcRepCommission(req.db, rep_id, term, parseInt(year));
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /admin/api/commission/payments?rep_id=&status=&term=&year=
+router.get('/commission/payments', async (req, res) => {
+  const { rep_id, status, term, year } = req.query;
+  let sql = `SELECT cp.*, sr.full_name AS rep_name, sr.phone AS rep_phone, sr.email AS rep_email
+             FROM commission_payments cp
+             JOIN sales_reps sr ON cp.rep_id = sr.rep_id
+             WHERE 1=1`;
+  const params = [];
+  if (rep_id) { sql += ' AND cp.rep_id = ?'; params.push(rep_id); }
+  if (status) { sql += ' AND cp.payment_status = ?'; params.push(status); }
+  if (term)   { sql += ' AND cp.term = ?'; params.push(term); }
+  if (year)   { sql += ' AND cp.year = ?'; params.push(parseInt(year)); }
+  sql += ' ORDER BY cp.created_at DESC';
+  try {
+    const [rows] = await req.db.execute(sql, params);
+    res.json({ payments: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/api/commission/payments
+// Sales rep requests a commission payment for a term
+router.post('/commission/payments', async (req, res) => {
+  const { rep_id, term, year, request_notes } = req.body;
+  if (!rep_id || !term || !year) return res.status(400).json({ error: 'rep_id, term, year required' });
+
+  try {
+    // Verify rep exists
+    const [repRows] = await req.db.execute('SELECT rep_id FROM sales_reps WHERE rep_id = ?', [rep_id]);
+    if (!repRows.length) return res.status(404).json({ error: 'Sales rep not found' });
+
+    // Check for duplicate
+    const [existing] = await req.db.execute(
+      'SELECT payment_id, payment_status FROM commission_payments WHERE rep_id = ? AND term = ? AND year = ?',
+      [rep_id, term, parseInt(year)]
+    );
+    if (existing.length) {
+      return res.status(409).json({
+        error: `A payment request for ${term} ${year} already exists`,
+        existing: existing[0]
+      });
+    }
+
+    // Calculate commission
+    const calc = await calcRepCommission(req.db, rep_id, term, parseInt(year));
+
+    if (calc.commission_amount <= 0) {
+      return res.status(400).json({ error: `No commission earned for ${term} ${year}. Revenue was KSh ${calc.revenue_base}.` });
+    }
+
+    // Insert payment request
+    const [result] = await req.db.execute(
+      `INSERT INTO commission_payments (rep_id, term, year, commission_amount, revenue_base, payment_status, request_notes)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+      [rep_id, term, parseInt(year), calc.commission_amount, calc.revenue_base, request_notes || null]
+    );
+
+    // Save per-school breakdown
+    for (const row of calc.breakdown) {
+      await req.db.execute(
+        `INSERT IGNORE INTO commission_calculations
+           (rep_id, school_id, term, year, revenue_amount, commission_type, commission_value, calculated_commission)
+         SELECT ?, ?, ?, ?, ?, commission_type, commission_value, ?
+         FROM sales_reps WHERE rep_id = ?`,
+        [rep_id, row.school_id, term, parseInt(year), row.revenue, row.commission, rep_id]
+      );
+    }
+
+    // Audit log
+    await req.db.execute(
+      `INSERT INTO commission_audit_log (action_type, payment_id, rep_id, term, year, performed_by, details)
+       VALUES ('requested', ?, ?, ?, ?, ?, ?)`,
+      [result.insertId, rep_id, term, parseInt(year), rep_id,
+       JSON.stringify({ commission_amount: calc.commission_amount, revenue_base: calc.revenue_base })]
+    );
+
+    res.json({
+      payment_id:        result.insertId,
+      rep_id,
+      term,
+      year:              parseInt(year),
+      commission_amount: calc.commission_amount,
+      revenue_base:      calc.revenue_base,
+      payment_status:    'pending',
+      breakdown:         calc.breakdown
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /admin/api/commission/payments/:paymentId/approve
+router.put('/commission/payments/:paymentId/approve', async (req, res) => {
+  const { paymentId } = req.params;
+  const { approved_by, payment_reference } = req.body;
+
+  try {
+    const [rows] = await req.db.execute(
+      'SELECT * FROM commission_payments WHERE payment_id = ?', [paymentId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Payment not found' });
+    if (rows[0].payment_status !== 'pending') {
+      return res.status(409).json({ error: `Payment is already ${rows[0].payment_status}` });
+    }
+
+    await req.db.execute(
+      `UPDATE commission_payments
+         SET payment_status = 'approved', approved_by = ?, approved_at = NOW(), payment_reference = ?
+       WHERE payment_id = ?`,
+      [approved_by || 'admin', payment_reference || null, paymentId]
+    );
+
+    await req.db.execute(
+      `INSERT INTO commission_audit_log (action_type, payment_id, rep_id, term, year, performed_by, details)
+       VALUES ('approved', ?, ?, ?, ?, ?, ?)`,
+      [paymentId, rows[0].rep_id, rows[0].term, rows[0].year, approved_by || 'admin',
+       JSON.stringify({ commission_amount: rows[0].commission_amount })]
+    );
+
+    res.json({ updated: true, payment_id: parseInt(paymentId), payment_status: 'approved' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /admin/api/commission/payments/:paymentId/reject
+router.put('/commission/payments/:paymentId/reject', async (req, res) => {
+  const { paymentId } = req.params;
+  const { rejected_by, rejection_reason } = req.body;
+
+  try {
+    const [rows] = await req.db.execute(
+      'SELECT * FROM commission_payments WHERE payment_id = ?', [paymentId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Payment not found' });
+    if (rows[0].payment_status !== 'pending') {
+      return res.status(409).json({ error: `Payment is already ${rows[0].payment_status}` });
+    }
+
+    await req.db.execute(
+      `UPDATE commission_payments
+         SET payment_status = 'rejected', approved_by = ?, approved_at = NOW(), rejection_reason = ?
+       WHERE payment_id = ?`,
+      [rejected_by || 'admin', rejection_reason || null, paymentId]
+    );
+
+    await req.db.execute(
+      `INSERT INTO commission_audit_log (action_type, payment_id, rep_id, term, year, performed_by, details)
+       VALUES ('rejected', ?, ?, ?, ?, ?, ?)`,
+      [paymentId, rows[0].rep_id, rows[0].term, rows[0].year, rejected_by || 'admin',
+       JSON.stringify({ rejection_reason })]
+    );
+
+    res.json({ updated: true, payment_id: parseInt(paymentId), payment_status: 'rejected' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PUT /admin/api/commission/payments/:paymentId/mark-paid
+router.put('/commission/payments/:paymentId/mark-paid', async (req, res) => {
+  const { paymentId } = req.params;
+  const { paid_by, payment_reference } = req.body;
+
+  try {
+    const [rows] = await req.db.execute(
+      'SELECT * FROM commission_payments WHERE payment_id = ?', [paymentId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Payment not found' });
+    if (rows[0].payment_status !== 'approved') {
+      return res.status(409).json({ error: 'Only approved payments can be marked as paid' });
+    }
+
+    await req.db.execute(
+      `UPDATE commission_payments
+         SET payment_status = 'paid', paid_at = NOW(), payment_reference = COALESCE(?, payment_reference)
+       WHERE payment_id = ?`,
+      [payment_reference || null, paymentId]
+    );
+
+    await req.db.execute(
+      `INSERT INTO commission_audit_log (action_type, payment_id, rep_id, term, year, performed_by, details)
+       VALUES ('paid', ?, ?, ?, ?, ?, ?)`,
+      [paymentId, rows[0].rep_id, rows[0].term, rows[0].year, paid_by || 'admin',
+       JSON.stringify({ commission_amount: rows[0].commission_amount, payment_reference })]
+    );
+
+    res.json({ updated: true, payment_id: parseInt(paymentId), payment_status: 'paid' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /admin/api/commission/audit-log?rep_id=&payment_id=
+router.get('/commission/audit-log', async (req, res) => {
+  const { rep_id, payment_id } = req.query;
+  let sql = 'SELECT * FROM commission_audit_log WHERE 1=1';
+  const params = [];
+  if (rep_id)     { sql += ' AND rep_id = ?';     params.push(rep_id); }
+  if (payment_id) { sql += ' AND payment_id = ?'; params.push(parseInt(payment_id)); }
+  sql += ' ORDER BY created_at DESC LIMIT 200';
+  try {
+    const [rows] = await req.db.execute(sql, params);
+    res.json({ audit_log: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// FIXED: GET /admin/api/revenue/sales-reps?term=&year=
+// Now supports term/year filtering. Falls back to all-time if no params given.
+router.get('/revenue/sales-reps-by-term', async (req, res) => {
+  const { term, year } = req.query;
+  let psJoinCondition = 'ps.school_id = sc.school_id AND ps.payment_status = \'paid\'';
+  const params = [];
+  if (term && year) {
+    psJoinCondition += ' AND ps.term = ? AND ps.year = ?';
+    params.push(term, parseInt(year));
+  }
+  try {
+    const [rows] = await req.db.execute(
+      `SELECT sr.rep_id, sr.full_name, sr.phone, sr.email,
+              sr.commission_type, sr.commission_value,
+              COALESCE(SUM(ps.amount), 0) AS revenue,
+              COUNT(ps.subscription_id) AS transactions,
+              COUNT(DISTINCT sc.school_id) AS schools_count
+       FROM sales_reps sr
+       LEFT JOIN schools sc ON sc.sales_rep_id = sr.rep_id
+       LEFT JOIN premium_subscriptions ps ON ${psJoinCondition}
+       GROUP BY sr.rep_id, sr.full_name, sr.phone, sr.email, sr.commission_type, sr.commission_value
+       ORDER BY revenue DESC`,
+      params
+    );
+
+    // Compute estimated commission per rep
+    const result = rows.map(r => {
+      const rev = Number(r.revenue);
+      const commission = r.commission_type === 'flat'
+        ? Number(r.commission_value) * Number(r.transactions)
+        : rev * (Number(r.commission_value) / 100);
+      return { ...r, revenue: rev, estimated_commission: Math.round(commission * 100) / 100 };
+    });
+
+    res.json({ sales_rep_revenue: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
+
