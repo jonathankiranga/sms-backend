@@ -89,7 +89,7 @@ const TERMS = {
     {
       id: 'liability',
       heading: '16. Limitation of Liability',
-      body: `To the maximum extent permitted by law, Smarternow Data Venture shall not be liable for any indirect, incidental, special, or consequential loss arising out of or in connection with these Terms or your use of the Platform, including loss of profits, data (except where negligently caused by us), or goodwill. Our total aggregate liability arising out of or in connection with these Terms shall not exceed the amount paid by the school to us in the twelve (12) months preceding the claim — which, given the service is free to schools, is limited to the aggregate of amounts paid by parents of the school during that period relating to the school's Parent Subscription programme.`
+      body: `To the maximum extent permitted by law, Smarternow Data Venture shall not be liable for any indirect, incidental, special, or consequential loss arising out of or in connection with these Terms or your use of the Platform, including loss of profits, data (except where negligently caused by us), or goodwill. Our total aggregate liability arising out of or in connection with these Terms shall not exceed 50% of the total amount paid by the school to us in the twelve (12) months preceding the event giving rise to the claim — which, given the service is free to schools, is limited to 50% of the aggregate of amounts paid by parents of the school during that period relating to the school's Parent Subscription programme.`
     },
     {
       id: 'indemnity',
