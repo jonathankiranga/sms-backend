@@ -125,7 +125,7 @@ const TERMS = {
     {
       id: 'contact',
       heading: '23. Contact',
-      body: `Questions about these Terms may be sent to ${'{{SUPPORT_EMAIL}}'} or write to ${'{{COMPANY}}'}, Nairobi, Kenya.`
+      body: `Questions about these Terms may be sent to jonathankiranga@gmail.com or write to ${'{{COMPANY}}'}, Nairobi, Kenya.`
     }
   ]
 };
