@@ -287,7 +287,7 @@ router.get('/payments', requireSalesRepAuth, async (req, res) => {
   try {
     const [rows] = await req.db.execute(
       `SELECT payment_id, term, year, commission_amount, revenue_base,
-              payment_status, request_notes, admin_notes, payment_reference,
+              payment_status, request_notes, rejection_reason, payment_reference,
               created_at, approved_at, paid_at
        FROM commission_payments
        WHERE rep_id = ?
