@@ -45,29 +45,6 @@ router.use(async (req, res, next) => {
   if (req.bursar) next();
 });
 
-// Self-healing indexes for payment_ledger so search/pagination stay fast at scale.
-let paymentIndexesEnsured = false;
-async function ensurePaymentIndexes(db) {
-  if (paymentIndexesEnsured) return;
-  try {
-    const wanted = [
-      ['idx_pl_school_logged', 'ALTER TABLE payment_ledger ADD INDEX idx_pl_school_logged (school_id, logged_at)'],
-      ['idx_pl_student', 'ALTER TABLE payment_ledger ADD INDEX idx_pl_student (student_reference)'],
-      ['idx_pl_school_year', 'ALTER TABLE payment_ledger ADD INDEX idx_pl_school_year (school_id, academic_year)'],
-    ];
-    for (const [name, ddl] of wanted) {
-      const [rows] = await db.query(
-        "SELECT COUNT(*) AS c FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'payment_ledger' AND INDEX_NAME = ?",
-        [name]
-      );
-      if ((rows[0]?.c || 0) === 0) await db.query(ddl);
-    }
-    paymentIndexesEnsured = true;
-  } catch (e) {
-    console.error('ensurePaymentIndexes failed (non-fatal):', e.message);
-  }
-}
-
 // GET /api/bazar-pay/fee-structures/:school_id — list fee items for a school
 router.get('/fee-structures/:school_id', async (req, res) => {
   const { school_id } = req.params;
@@ -199,8 +176,6 @@ router.get('/payments', async (req, res) => {
   const { school_id, term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
   if (!school_id) return res.status(400).json({ error: 'school_id required' });
 
-  await ensurePaymentIndexes(req.db);
-
   let sql = `SELECT p.*, s.full_name AS student_name, c.class_name
              FROM payment_ledger p
              LEFT JOIN students s ON p.student_reference = s.student_id
@@ -225,11 +200,10 @@ router.get('/payments', async (req, res) => {
     sql += ')';
   }
 
-  // Count total
-  const [countResult] = await req.db.execute(
-    sql.replace(/SELECT .+ FROM payment_ledger/, 'SELECT COUNT(*) AS total FROM payment_ledger'),
-    params
-  );
+  // Count total — use a separate simple query, not string replacement
+  const countWhere = sql.substring(sql.indexOf('WHERE'));
+  const countSql = `SELECT COUNT(*) AS total FROM payment_ledger p LEFT JOIN students s ON p.student_reference = s.student_id LEFT JOIN classes c ON s.class_id = c.class_id ${countWhere}`;
+  const [countResult] = await req.db.execute(countSql, params);
   const totalRecords = Number(countResult[0]?.total || 0);
 
   const offset = (parseInt(page) - 1) * parseInt(limit);
