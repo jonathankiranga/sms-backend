@@ -576,15 +576,28 @@ router.post('/schools/:id/seed-structure', async (req, res) => {
   const [schoolRows] = await req.db.execute('SELECT school_id, school_name FROM schools WHERE school_id = ?', [schoolId]);
   if (schoolRows.length === 0) return res.status(404).json({ error: 'School not found' });
 
-  // Verify school has classes — we need level_name values to seed subjects
+  // If school has no classes with level_name, auto-create the default CBC progression
   const [classCheck] = await req.db.execute(
     'SELECT COUNT(*) AS cnt FROM classes WHERE school_id = ? AND level_name IS NOT NULL',
     [schoolId]
   );
+  let classesCreated = 0;
   if (classCheck[0].cnt === 0) {
-    return res.status(400).json({
-      error: 'No classes with level_name found for this school. Add classes first before seeding structure.'
-    });
+    const defaultLevels = ['PP1', 'PP2', 'Grade 1', 'Grade 2', 'Grade 3', 'Grade 4', 'Grade 5', 'Grade 6', 'Grade 7', 'Grade 8', 'Grade 9'];
+    for (let i = 0; i < defaultLevels.length; i++) {
+      const level = defaultLevels[i];
+      const [existing] = await req.db.execute(
+        'SELECT class_id FROM classes WHERE school_id = ? AND class_name = ? AND academic_year = ?',
+        [schoolId, level, year]
+      );
+      if (existing.length === 0) {
+        await req.db.execute(
+          'INSERT INTO classes (school_id, class_name, level_name, academic_year, class_rank) VALUES (?, ?, ?, ?, ?)',
+          [schoolId, level, level, year, i + 1]
+        );
+        classesCreated++;
+      }
+    }
   }
 
   const {
