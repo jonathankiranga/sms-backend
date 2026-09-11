@@ -14,7 +14,7 @@ async function requireBursar(req, res) {
 
   let trows;
   if (sess.teacher_id) {
-    [trows] = await req.db.execute('SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
+    [trows] = await req.db.execute("SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE teacher_id = ? AND role = 'bursar' LIMIT 1", [sess.teacher_id]);
   }
   if ((!trows || trows.length === 0) && sess.phone) {
     [trows] = await req.db.execute("SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE phone = ? AND role = 'bursar' LIMIT 1", [sess.phone]);
