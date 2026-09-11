@@ -227,10 +227,10 @@ router.get('/payments', async (req, res) => {
 
   // Count total
   const [countResult] = await req.db.execute(
-    sql.replace('p.*, s.full_name AS student_name, c.class_name', 'COUNT(*) AS total'),
+    sql.replace(/SELECT .+ FROM payment_ledger/, 'SELECT COUNT(*) AS total FROM payment_ledger'),
     params
   );
-  const totalRecords = countResult[0]?.total || 0;
+  const totalRecords = Number(countResult[0]?.total || 0);
 
   const offset = (parseInt(page) - 1) * parseInt(limit);
   sql += ' ORDER BY p.logged_at DESC LIMIT ? OFFSET ?';
