@@ -171,50 +171,56 @@ router.post('/reverse-payment', async (req, res) => {
   res.json({ success: true, message: 'Payment reversed', transaction_reference });
 });
 
-// GET /api/bazar-pay/payments — list payments with filters + full-text-ish search
+// GET /api/bazar-pay/payments — list payments with filters
 router.get('/payments', async (req, res) => {
-  const { school_id, term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
-  if (!school_id) return res.status(400).json({ error: 'school_id required' });
+  try {
+    const { school_id, term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
+    if (!school_id) return res.status(400).json({ error: 'school_id required' });
 
-  let sql = `SELECT p.*, s.full_name AS student_name, c.class_name
-             FROM payment_ledger p
-             LEFT JOIN students s ON p.student_reference = s.student_id
-             LEFT JOIN classes c ON s.class_id = c.class_id
-             WHERE p.school_id = ?`;
-  const params = [school_id];
+    const where = ['p.school_id = ?'];
+    const params = [school_id];
 
-  if (term) { sql += ' AND p.term = ?'; params.push(term); }
-  if (year) { sql += ' AND p.academic_year = ?'; params.push(year); }
-  if (method) { sql += ' AND p.payment_method = ?'; params.push(method); }
-  if (student_id) { sql += ' AND p.student_reference = ?'; params.push(student_id); }
-  if (search && String(search).trim()) {
-    const q = String(search).trim();
-    const like = `%${q}%`;
-    const numeric = parseFloat(q.replace(/,/g, ''));
-    sql += ' AND (p.transaction_reference LIKE ? OR s.full_name LIKE ? OR p.parent_phone LIKE ? OR c.class_name LIKE ?';
-    params.push(like, like, like, like);
-    if (!isNaN(numeric)) {
-      sql += ' OR p.amount = ?';
-      params.push(numeric);
+    if (term)       { where.push('p.term = ?');              params.push(term); }
+    if (year)       { where.push('p.academic_year = ?');     params.push(year); }
+    if (method)     { where.push('p.payment_method = ?');    params.push(method); }
+    if (student_id) { where.push('p.student_reference = ?'); params.push(student_id); }
+    if (search && String(search).trim()) {
+      const like = `%${String(search).trim()}%`;
+      const numeric = parseFloat(String(search).replace(/,/g, ''));
+      const searchClause = !isNaN(numeric)
+        ? '(p.transaction_reference LIKE ? OR s.full_name LIKE ? OR p.parent_phone LIKE ? OR p.amount = ?)'
+        : '(p.transaction_reference LIKE ? OR s.full_name LIKE ? OR p.parent_phone LIKE ?)';
+      where.push(searchClause);
+      params.push(like, like, like);
+      if (!isNaN(numeric)) params.push(numeric);
     }
-    sql += ')';
+
+    const whereClause = 'WHERE ' + where.join(' AND ');
+    const joins = 'FROM payment_ledger p LEFT JOIN students s ON p.student_reference = s.student_id LEFT JOIN classes c ON s.class_id = c.class_id';
+
+    const [[countRow]] = await req.db.execute(
+      `SELECT COUNT(*) AS total ${joins} ${whereClause}`,
+      params
+    );
+    const totalRecords = Number(countRow?.total || 0);
+
+    const pg = Math.max(1, parseInt(page));
+    const lim = Math.max(1, Math.min(200, parseInt(limit)));
+    const offset = (pg - 1) * lim;
+
+    const [rows] = await req.db.execute(
+      `SELECT p.*, s.full_name AS student_name, c.class_name ${joins} ${whereClause} ORDER BY p.logged_at DESC LIMIT ? OFFSET ?`,
+      [...params, lim, offset]
+    );
+
+    res.json({
+      payments: rows,
+      pagination: { page: pg, limit: lim, total: totalRecords, pages: Math.ceil(totalRecords / lim) }
+    });
+  } catch (err) {
+    console.error('[PAYMENTS]', err.message);
+    res.status(500).json({ error: err.message });
   }
-
-  // Count total — use a separate simple query, not string replacement
-  const countWhere = sql.substring(sql.indexOf('WHERE'));
-  const countSql = `SELECT COUNT(*) AS total FROM payment_ledger p LEFT JOIN students s ON p.student_reference = s.student_id LEFT JOIN classes c ON s.class_id = c.class_id ${countWhere}`;
-  const [countResult] = await req.db.execute(countSql, params);
-  const totalRecords = Number(countResult[0]?.total || 0);
-
-  const offset = (parseInt(page) - 1) * parseInt(limit);
-  sql += ' ORDER BY p.logged_at DESC LIMIT ? OFFSET ?';
-  params.push(parseInt(limit), offset);
-
-  const [rows] = await req.db.execute(sql, params);
-  res.json({
-    payments: rows,
-    pagination: { page: parseInt(page), limit: parseInt(limit), total: totalRecords, pages: Math.ceil(totalRecords / parseInt(limit)) }
-  });
 });
 
 // GET /api/bazar-pay/student-balances — all students with fee summary
