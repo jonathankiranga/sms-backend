@@ -391,8 +391,9 @@ router.get('/report/:student_id/:term', async (req, res) => {
      JOIN assessments a ON ss.sub_strand_id = a.sub_strand_id
      JOIN assessment_results r ON a.assessment_id = r.assessment_id AND r.student_id = ?
      WHERE YEAR(a.date) = ?
+       AND la.school_id = ?
      ORDER BY la.area_name, s.strand_name, ss.sub_strand_name`,
-    [term, student_id, reportYear]
+    [term, student_id, reportYear, student[0].school_id]
   );
 
   // ---- Summative: CAT / End-Term papers per learning area ----
@@ -458,13 +459,21 @@ router.get('/report/:student_id/:term', async (req, res) => {
     })) : [];
     const summative = examByArea.get(areaBase.area_id) || [];
 
-    // Recorded level summary text (e.g. "Listening and Speaking:ME, Reading:EE")
-    const strand_summary = strands
-      .flatMap(s => s.sub_strands
-        .filter(sb => sb.formative_score != null)
-        .map(sb => `${s.strand_name}:${sb.performance_level}`))
-      .filter((v, i, arr) => v && arr.indexOf(v) === i)
-      .join(', ');
+    // Recorded level summary: one entry per strand, using the dominant level across its sub-strands
+    const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+    const strandSummaryParts = strands
+      .map(s => {
+        const levels = s.sub_strands
+          .filter(sb => sb.performance_level)
+          .map(sb => sb.performance_level);
+        if (levels.length === 0) return null;
+        const dominant = levels.reduce((best, l) =>
+          (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best
+        );
+        return `${s.strand_name}:${dominant}`;
+      })
+      .filter(Boolean);
+    const strand_summary = strandSummaryParts.join(', ');
 
     return {
       area_id: areaBase.area_id,
@@ -475,11 +484,29 @@ router.get('/report/:student_id/:term', async (req, res) => {
     };
   });
 
-  const [attendance] = await req.db.execute(
-    `SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) AS present
-     FROM attendance_logs WHERE student_id = ?`,
-    [student_id]
+  // Attendance for the specific term — use school_terms dates if available, else full year
+  const [termDates] = await req.db.execute(
+    `SELECT start_date, end_date FROM school_terms
+     WHERE school_id = ? AND term_name = ? AND academic_year = ? LIMIT 1`,
+    [student[0].school_id, term, reportYear]
   );
+  let attendanceSql, attendanceParams;
+  if (termDates.length > 0) {
+    attendanceSql = `SELECT COUNT(*) AS total,
+       SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) AS present,
+       SUM(CASE WHEN status = 'Absent'  THEN 1 ELSE 0 END) AS absent
+     FROM attendance_logs
+     WHERE student_id = ? AND attendance_date BETWEEN ? AND ?`;
+    attendanceParams = [student_id, termDates[0].start_date, termDates[0].end_date];
+  } else {
+    attendanceSql = `SELECT COUNT(*) AS total,
+       SUM(CASE WHEN status = 'Present' THEN 1 ELSE 0 END) AS present,
+       SUM(CASE WHEN status = 'Absent'  THEN 1 ELSE 0 END) AS absent
+     FROM attendance_logs
+     WHERE student_id = ? AND YEAR(attendance_date) = ?`;
+    attendanceParams = [student_id, reportYear];
+  }
+  const [attendance] = await req.db.execute(attendanceSql, attendanceParams);
 
   const [reportSettings] = await req.db.execute(
     `SELECT template_name, show_teacher_name, show_teacher_signature, show_final_remarks, show_recommendation,
@@ -766,19 +793,46 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
 
   // Attendance totals per term (derived from date since attendance_logs has no term column;
   // Kenya calendar: Term 1 Jan-Apr, Term 2 May-Aug, Term 3 Sep-Dec)
-  const [attRows] = await req.db.execute(
-    `SELECT CASE
-              WHEN MONTH(a.attendance_date) IN (1,2,3,4) THEN 'Term 1'
-              WHEN MONTH(a.attendance_date) IN (5,6,7,8) THEN 'Term 2'
-              ELSE 'Term 3'
-            END AS term,
-            COUNT(*) AS total,
-            SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) AS present
-     FROM attendance_logs a
-     WHERE a.student_id = ? AND YEAR(a.attendance_date) = ?
-     GROUP BY term`,
-    [student_id, reportYear]
+  // Use school_terms to map attendance dates to correct terms
+  const [schoolTerms] = await req.db.execute(
+    `SELECT term_name, start_date, end_date FROM school_terms
+     WHERE school_id = ? AND academic_year = ? ORDER BY start_date`,
+    [student[0].school_id, reportYear]
   );
+
+  let attRows;
+  if (schoolTerms.length > 0) {
+    // Build per-term attendance using actual school term date ranges
+    const termCases = schoolTerms.map(t =>
+      `WHEN a.attendance_date BETWEEN '${t.start_date}' AND '${t.end_date}' THEN '${t.term_name}'`
+    ).join(' ');
+    const [attResult] = await req.db.execute(
+      `SELECT CASE ${termCases} ELSE 'Other' END AS term,
+              COUNT(*) AS total,
+              SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) AS present
+       FROM attendance_logs a
+       WHERE a.student_id = ? AND YEAR(a.attendance_date) = ?
+       GROUP BY term`,
+      [student_id, reportYear]
+    );
+    attRows = attResult.filter(r => r.term !== 'Other');
+  } else {
+    // Fallback: Kenyan standard calendar
+    const [attResult] = await req.db.execute(
+      `SELECT CASE
+                WHEN MONTH(a.attendance_date) IN (1,2,3,4) THEN 'Term 1'
+                WHEN MONTH(a.attendance_date) IN (5,6,7,8) THEN 'Term 2'
+                ELSE 'Term 3'
+              END AS term,
+              COUNT(*) AS total,
+              SUM(CASE WHEN a.status = 'Present' THEN 1 ELSE 0 END) AS present
+       FROM attendance_logs a
+       WHERE a.student_id = ? AND YEAR(a.attendance_date) = ?
+       GROUP BY term`,
+      [student_id, reportYear]
+    );
+    attRows = attResult;
+  }
 
   if (sessions.length === 0 && areas.length === 0) {
     return res.status(404).json({ error: 'No previous term data found. Cumulative data not available.' });

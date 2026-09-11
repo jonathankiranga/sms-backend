@@ -127,19 +127,6 @@ router.get('/level-distribution', async (req, res) => {
 
     // Normalize level key for matching
     const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const classAreaMap = {};
-    for (const r of clsAreas) {
-      if (!classAreaMap[r.class_id]) classAreaMap[r.class_id] = [];
-      let k = norm(r.level_name);
-      if (k === 'preprimary') k = 'pp2';
-      // Include area if its level_name matches class's normalized level key
-      const laNorm = norm(r.area_name); // wait — learning_areas.level_name
-      // Actually we need to filter by learning_areas.level_name matching class's level
-      // Let's just pull areas per class level properly
-    }
-
-    // Simpler: for each class, find its level, then get areas for that level
-    // We'll do it in JS after fetching
     const [allAreas] = await req.db.execute(
       'SELECT area_id, area_name, level_name FROM learning_areas WHERE school_id = ?',
       [staff.school_id]
@@ -147,7 +134,7 @@ router.get('/level-distribution', async (req, res) => {
 
     // Class metadata
     const [classMeta] = await req.db.execute(
-      'SELECT class_id, class_name, level_name FROM classes WHERE class_id IN (${ph})'.replace('${ph}', ph),
+      `SELECT class_id, class_name, level_name FROM classes WHERE class_id IN (${ph})`,
       [...classIds]
     );
 
