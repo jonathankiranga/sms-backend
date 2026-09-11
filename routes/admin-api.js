@@ -4,15 +4,12 @@ const { generateUniqueId, nextTeacherId } = require('../lib/ids');
 const router = express.Router();
 
 function genId(prefix) {
-  let entropy = crypto.randomBytes(6).toString('hex');
-  let n = BigInt('0x' + entropy);
-  let b36 = '';
-  while (n > 0n) {
-    b36 = '0123456789abcdefghijklmnopqrstuvwxyz'[Number(n % 36n)] + b36;
-    n = n / 36n;
-  }
-  const ts = Date.now().toString(36);
-  return `${prefix}${ts}${b36.padStart(9, '0')}`.toUpperCase();
+  // Generates a short unique ID that fits within VARCHAR(20).
+  // Format: PREFIX + 6-char timestamp (base36) + 6-char random (base36) = prefix + 12 chars max.
+  // REP + 12 = 15 chars, well within VARCHAR(20).
+  const ts = (Date.now() % (36 ** 6)) .toString(36).padStart(6, '0');
+  const rand = Math.floor(Math.random() * (36 ** 6)).toString(36).padStart(6, '0');
+  return `${prefix}${ts}${rand}`.toUpperCase().slice(0, 20);
 }
 
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
