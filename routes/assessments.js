@@ -370,125 +370,37 @@ router.get('/report/:student_id/:term', async (req, res) => {
     return res.status(402).json({ error: 'An active subscription is required to download report cards.' });
   }
 
+  // Extended student profile for KNEC report card
   const [student] = await req.db.execute(
-    `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+    `SELECT s.student_id, s.full_name, c.class_name, c.class_id, s.school_id,
+            s.gender, s.date_of_birth, s.admission_number, s.guardian_name, s.guardian_phone
      FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.student_id = ?`,
     [student_id]
   );
   if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
 
-  // ---- Formative: strand -> sub-strand scores + recorded competency levels ----
-  // KNEC CBC report presents per-strand (and sub-strand) competency levels with the
-  // formative and summative scores. We keep the recorded performance_level as-is.
-  const [strandRows] = await req.db.execute(
-    `SELECT la.area_id, la.area_name,
-            s.strand_id, s.strand_name,
-            ss.sub_strand_id, ss.sub_strand_name,
-            r.score, a.max_score, r.performance_level
-     FROM learning_areas la
-     JOIN strands s ON la.area_id = s.area_id AND s.term = ?
-     JOIN sub_strands ss ON s.strand_id = ss.strand_id
-     JOIN assessments a ON ss.sub_strand_id = a.sub_strand_id
-     JOIN assessment_results r ON a.assessment_id = r.assessment_id AND r.student_id = ?
-     WHERE YEAR(a.date) = ?
-       AND la.school_id = ?
-     ORDER BY la.area_name, s.strand_name, ss.sub_strand_name`,
-    [term, student_id, reportYear, student[0].school_id]
+  const schoolId = student[0].school_id;
+
+  // ---- School info (including region for KNEC county field) ----
+  const [schoolInfo] = await req.db.execute(
+    'SELECT school_id, school_name, contact_name, contact_phone, contact_email, contact_address, contact_website, region FROM schools WHERE school_id = ?',
+    [schoolId]
   );
 
-  // ---- Summative: CAT / End-Term papers per learning area ----
-  const [examRows] = await req.db.execute(
-    `SELECT la.area_id, la.area_name,
-            es.session_id, es.exam_type, es.exam_name,
-            sla.sub_area_name, er.score, er.out_of, er.performance_level
-     FROM exam_results er
-     JOIN exam_sessions es ON er.session_id = es.session_id
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     JOIN learning_areas la ON sla.area_id = la.area_id
-     WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
-     ORDER BY la.area_name, es.open_date, es.session_id, sla.display_order`,
-    [student_id, term, reportYear]
+  // ---- Next term opening date ----
+  const [nextTermRows] = await req.db.execute(
+    `SELECT start_date FROM school_terms
+     WHERE school_id = ? AND academic_year = ? AND start_date > CURDATE()
+     ORDER BY start_date ASC LIMIT 1`,
+    [schoolId, reportYear]
   );
+  const next_term_start = nextTermRows.length > 0 ? nextTermRows[0].start_date : null;
 
-  // Group formative rows into learning areas -> strands -> sub-strands
-  const strandMap = new Map(); // area_id -> { area_id, area_name, strands: Map }
-  for (const r of strandRows) {
-    let area = strandMap.get(r.area_id);
-    if (!area) {
-      area = { area_id: r.area_id, area_name: r.area_name, strands: new Map() };
-      strandMap.set(r.area_id, area);
-    }
-    let st = area.strands.get(r.strand_id);
-    if (!st) {
-      st = { strand_id: r.strand_id, strand_name: r.strand_name, sub_strands: [] };
-      area.strands.set(r.strand_id, st);
-    }
-    st.sub_strands.push({
-      sub_strand_name: r.sub_strand_name,
-      formative_score: r.score != null ? `${Number(r.score)}/${Number(r.max_score)}` : null,
-      performance_level: r.performance_level || null
-    });
-  }
-
-  // Group summative rows per area
-  const examByArea = new Map(); // area_id -> [ {exam_type, exam_name, sub_area_name, score, out_of, level} ]
-  for (const r of examRows) {
-    if (!examByArea.has(r.area_id)) examByArea.set(r.area_id, []);
-    examByArea.get(r.area_id).push({
-      exam_type: r.exam_type,
-      exam_name: r.exam_name,
-      sub_area_name: r.sub_area_name,
-      summative_score: `${Number(r.score)}/${Number(r.out_of)}`,
-      performance_level: r.performance_level || null
-    });
-  }
-
-  // Build per-area record: strand-level structure + summative list + level summary
-  const areaMap = new Map();
-  for (const r of strandRows) areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name });
-  for (const r of examRows) {
-    if (!areaMap.has(r.area_id)) areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name });
-  }
-
-  const areas = Array.from(areaMap.values()).sort((a, b) => a.area_name.localeCompare(b.area_name)).map(areaBase => {
-    const strandArea = strandMap.get(areaBase.area_id);
-    const strands = strandArea ? Array.from(strandArea.strands.values()).map(s => ({
-      strand_id: s.strand_id,
-      strand_name: s.strand_name,
-      sub_strands: s.sub_strands
-    })) : [];
-    const summative = examByArea.get(areaBase.area_id) || [];
-
-    // Recorded level summary: one entry per strand, using the dominant level across its sub-strands
-    const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
-    const strandSummaryParts = strands
-      .map(s => {
-        const levels = s.sub_strands
-          .filter(sb => sb.performance_level)
-          .map(sb => sb.performance_level);
-        if (levels.length === 0) return null;
-        const dominant = levels.reduce((best, l) =>
-          (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best
-        );
-        return `${s.strand_name}:${dominant}`;
-      })
-      .filter(Boolean);
-    const strand_summary = strandSummaryParts.join(', ');
-
-    return {
-      area_id: areaBase.area_id,
-      area_name: areaBase.area_name,
-      strands,
-      summative,
-      strand_summary: strand_summary || null
-    };
-  });
-
-  // Attendance for the specific term — use school_terms dates if available, else full year
+  // ---- Attendance for the specific term — use school_terms dates if available ----
   const [termDates] = await req.db.execute(
     `SELECT start_date, end_date FROM school_terms
      WHERE school_id = ? AND term_name = ? AND academic_year = ? LIMIT 1`,
-    [student[0].school_id, term, reportYear]
+    [schoolId, term, reportYear]
   );
   let attendanceSql, attendanceParams;
   if (termDates.length > 0) {
@@ -512,7 +424,7 @@ router.get('/report/:student_id/:term', async (req, res) => {
     `SELECT template_name, show_teacher_name, show_teacher_signature, show_final_remarks, show_recommendation,
             teacher_name, teacher_signature, final_remarks, recommendation_text, layout_json
      FROM school_report_settings WHERE school_id = ?`,
-    [student[0].school_id]
+    [schoolId]
   );
 
   const settings = reportSettings[0] || {
@@ -528,18 +440,194 @@ router.get('/report/:student_id/:term', async (req, res) => {
     layout_json: null
   };
 
-  const [schoolInfo] = await req.db.execute(
-    'SELECT school_id, school_name, contact_name, contact_phone, contact_email, contact_address, contact_website FROM schools WHERE school_id = ?',
-    [student[0].school_id]
+  // ---- Backward-compatible areas (old strands/summative format) ----
+  const [strandRows] = await req.db.execute(
+    `SELECT la.area_id, la.area_name,
+            s.strand_id, s.strand_name,
+            ss.sub_strand_id, ss.sub_strand_name,
+            r.score, a.max_score, r.performance_level
+     FROM learning_areas la
+     JOIN strands s ON la.area_id = s.area_id AND s.term = ?
+     JOIN sub_strands ss ON s.strand_id = ss.strand_id
+     JOIN assessments a ON ss.sub_strand_id = a.sub_strand_id
+     JOIN assessment_results r ON a.assessment_id = r.assessment_id AND r.student_id = ?
+     WHERE YEAR(a.date) = ?
+       AND la.school_id = ?
+     ORDER BY la.area_name, s.strand_name, ss.sub_strand_name`,
+    [term, student_id, reportYear, schoolId]
   );
 
+  const [examRows] = await req.db.execute(
+    `SELECT la.area_id, la.area_name,
+            es.session_id, es.exam_type, es.exam_name,
+            sla.sub_area_name, er.score, er.out_of, er.performance_level
+     FROM exam_results er
+     JOIN exam_sessions es ON er.session_id = es.session_id
+     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
+     JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
+     ORDER BY la.area_name, es.open_date, es.session_id, sla.display_order`,
+    [student_id, term, reportYear]
+  );
+
+  const strandMap = new Map();
+  for (const r of strandRows) {
+    let area = strandMap.get(r.area_id);
+    if (!area) { area = { area_id: r.area_id, area_name: r.area_name, strands: new Map() }; strandMap.set(r.area_id, area); }
+    let st = area.strands.get(r.strand_id);
+    if (!st) { st = { strand_id: r.strand_id, strand_name: r.strand_name, sub_strands: [] }; area.strands.set(r.strand_id, st); }
+    st.sub_strands.push({
+      sub_strand_name: r.sub_strand_name,
+      formative_score: r.score != null ? `${Number(r.score)}/${Number(r.max_score)}` : null,
+      performance_level: r.performance_level || null
+    });
+  }
+  const examByArea = new Map();
+  for (const r of examRows) {
+    if (!examByArea.has(r.area_id)) examByArea.set(r.area_id, []);
+    examByArea.get(r.area_id).push({
+      exam_type: r.exam_type, exam_name: r.exam_name, sub_area_name: r.sub_area_name,
+      summative_score: `${Number(r.score)}/${Number(r.out_of)}`, performance_level: r.performance_level || null
+    });
+  }
+  const areaMapOld = new Map();
+  for (const r of strandRows) areaMapOld.set(r.area_id, { area_id: r.area_id, area_name: r.area_name });
+  for (const r of examRows) { if (!areaMapOld.has(r.area_id)) areaMapOld.set(r.area_id, { area_id: r.area_id, area_name: r.area_name }); }
+  const levelOrder = { EE: 4, ME: 3, AE: 2, BE: 1 };
+  const dominantLevelFn = (levels) => {
+    if (!levels || levels.length === 0) return null;
+    return levels.reduce((best, l) => (levelOrder[l] || 0) > (levelOrder[best] || 0) ? l : best);
+  };
+  const areas = Array.from(areaMapOld.values()).sort((a, b) => a.area_name.localeCompare(b.area_name)).map(areaBase => {
+    const strandArea = strandMap.get(areaBase.area_id);
+    const strands = strandArea ? Array.from(strandArea.strands.values()).map(s => ({
+      strand_id: s.strand_id, strand_name: s.strand_name, sub_strands: s.sub_strands
+    })) : [];
+    const summative = examByArea.get(areaBase.area_id) || [];
+    const strandSummaryParts = strands.map(s => {
+      const levels = s.sub_strands.filter(sb => sb.performance_level).map(sb => sb.performance_level);
+      if (levels.length === 0) return null;
+      return `${s.strand_name}:${dominantLevelFn(levels)}`;
+    }).filter(Boolean);
+    return { area_id: areaBase.area_id, area_name: areaBase.area_name, strands, summative, strand_summary: strandSummaryParts.join(', ') || null };
+  });
+
+  // ---- KNEC learning_areas: sessions x sub_areas grid ----
+  // All exam sessions for this student's class in this term/year, ordered by open_date
+  const [sessionRows] = await req.db.execute(
+    `SELECT es.session_id, es.exam_name, es.exam_type, es.open_date
+     FROM exam_sessions es
+     WHERE es.class_id = ? AND es.term = ? AND es.academic_year = ?
+     ORDER BY es.open_date ASC, es.session_id ASC`,
+    [student[0].class_id, term, reportYear]
+  );
+
+  // All sub_learning_areas for this school, with their area info
+  const [subAreaRows] = await req.db.execute(
+    `SELECT sla.sub_area_id, sla.sub_area_name, sla.area_id, sla.display_order,
+            la.area_name
+     FROM sub_learning_areas sla
+     JOIN learning_areas la ON sla.area_id = la.area_id
+     WHERE la.school_id = ?
+     ORDER BY la.area_name, sla.display_order, sla.sub_area_name`,
+    [schoolId]
+  );
+
+  // All exam results for these sessions for this student
+  let knecResultRows = [];
+  if (sessionRows.length > 0) {
+    const sessionIds = sessionRows.map(s => s.session_id);
+    const placeholders = sessionIds.map(() => '?').join(',');
+    const [kr] = await req.db.execute(
+      `SELECT er.session_id, er.sub_area_id, er.score, er.out_of, er.performance_level
+       FROM exam_results er
+       WHERE er.student_id = ? AND er.session_id IN (${placeholders})`,
+      [student_id, ...sessionIds]
+    );
+    knecResultRows = kr;
+  }
+
+  // Index results: resultsBySubArea[sub_area_id][session_id] = { score, out_of, performance_level }
+  const resultsBySubArea = {};
+  for (const r of knecResultRows) {
+    if (!resultsBySubArea[r.sub_area_id]) resultsBySubArea[r.sub_area_id] = {};
+    resultsBySubArea[r.sub_area_id][r.session_id] = {
+      score: r.score,
+      out_of: r.out_of,
+      performance_level: r.performance_level || null
+    };
+  }
+
+  // Group sub_areas by area
+  const knecAreaMap = new Map(); // area_id -> { area_id, area_name, sub_areas: [] }
+  for (const sa of subAreaRows) {
+    if (!knecAreaMap.has(sa.area_id)) {
+      knecAreaMap.set(sa.area_id, { area_id: sa.area_id, area_name: sa.area_name, sub_areas: [] });
+    }
+    const subAreaResults = resultsBySubArea[sa.sub_area_id] || {};
+    // Build results keyed by session_id
+    const results = {};
+    const subAreaLevels = [];
+    for (const sess of sessionRows) {
+      const r = subAreaResults[sess.session_id];
+      if (r) {
+        results[sess.session_id] = {
+          score: r.score != null ? Number(r.score) : null,
+          out_of: r.out_of != null ? Number(r.out_of) : null,
+          performance_level: r.performance_level || null
+        };
+        if (r.performance_level) subAreaLevels.push(r.performance_level);
+      }
+    }
+    const overall_level = dominantLevelFn(subAreaLevels);
+    knecAreaMap.get(sa.area_id).sub_areas.push({
+      sub_area_id: sa.sub_area_id,
+      sub_area_name: sa.sub_area_name,
+      results,
+      overall_level
+    });
+  }
+
+  // Build final learning_areas array
+  const learning_areas = Array.from(knecAreaMap.values()).sort((a, b) => a.area_name.localeCompare(b.area_name)).map(area => {
+    const allSubAreaLevels = area.sub_areas.map(sa => sa.overall_level).filter(Boolean);
+    const area_overall_level = dominantLevelFn(allSubAreaLevels);
+    return {
+      area_id: area.area_id,
+      area_name: area.area_name,
+      sessions: sessionRows.map(s => ({
+        session_id: s.session_id,
+        exam_name: s.exam_name,
+        exam_type: s.exam_type,
+        open_date: s.open_date
+      })),
+      sub_areas: area.sub_areas,
+      overall_level: area_overall_level,
+      remarks: ''
+    };
+  });
+
   res.json({
-    student: student[0],
+    student: {
+      student_id: student[0].student_id,
+      full_name: student[0].full_name,
+      class_name: student[0].class_name,
+      school_id: student[0].school_id,
+      gender: student[0].gender || null,
+      date_of_birth: student[0].date_of_birth || null,
+      admission_number: student[0].admission_number || null,
+      guardian_name: student[0].guardian_name || null,
+      guardian_phone: student[0].guardian_phone || null
+    },
     term,
     year: reportYear,
-    areas,
+    school: schoolInfo[0] || null,
+    next_term_start: next_term_start ? (next_term_start instanceof Date ? next_term_start.toISOString().split('T')[0] : String(next_term_start).split('T')[0]) : null,
     attendance: attendance[0],
     report_settings: settings,
+    learning_areas,
+    // Backward-compatible fields for cumulative report and legacy clients
+    areas,
     school_contact: schoolInfo[0] || null
   });
 });
