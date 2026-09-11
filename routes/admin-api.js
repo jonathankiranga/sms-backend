@@ -998,20 +998,31 @@ router.post('/sales-reps', async (req, res) => {
   const type = commission_type === 'flat' ? 'flat' : 'percent';
   const value = Math.max(0, parseFloat(commission_value) || 0);
   const repId = genId('REP');
-  await req.db.execute(
-    'INSERT INTO sales_reps (rep_id, full_name, phone, email, commission_type, commission_value) VALUES (?, ?, ?, ?, ?, ?)',
-    [repId, full_name, phone || null, email || null, type, value]);
-  res.json({ rep_id: repId, full_name, commission_type: type, commission_value: value });
+  try {
+    await req.db.execute(
+      'INSERT INTO sales_reps (rep_id, full_name, phone, email, commission_type, commission_value) VALUES (?, ?, ?, ?, ?, ?)',
+      [repId, full_name, phone || null, email || null, type, value]);
+    res.json({ rep_id: repId, full_name, commission_type: type, commission_value: value });
+  } catch (err) {
+    console.error('[CREATE SALES REP]', err.message);
+    if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'A sales rep with that phone or email already exists' });
+    res.status(500).json({ error: err.message });
+  }
 });
 
 router.put('/sales-reps/:repId', async (req, res) => {
   const { full_name, phone, email, commission_type, commission_value } = req.body;
   const type = commission_type === 'flat' ? 'flat' : 'percent';
   const value = Math.max(0, parseFloat(commission_value) || 0);
-  await req.db.execute(
-    'UPDATE sales_reps SET full_name = COALESCE(?, full_name), phone = COALESCE(?, phone), email = COALESCE(?, email), commission_type = ?, commission_value = ? WHERE rep_id = ?',
-    [full_name || null, phone || null, email || null, type, value, req.params.repId]);
-  res.json({ updated: true, rep_id: req.params.repId });
+  try {
+    await req.db.execute(
+      'UPDATE sales_reps SET full_name = COALESCE(?, full_name), phone = COALESCE(?, phone), email = COALESCE(?, email), commission_type = ?, commission_value = ? WHERE rep_id = ?',
+      [full_name || null, phone || null, email || null, type, value, req.params.repId]);
+    res.json({ updated: true, rep_id: req.params.repId });
+  } catch (err) {
+    console.error('[UPDATE SALES REP]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 router.delete('/sales-reps/:repId', async (req, res) => {
