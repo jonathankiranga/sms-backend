@@ -248,25 +248,29 @@ router.get('/student-balances', async (req, res) => {
   const { school_id, term, year, class_id } = req.query;
   if (!school_id || !term || !year) return res.status(400).json({ error: 'school_id, term, year required' });
 
-  let studentSql = 'SELECT s.student_id, s.full_name, c.class_name, c.class_id FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ? AND s.enrollment_status = ?';
-  const studentParams = [school_id, 'Active'];
+  const statusFilter = req.query.status || 'Active';
+  let studentSql = 'SELECT s.student_id, s.full_name, s.enrollment_status, c.class_name, c.class_id FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ?';
+  const studentParams = [school_id];
+  if (statusFilter !== 'all') { studentSql += ' AND s.enrollment_status = ?'; studentParams.push(statusFilter); }
   if (class_id) { studentSql += ' AND s.class_id = ?'; studentParams.push(class_id); }
-  studentSql += ' ORDER BY c.class_name, s.full_name';
+  studentSql += ' ORDER BY s.enrollment_status, c.class_name, s.full_name';
   const [students] = await req.db.execute(studentSql, studentParams);
 
   // Get total fee amounts per student
-  const [feeTotals] = await req.db.execute(
-    `SELECT s.student_id,
+  const feeTotalsSql = `SELECT s.student_id,
        COALESCE(SUM(CASE WHEN fa.waived = FALSE THEN COALESCE(fa.adjusted_amount, f.amount) ELSE 0 END), 0) AS total_due
      FROM students s
      JOIN fee_structures f ON f.school_id = s.school_id AND f.term = ? AND f.academic_year = ?
      LEFT JOIN fee_assignments fa ON fa.fee_id = f.fee_id
        AND (fa.student_id = s.student_id OR fa.class_id = s.class_id)
-     WHERE s.school_id = ? AND s.enrollment_status = ?
+     WHERE s.school_id = ?
+       ${statusFilter !== 'all' ? 'AND s.enrollment_status = ?' : ''}
        AND (f.is_optional = FALSE OR fa.assignment_id IS NOT NULL)
-     GROUP BY s.student_id`,
-    [term, year, school_id, 'Active']
-  );
+     GROUP BY s.student_id`;
+  const feeTotalsParams = statusFilter !== 'all'
+    ? [term, year, school_id, statusFilter]
+    : [term, year, school_id];
+  const [feeTotals] = await req.db.execute(feeTotalsSql, feeTotalsParams);
   const dueMap = {};
   feeTotals.forEach(f => { dueMap[f.student_id] = parseFloat(f.total_due); });
 
@@ -287,6 +291,7 @@ router.get('/student-balances', async (req, res) => {
     return {
       student_id: s.student_id,
       full_name: s.full_name,
+      enrollment_status: s.enrollment_status,
       class_name: s.class_name,
       class_id: s.class_id,
       total_due: due,
