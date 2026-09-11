@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 const cors = require('cors');
@@ -24,6 +24,7 @@ const competencyRoutes = require('./routes/competencies');
 const bazarPayRoutes = require('./routes/bazarPay');
 const examSessionRoutes = require('./routes/examSessions');
 const reportsRoutes = require('./routes/reports');
+const salesRepRoutes = require('./routes/salesRep');
 
 process.on('uncaughtException', (err) => {
   console.error('[CRASH-GUARD] uncaughtException:', err);
@@ -36,7 +37,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 const app = express();
-const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,https://headteacher-frontend.vercel.app,https://admin.smarternowapps.co.ke,https://bazar.smarternowapps.co.ke,https://teacher.smarternowapps.co.ke,https://principle.smarternowapps.co.ke,https://parent.smarternowapps.co.ke,http://localhost:5173,http://localhost:3000';
+const defaultOrigins = 'https://teacher-frontend.vercel.app,https://parent-frontend.vercel.app,https://headteacher-frontend.vercel.app,https://admin.smarternowapps.co.ke,https://bazar.smarternowapps.co.ke,https://teacher.smarternowapps.co.ke,https://principle.smarternowapps.co.ke,https://parent.smarternowapps.co.ke,https://salesrep.smarternowapps.co.ke,http://localhost:5173,http://localhost:3000';
 const configuredOrigins = (process.env.CORS_ORIGIN || '').split(',').map(o => o.trim()).filter(Boolean);
 const allowedOrigins = [...new Set([...configuredOrigins, ...defaultOrigins.split(',')])];
 
@@ -178,6 +179,7 @@ app.use('/api/teachers/request-otp', otpLimiter);
 app.use('/api/parents/request-otp', otpLimiter);
 app.use('/api/merchants/request-otp', otpLimiter);
 app.use('/api/merchants/register', otpLimiter);
+app.use('/api/sales-rep/request-otp', otpLimiter);
 
 // Reusable auth middleware — verifies Bearer token from OTP session
 async function authenticate(req, res, next) {
@@ -494,6 +496,7 @@ app.use('/api/competencies', competencyRoutes);
 app.use('/api/bazar-pay', bazarPayRoutes);
 app.use('/api/exam-sessions', examSessionRoutes);
 app.use('/api/reports', reportsRoutes);
+app.use('/api/sales-rep', salesRepRoutes);
 
 // /health — instant liveness check. Responds immediately so Render wake-up
 // detection works without waiting for a DB round-trip. Frontends poll this
