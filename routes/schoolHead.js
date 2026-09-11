@@ -269,7 +269,7 @@ router.put('/:schoolId/students/:studentId', async (req, res) => {
   const head = await requireHead(req, res);
   if (!head) return;
 
-  const { full_name, class_id, gender, date_of_birth, admission_number, admission_date,
+  const { full_name, class_id, gender, date_of_birth, admission_number, nemis_number, admission_date,
           guardian_name, guardian_phone, guardian_relationship, address,
           religion, nationality, medical_notes, special_needs, previous_school } = req.body;
 
@@ -280,7 +280,7 @@ router.put('/:schoolId/students/:studentId', async (req, res) => {
     }
     const fields = [], params = [];
     for (const [key, val] of Object.entries({
-      full_name, class_id, gender, date_of_birth, admission_number, admission_date,
+      full_name, class_id, gender, date_of_birth, admission_number, nemis_number, admission_date,
       guardian_name, guardian_phone, guardian_relationship, address,
       religion, nationality, medical_notes, special_needs, previous_school
     })) {
@@ -477,13 +477,14 @@ router.post('/:schoolId/students/import', async (req, res) => {
     const parts = line.split(',');
     if (parts.length < 2) { errors++; continue; }
     const student_id = parts[0].trim();
-    const full_name = parts.slice(1).join(',').trim();
+    const full_name = parts[1].trim();
     if (!student_id || !full_name) { errors++; continue; }
-    const parent_phone = parts.length >= 3 ? parts[2].trim() : '';
-    const parent_name = parts.length >= 4 ? parts.slice(3).join(',').trim() : '';
+    const nemis_number = parts.length >= 3 && parts[2].trim() && !parts[2].trim().startsWith('254') ? parts[2].trim() : '';
+    const parent_phone = parts.length >= 4 ? parts[3].trim() : (parts.length >= 3 && parts[2].trim().startsWith('254') ? parts[2].trim() : '');
+    const parent_name = parts.length >= 5 ? parts.slice(4).join(',').trim() : '';
     try {
-      await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id) VALUES (?, ?, ?, ?)',
-        [student_id, full_name, class_id, req.params.schoolId]);
+      await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id, nemis_number) VALUES (?, ?, ?, ?, ?)',
+        [student_id, full_name, class_id, req.params.schoolId, nemis_number || null]);
       imported++;
       if (parent_phone) {
         await req.db.execute('INSERT INTO parent_profiles (parent_phone, full_name, is_premium) VALUES (?, ?, FALSE) ON DUPLICATE KEY UPDATE full_name = COALESCE(NULLIF(?, \'\'), full_name)', [parent_phone, parent_name || null, parent_name || null]);

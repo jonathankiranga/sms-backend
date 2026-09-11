@@ -249,7 +249,7 @@ router.get('/student-balances', async (req, res) => {
   if (!school_id || !term || !year) return res.status(400).json({ error: 'school_id, term, year required' });
 
   const statusFilter = req.query.status || 'Active';
-  let studentSql = 'SELECT s.student_id, s.full_name, s.enrollment_status, c.class_name, c.class_id FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ?';
+  let studentSql = 'SELECT s.student_id, s.full_name, s.nemis_number, s.enrollment_status, c.class_name, c.class_id FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ?';
   const studentParams = [school_id];
   if (statusFilter !== 'all') { studentSql += ' AND s.enrollment_status = ?'; studentParams.push(statusFilter); }
   if (class_id) { studentSql += ' AND s.class_id = ?'; studentParams.push(class_id); }
@@ -291,6 +291,7 @@ router.get('/student-balances', async (req, res) => {
     return {
       student_id: s.student_id,
       full_name: s.full_name,
+      nemis_number: s.nemis_number || null,
       enrollment_status: s.enrollment_status,
       class_name: s.class_name,
       class_id: s.class_id,
