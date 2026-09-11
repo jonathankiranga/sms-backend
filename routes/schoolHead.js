@@ -60,7 +60,7 @@ router.get('/:schoolId/teachers', async (req, res) => {
 // List classes for the school
 router.get('/:schoolId/classes', async (req, res) => {
   const [rows] = await req.db.execute(
-    'SELECT class_id, class_name, stream, level_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
+    'SELECT class_id, class_name, stream, level_name, academic_year, class_rank FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
     [req.params.schoolId]
   );
   res.json({ classes: rows });
@@ -602,7 +602,7 @@ router.get('/:schoolId/assignments', async (req, res) => {
   try {
     await ensureAssignmentsTable(req.db);
     const [rows] = await req.db.execute(
-      `SELECT a.assignment_id, a.teacher_id, a.class_id, t.full_name AS teacher_name, c.class_name
+      `SELECT a.assignment_id, a.teacher_id, a.class_id, t.full_name AS teacher_name, c.class_name, c.class_rank
        FROM teacher_class_assignments a
        JOIN teachers t ON a.teacher_id = t.teacher_id
        JOIN classes c ON a.class_id = c.class_id
@@ -674,13 +674,13 @@ router.get('/:schoolId/my-classes', async (req, res) => {
     let rows;
     if (me.role === 'head') {
       [rows] = await req.db.execute(
-        'SELECT class_id, class_name, stream, level_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
+        'SELECT class_id, class_name, stream, level_name, academic_year, class_rank FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
         [req.params.schoolId]
       );
       return res.json({ role: 'head', classes: rows });
     }
     [rows] = await req.db.execute(
-      `SELECT c.class_id, c.class_name, c.stream, c.level_name, c.academic_year
+      `SELECT c.class_id, c.class_name, c.stream, c.level_name, c.academic_year, c.class_rank
        FROM teacher_class_assignments a JOIN classes c ON a.class_id = c.class_id
        WHERE a.teacher_id = ? ORDER BY c.class_rank, c.class_name`,
       [me.teacher_id]
