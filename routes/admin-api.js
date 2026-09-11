@@ -1367,19 +1367,21 @@ router.post('/promote', async (req, res) => {
 
 // Helper: calculate commission for a rep for a given term/year
 async function calcRepCommission(db, repId, term, year) {
-  const [rows] = await db.execute(
+  // Pull parent-pays revenue: sum of amounts in premium_subscriptions
+  const [parentRows] = await db.execute(
     `SELECT
        sc.school_id,
        sc.school_name,
        sr.commission_type,
        sr.commission_value,
-       COALESCE(SUM(ps.amount), 0) AS revenue,
+       COALESCE(SUM(ps.amount), 0) AS parent_revenue,
        COUNT(ps.subscription_id)   AS transactions
      FROM schools sc
      JOIN sales_reps sr ON sc.sales_rep_id = sr.rep_id
      LEFT JOIN premium_subscriptions ps
             ON ps.school_id = sc.school_id
            AND ps.payment_status = 'paid'
+           AND ps.payment_model = 'parent'
            AND ps.term = ?
            AND ps.year = ?
      WHERE sc.sales_rep_id = ?
@@ -1387,17 +1389,44 @@ async function calcRepCommission(db, repId, term, year) {
     [term, year, repId]
   );
 
+  // Pull school-pays revenue: sum of completed bulk payments
+  const [bulkRows] = await db.execute(
+    `SELECT
+       sc.school_id,
+       COALESCE(SUM(bp.amount), 0) AS bulk_revenue
+     FROM schools sc
+     LEFT JOIN premium_bulk_payments bp
+            ON bp.school_id = sc.school_id
+           AND bp.payment_status = 'completed'
+           AND bp.term = ?
+           AND bp.year = ?
+     WHERE sc.sales_rep_id = ?
+     GROUP BY sc.school_id`,
+    [term, year, repId]
+  );
+
+  // Index bulk revenue by school_id for fast lookup
+  const bulkBySchool = {};
+  for (const b of bulkRows) {
+    bulkBySchool[b.school_id] = Number(b.bulk_revenue);
+  }
+
   let totalRevenue = 0;
   let totalCommission = 0;
   const breakdown = [];
 
-  for (const row of rows) {
-    const rev = Number(row.revenue);
+  for (const row of parentRows) {
+    const parentRev = Number(row.parent_revenue);
+    const bulkRev   = bulkBySchool[row.school_id] || 0;
+    const rev       = parentRev + bulkRev;
+
     const comm = row.commission_type === 'flat'
       ? Number(row.commission_value) * Number(row.transactions)
       : rev * (Number(row.commission_value) / 100);
-    totalRevenue += rev;
+
+    totalRevenue    += rev;
     totalCommission += comm;
+
     breakdown.push({
       school_id:    row.school_id,
       school_name:  row.school_name,
