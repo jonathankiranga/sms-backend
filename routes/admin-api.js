@@ -674,8 +674,11 @@ router.get('/schools/:id/details', async (req, res) => {
   for (const term of terms) {
     const [feeTotal] = await req.db.execute(
       `SELECT COALESCE(SUM(COALESCE(fa.adjusted_amount, f.amount)), 0) AS expected
-       FROM (SELECT fee_id, amount, is_optional FROM fee_structures WHERE school_id = ? AND term = ? AND academic_year = ?) f
-       JOIN fee_assignments fa ON f.fee_id = fa.fee_id WHERE fa.waived = FALSE`, [id, term, year]);
+       FROM fee_structures f
+       LEFT JOIN fee_assignments fa ON f.fee_id = fa.fee_id
+       WHERE f.school_id = ? AND f.term = ? AND f.academic_year = ?
+         AND f.is_optional = FALSE
+         AND (fa.waived IS NULL OR fa.waived = FALSE)`, [id, term, year]);
     const [paidTotal] = await req.db.execute(
       `SELECT COALESCE(SUM(amount), 0) AS paid, COUNT(*) AS txns
        FROM payment_ledger WHERE school_id = ? AND term = ? AND academic_year = ? AND reversed_at IS NULL`, [id, term, year]);

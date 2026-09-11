@@ -547,15 +547,18 @@ router.post('/:schoolId/fee-reminder/:studentId', async (req, res) => {
   if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
 
   // Get total fee for the current term
+  const currentTerm = `Term ${Math.ceil((new Date().getMonth() + 1) / 4)}`;
+  const currentYear = new Date().getFullYear();
   const [fees] = await req.db.execute(
-    `SELECT SUM(f.amount) AS total FROM fee_structures f
-     WHERE f.school_id = ? AND f.term = (SELECT CONCAT('Term ', CEIL(MONTH(CURDATE())/4)) FROM DUAL)`,
-    [req.params.schoolId]
+    `SELECT COALESCE(SUM(f.amount), 0) AS total FROM fee_structures f
+     WHERE f.school_id = ? AND f.term = ? AND f.academic_year = ?`,
+    [req.params.schoolId, currentTerm, currentYear]
   );
   // Get amount paid
   const [paid] = await req.db.execute(
-    `SELECT COALESCE(SUM(amount), 0) AS paid FROM payment_ledger WHERE student_reference = ?`,
-    [req.params.studentId]
+    `SELECT COALESCE(SUM(amount), 0) AS paid FROM payment_ledger 
+     WHERE student_reference = ? AND term = ? AND academic_year = ? AND reversed_at IS NULL`,
+    [req.params.studentId, currentTerm, currentYear]
   );
   const total = fees[0]?.total || 0;
   const balance = total - paid[0].paid;

@@ -70,22 +70,26 @@ router.get('/statement/:student_id/:term/:year', async (req, res) => {
   const { student_id, term, year } = req.params;
   const [fees] = await req.db.execute(
     `SELECT f.fee_id, f.fee_name, f.amount, f.is_optional,
-            fa.adjusted_amount, fa.waived,
-            COALESCE((SELECT SUM(pl.amount) FROM payment_ledger pl WHERE pl.student_reference = ? AND pl.logged_at LIKE CONCAT(?, '%')), 0) AS paid
+            fa.adjusted_amount, fa.waived
      FROM fee_structures f
      LEFT JOIN fee_assignments fa ON f.fee_id = fa.fee_id AND (fa.student_id = ? OR fa.class_id = (SELECT class_id FROM students WHERE student_id = ?))
      WHERE f.term = ? AND f.academic_year = ?
        AND (f.is_optional = FALSE OR fa.assignment_id IS NOT NULL)
      ORDER BY f.fee_name`,
-    [student_id, year, student_id, student_id, term, year]
+    [student_id, student_id, term, year]
   );
+  const [paidRows] = await req.db.execute(
+    `SELECT COALESCE(SUM(amount), 0) AS total_paid
+     FROM payment_ledger
+     WHERE student_reference = ? AND term = ? AND academic_year = ? AND reversed_at IS NULL`,
+    [student_id, term, year]
+  );
+  const total_paid = parseFloat(paidRows[0]?.total_paid || 0);
   const items = fees.map(f => ({
     ...f,
     effective_amount: f.waived ? 0 : (f.adjusted_amount || f.amount),
-    balance: (f.waived ? 0 : (f.adjusted_amount || f.amount)) - f.paid
   }));
   const total_due = items.reduce((s, i) => s + i.effective_amount, 0);
-  const total_paid = items.reduce((s, i) => s + i.paid, 0);
 
   // Fetch school contact to include on fee statement
   const [studentInfo] = await req.db.execute('SELECT school_id FROM students WHERE student_id = ?', [student_id]);

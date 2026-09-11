@@ -256,13 +256,16 @@ router.get('/student-balances', async (req, res) => {
 
   // Get total fee amounts per student
   const [feeTotals] = await req.db.execute(
-    `SELECT s.student_id, COALESCE(SUM(CASE WHEN fa.waived = FALSE THEN COALESCE(fa.adjusted_amount, f.amount) ELSE 0 END), 0) AS total_due
+    `SELECT s.student_id,
+       COALESCE(SUM(CASE WHEN fa.waived = FALSE THEN COALESCE(fa.adjusted_amount, f.amount) ELSE 0 END), 0) AS total_due
      FROM students s
-     JOIN fee_assignments fa ON fa.student_id = s.student_id OR fa.class_id = s.class_id
-     JOIN fee_structures f ON fa.fee_id = f.fee_id
-     WHERE s.school_id = ? AND s.enrollment_status = ? AND f.term = ? AND f.academic_year = ?
+     JOIN fee_structures f ON f.school_id = s.school_id AND f.term = ? AND f.academic_year = ?
+     LEFT JOIN fee_assignments fa ON fa.fee_id = f.fee_id
+       AND (fa.student_id = s.student_id OR fa.class_id = s.class_id)
+     WHERE s.school_id = ? AND s.enrollment_status = ?
+       AND (f.is_optional = FALSE OR fa.assignment_id IS NOT NULL)
      GROUP BY s.student_id`,
-    [school_id, 'Active', term, year]
+    [term, year, school_id, 'Active']
   );
   const dueMap = {};
   feeTotals.forEach(f => { dueMap[f.student_id] = parseFloat(f.total_due); });
@@ -288,7 +291,8 @@ router.get('/student-balances', async (req, res) => {
       class_id: s.class_id,
       total_due: due,
       total_paid: paid,
-      balance: due - paid,
+      balance: Math.max(0, due - paid),
+      overpaid: Math.max(0, paid - due),
       payment_status: paid >= due ? 'Paid' : paid > 0 ? 'Partial' : 'Unpaid'
     };
   });
