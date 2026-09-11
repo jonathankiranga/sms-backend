@@ -649,7 +649,7 @@ router.get('/schools/:id/details', async (req, res) => {
   if (school.length === 0) return res.status(404).json({ error: 'School not found' });
 
   const [classes] = await req.db.execute(
-    'SELECT class_id, class_name, academic_year FROM classes WHERE school_id = ? ORDER BY class_rank, class_name', [id]);
+    'SELECT class_id, class_name, academic_year, class_rank FROM classes WHERE school_id = ? ORDER BY class_rank, class_name', [id]);
 
   const [learningAreas] = await req.db.execute(
     'SELECT area_id, level_name, area_name FROM learning_areas WHERE school_id = ? ORDER BY level_name, area_name', [id]);
