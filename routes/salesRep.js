@@ -269,9 +269,7 @@ async function calcRepCommission(db, repId, term, year) {
     // Total transactions = parent subscriptions + bulk payment events
     const totalTxns   = Number(row.transactions) + bulk.transactions;
 
-    const comm = row.commission_type === 'flat'
-      ? Number(row.commission_value) * totalTxns
-      : rev * (Number(row.commission_value) / 100);
+    const comm = rev * (Number(row.commission_value) / 100);
 
     totalRevenue    += rev;
     totalCommission += comm;

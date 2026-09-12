@@ -995,7 +995,7 @@ router.get('/sales-reps', async (req, res) => {
 router.post('/sales-reps', async (req, res) => {
   const { full_name, phone, email, commission_type, commission_value } = req.body;
   if (!full_name) return res.status(400).json({ error: 'full_name required' });
-  const type = commission_type === 'flat' ? 'flat' : 'percent';
+  const type = 'percent';
   const value = Math.max(0, parseFloat(commission_value) || 0);
   const repId = genId('REP');
   try {
@@ -1012,7 +1012,7 @@ router.post('/sales-reps', async (req, res) => {
 
 router.put('/sales-reps/:repId', async (req, res) => {
   const { full_name, phone, email, commission_type, commission_value } = req.body;
-  const type = commission_type === 'flat' ? 'flat' : 'percent';
+  const type = 'percent';
   const value = Math.max(0, parseFloat(commission_value) || 0);
   try {
     await req.db.execute(
@@ -1429,9 +1429,7 @@ async function calcRepCommission(db, repId, term, year) {
     // Total transactions = parent subscriptions + bulk payment events
     const totalTxns   = Number(row.transactions) + bulk.transactions;
 
-    const comm = row.commission_type === 'flat'
-      ? Number(row.commission_value) * totalTxns
-      : rev * (Number(row.commission_value) / 100);
+    const comm = rev * (Number(row.commission_value) / 100);
 
     totalRevenue    += rev;
     totalCommission += comm;
@@ -1740,9 +1738,7 @@ router.get('/revenue/sales-reps-by-term', async (req, res) => {
     // Compute estimated commission per rep
     const result = rows.map(r => {
       const rev = Number(r.revenue);
-      const commission = r.commission_type === 'flat'
-        ? Number(r.commission_value) * Number(r.transactions)
-        : rev * (Number(r.commission_value) / 100);
+      const commission = rev * (Number(r.commission_value) / 100);
       return { ...r, revenue: rev, estimated_commission: Math.round(commission * 100) / 100 };
     });
 
