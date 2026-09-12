@@ -86,8 +86,9 @@ router.get('/level-distribution', async (req, res) => {
       `SELECT er.student_id, es.class_id, la.area_id, er.score, er.out_of, er.performance_level
        FROM exam_results er
        JOIN exam_sessions es ON er.session_id = es.session_id
-       JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-       JOIN learning_areas la ON sla.area_id = la.area_id
+       JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id
+       JOIN strands st ON ss.strand_id = st.strand_id
+       JOIN learning_areas la ON st.area_id = la.area_id
        WHERE es.class_id IN (${ph}) AND es.term = ? AND es.academic_year = ?`,
       [...classIds, term, year]
     );

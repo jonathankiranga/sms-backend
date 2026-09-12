@@ -41,7 +41,8 @@ router.get('/class-report/:class_id/:term', async (req, res) => {
   const [allAreas] = await req.db.execute(
     `SELECT DISTINCT la.area_id, la.area_name
      FROM learning_areas la
-     JOIN sub_learning_areas sla ON la.area_id = sla.area_id
+     JOIN strands st ON la.area_id = st.area_id
+     JOIN sub_strands ss ON st.strand_id = ss.strand_id
      WHERE ${areaWhere}
      ORDER BY la.area_name`,
     areaParams
@@ -69,8 +70,9 @@ router.get('/class-report/:class_id/:term', async (req, res) => {
     `SELECT er.session_id, er.student_id, la.area_id, la.area_name,
             er.score, er.out_of, er.performance_level
      FROM exam_results er
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     JOIN learning_areas la ON sla.area_id = la.area_id
+     JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
      WHERE er.session_id IN (${placeholders})`,
     sessionIds
   );
@@ -490,13 +492,14 @@ router.get('/report/:student_id/:term', async (req, res) => {
   const [examRows] = await req.db.execute(
     `SELECT la.area_id, la.area_name,
             es.session_id, es.exam_type, es.exam_name,
-            sla.sub_area_name, er.score, er.out_of, er.performance_level
+            ss.sub_strand_name, er.score, er.out_of, er.performance_level
      FROM exam_results er
      JOIN exam_sessions es ON er.session_id = es.session_id
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     JOIN learning_areas la ON sla.area_id = la.area_id
+     JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
      WHERE er.student_id = ? AND es.term = ? AND es.academic_year = ?
-     ORDER BY la.area_name, es.open_date, es.session_id, sla.display_order`,
+     ORDER BY la.area_name, es.open_date, es.session_id, ss.sub_strand_name`,
     [student_id, term, reportYear]
   );
 
@@ -516,7 +519,7 @@ router.get('/report/:student_id/:term', async (req, res) => {
   for (const r of examRows) {
     if (!examByArea.has(r.area_id)) examByArea.set(r.area_id, []);
     examByArea.get(r.area_id).push({
-      exam_type: r.exam_type, exam_name: r.exam_name, sub_area_name: r.sub_area_name,
+      exam_type: r.exam_type, exam_name: r.exam_name, sub_area_name: r.sub_strand_name,
       summative_score: `${Number(r.score)}/${Number(r.out_of)}`, performance_level: r.performance_level || null
     });
   }
@@ -552,14 +555,14 @@ router.get('/report/:student_id/:term', async (req, res) => {
     [student[0].class_id, term, reportYear]
   );
 
-  // All sub_learning_areas for this school, with their area info
+  // All sub_strands for this school, with their strand + area info (KICD ladder)
   const [subAreaRows] = await req.db.execute(
-    `SELECT sla.sub_area_id, sla.sub_area_name, sla.area_id, sla.display_order,
-            la.area_name
-     FROM sub_learning_areas sla
-     JOIN learning_areas la ON sla.area_id = la.area_id
+    `SELECT ss.sub_strand_id, ss.sub_strand_name, st.strand_id, st.strand_name, la.area_id, la.area_name
+     FROM sub_strands ss
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
      WHERE la.school_id = ?
-     ORDER BY la.area_name, sla.display_order, sla.sub_area_name`,
+     ORDER BY la.area_name, st.strand_name, ss.sub_strand_name`,
     [schoolId]
   );
 
@@ -569,7 +572,7 @@ router.get('/report/:student_id/:term', async (req, res) => {
     const sessionIds = sessionRows.map(s => s.session_id);
     const placeholders = sessionIds.map(() => '?').join(',');
     const [kr] = await req.db.execute(
-      `SELECT er.session_id, er.sub_area_id, er.score, er.out_of, er.performance_level
+      `SELECT er.session_id, er.sub_strand_id, er.score, er.out_of, er.performance_level
        FROM exam_results er
        WHERE er.student_id = ? AND er.session_id IN (${placeholders})`,
       [student_id, ...sessionIds]
@@ -577,24 +580,24 @@ router.get('/report/:student_id/:term', async (req, res) => {
     knecResultRows = kr;
   }
 
-  // Index results: resultsBySubArea[sub_area_id][session_id] = { score, out_of, performance_level }
+  // Index results: resultsBySubArea[sub_strand_id][session_id] = { score, out_of, performance_level }
   const resultsBySubArea = {};
   for (const r of knecResultRows) {
-    if (!resultsBySubArea[r.sub_area_id]) resultsBySubArea[r.sub_area_id] = {};
-    resultsBySubArea[r.sub_area_id][r.session_id] = {
+    if (!resultsBySubArea[r.sub_strand_id]) resultsBySubArea[r.sub_strand_id] = {};
+    resultsBySubArea[r.sub_strand_id][r.session_id] = {
       score: r.score,
       out_of: r.out_of,
       performance_level: r.performance_level || null
     };
   }
 
-  // Group sub_areas by area
+  // Group sub_strands by area
   const knecAreaMap = new Map(); // area_id -> { area_id, area_name, sub_areas: [] }
   for (const sa of subAreaRows) {
     if (!knecAreaMap.has(sa.area_id)) {
       knecAreaMap.set(sa.area_id, { area_id: sa.area_id, area_name: sa.area_name, sub_areas: [] });
     }
-    const subAreaResults = resultsBySubArea[sa.sub_area_id] || {};
+    const subAreaResults = resultsBySubArea[sa.sub_strand_id] || {};
     // Build results keyed by session_id
     const results = {};
     const subAreaLevels = [];
@@ -611,8 +614,10 @@ router.get('/report/:student_id/:term', async (req, res) => {
     }
     const overall_level = dominantLevelFn(subAreaLevels);
     knecAreaMap.get(sa.area_id).sub_areas.push({
-      sub_area_id: sa.sub_area_id,
-      sub_area_name: sa.sub_area_name,
+      sub_strand_id: sa.sub_strand_id,
+      sub_area_name: sa.sub_strand_name,
+      strand_id: sa.strand_id,
+      strand_name: sa.strand_name,
       results,
       overall_level
     });
@@ -714,10 +719,11 @@ router.delete('/areas/:id', async (req, res) => {
   // Check if in use — sub_learning_areas, strands, or exam_results reference this area
   const [[subCount]]  = await req.db.execute('SELECT COUNT(*) AS n FROM sub_learning_areas WHERE area_id = ?', [req.params.id]);
   const [[strandCount]] = await req.db.execute('SELECT COUNT(*) AS n FROM strands WHERE area_id = ?', [req.params.id]);
-  const [[examCount]] = await req.db.execute(
+const [[examCount]] = await req.db.execute(
     `SELECT COUNT(*) AS n FROM exam_results er
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     WHERE sla.area_id = ?`, [req.params.id]
+     JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id
+     JOIN strands st ON ss.strand_id = st.strand_id
+     WHERE st.area_id = ?`, [req.params.id]
   );
   const [[assessCount]] = await req.db.execute(
     `SELECT COUNT(*) AS n FROM assessment_results ar
@@ -783,6 +789,134 @@ router.post('/sub-strands', async (req, res) => {
 
   const [r] = await req.db.execute('INSERT INTO sub_strands (strand_id, sub_strand_name) VALUES (?, ?)', [strand_id, sub_strand_name]);
   res.json({ sub_strand_id: r.insertId, strand_id, sub_strand_name });
+});
+
+// PUT /api/assessments/strands/:id — rename a strand / change its term (headteacher only)
+router.put('/strands/:id', async (req, res) => {
+  const { strand_name, term, teacher_id } = req.body;
+  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+
+  const [srows] = await req.db.execute(
+    'SELECT s.strand_id, s.area_id, la.school_id FROM strands s JOIN learning_areas la ON s.area_id = la.area_id WHERE s.strand_id = ?',
+    [req.params.id]
+  );
+  if (srows.length === 0) return res.status(404).json({ error: 'Strand not found' });
+  const school_id = srows[0].school_id;
+
+  const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may update strands for this school' });
+
+  const fields = [], params = [];
+  if (strand_name) { fields.push('strand_name = ?'); params.push(strand_name); }
+  if (term !== undefined) {
+    const allowedTerms = ['Term 1', 'Term 2', 'Term 3'];
+    const termVal = allowedTerms.includes(term) ? term : null;
+    fields.push('term = ?'); params.push(termVal);
+  }
+  if (fields.length === 0) return res.status(400).json({ error: 'Nothing to update' });
+  params.push(req.params.id);
+  await req.db.execute(`UPDATE strands SET ${fields.join(', ')} WHERE strand_id = ?`, params);
+  const [saved] = await req.db.execute('SELECT strand_id, area_id, strand_name, term FROM strands WHERE strand_id = ?', [req.params.id]);
+  res.json(saved[0]);
+});
+
+// DELETE /api/assessments/strands/:id — delete a strand (headteacher only, blocks if in use)
+router.delete('/strands/:id', async (req, res) => {
+  const { teacher_id } = req.query;
+  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+
+  const [srows] = await req.db.execute(
+    'SELECT s.strand_id, s.strand_name, la.school_id FROM strands s JOIN learning_areas la ON s.area_id = la.area_id WHERE s.strand_id = ?',
+    [req.params.id]
+  );
+  if (srows.length === 0) return res.status(404).json({ error: 'Strand not found' });
+  const school_id = srows[0].school_id;
+
+  const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may delete strands for this school' });
+
+  const [[examCount]] = await req.db.execute(
+    `SELECT COUNT(*) AS n FROM exam_results er
+     JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id WHERE ss.strand_id = ?`, [req.params.id]
+  );
+  const [[assessCount]] = await req.db.execute(
+    `SELECT COUNT(*) AS n FROM assessment_results ar
+     JOIN assessments a ON ar.assessment_id = a.assessment_id
+     JOIN sub_strands ss ON a.sub_strand_id = ss.sub_strand_id WHERE ss.strand_id = ?`, [req.params.id]
+  );
+  if (examCount.n + assessCount.n > 0) {
+    return res.status(409).json({
+      error: 'in_use',
+      message: `"${srows[0].strand_name}" cannot be deleted — it has ${examCount.n} exam result(s) and ${assessCount.n} assessment result(s) linked to it. Remove those first.`
+    });
+  }
+
+  await req.db.execute('DELETE FROM sub_strands WHERE strand_id = ?', [req.params.id]);
+  await req.db.execute('DELETE FROM strands WHERE strand_id = ?', [req.params.id]);
+  res.json({ deleted: true });
+});
+
+// PUT /api/assessments/sub-strands/:id — rename a sub-strand (headteacher only)
+router.put('/sub-strands/:id', async (req, res) => {
+  const { sub_strand_name, teacher_id } = req.body;
+  if (!sub_strand_name || !teacher_id) return res.status(400).json({ error: 'sub_strand_name and teacher_id required' });
+
+  const [srows] = await req.db.execute(
+    `SELECT ss.sub_strand_id, la.school_id
+     FROM sub_strands ss
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
+     WHERE ss.sub_strand_id = ?`,
+    [req.params.id]
+  );
+  if (srows.length === 0) return res.status(404).json({ error: 'Sub-strand not found' });
+  const school_id = srows[0].school_id;
+
+  const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may update sub-strands for this school' });
+
+  await req.db.execute('UPDATE sub_strands SET sub_strand_name = ? WHERE sub_strand_id = ?', [sub_strand_name, req.params.id]);
+  const [saved] = await req.db.execute('SELECT sub_strand_id, strand_id, sub_strand_name FROM sub_strands WHERE sub_strand_id = ?', [req.params.id]);
+  res.json(saved[0]);
+});
+
+// DELETE /api/assessments/sub-strands/:id — delete a sub-strand (headteacher only, blocks if in use)
+router.delete('/sub-strands/:id', async (req, res) => {
+  const { teacher_id } = req.query;
+  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+
+  const [srows] = await req.db.execute(
+    `SELECT ss.sub_strand_id, ss.sub_strand_name, la.school_id
+     FROM sub_strands ss
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
+     WHERE ss.sub_strand_id = ?`,
+    [req.params.id]
+  );
+  if (srows.length === 0) return res.status(404).json({ error: 'Sub-strand not found' });
+  const school_id = srows[0].school_id;
+
+  const [t] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
+  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  if (t[0].role !== 'head' || t[0].school_id !== school_id) return res.status(403).json({ error: 'Only the school head may delete sub-strands for this school' });
+
+  const [[examCount]] = await req.db.execute('SELECT COUNT(*) AS n FROM exam_results WHERE sub_strand_id = ?', [req.params.id]);
+  const [[assessCount]] = await req.db.execute(
+    `SELECT COUNT(*) AS n FROM assessment_results ar JOIN assessments a ON ar.assessment_id = a.assessment_id WHERE a.sub_strand_id = ?`, [req.params.id]
+  );
+  const [[planCount]] = await req.db.execute('SELECT COUNT(*) AS n FROM lesson_plans WHERE sub_strand_id = ?', [req.params.id]);
+  if (examCount.n + assessCount.n + planCount.n > 0) {
+    return res.status(409).json({
+      error: 'in_use',
+      message: `"${srows[0].sub_strand_name}" cannot be deleted — it has ${examCount.n} exam result(s), ${assessCount.n} assessment result(s) and ${planCount.n} lesson plan(s) linked to it. Remove those first.`
+    });
+  }
+
+  await req.db.execute('DELETE FROM sub_strands WHERE sub_strand_id = ?', [req.params.id]);
+  res.json({ deleted: true });
 });
 
 // GET /api/assessments/report/:student_id/cumulative/:year
@@ -861,8 +995,9 @@ router.get('/report/:student_id/cumulative/:year', async (req, res) => {
             er.performance_level, er.score, er.out_of
      FROM exam_results er
      JOIN exam_sessions es ON er.session_id = es.session_id
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     JOIN learning_areas la ON sla.area_id = la.area_id
+     JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
      WHERE er.student_id = ? AND es.academic_year = ?
      ORDER BY la.area_name`,
     [student_id, reportYear]

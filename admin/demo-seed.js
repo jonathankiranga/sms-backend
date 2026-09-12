@@ -111,7 +111,7 @@ async function main() {
   console.log('✓ Demo parent linked to Amina Hassan (phone: 254712345678)');
 
   // ── LEARNING AREAS ───────────────────────────────────────────
-  const areas = ['English', 'Mathematics', 'Science', 'Social Studies', 'Kiswahili', 'Creative Arts'];
+  const areas = ['English', 'Mathematics', 'Science and Technology', 'Social Studies', 'Kiswahili', 'Creative Arts'];
   const areaIds = {};
   for (const name of areas) {
     const [r] = await conn.execute(`INSERT IGNORE INTO learning_areas
@@ -124,33 +124,26 @@ async function main() {
   existingAreas.forEach(a => { areaIds[a.area_name] = a.area_id; });
   console.log('✓ Learning areas created');
 
-  // ── SUB-LEARNING AREAS ───────────────────────────────────────
-  const subAreas = {
-    'English':      [['Language', 1], ['Composition', 2], ['Reading', 3]],
-    'Mathematics':  [['Numbers', 1], ['Algebra', 2], ['Geometry', 3], ['Measurement', 4]],
-    'Science':      [['Scientific Investigation', 1], ['Living Things', 2], ['Matter & Energy', 3]],
-  };
-  const subAreaIds = {};
-  for (const [areaName, subs] of Object.entries(subAreas)) {
-    if (!areaIds[areaName]) continue;
-    subAreaIds[areaName] = {};
-    for (const [subName, order] of subs) {
-      const [r] = await conn.execute(`INSERT IGNORE INTO sub_learning_areas
-        (area_id, sub_area_name, display_order) VALUES (?, ?, ?)`,
-        [areaIds[areaName], subName, order]);
-      if (r.insertId) subAreaIds[areaName][subName] = r.insertId;
-    }
+  // ── KICD STRANDS + SUB-STRANDS ──────────────────────────────────
+  // Learning Area → Strand → Sub-strand (shared CBC seed module)
+  const { seedStrands } = require('../lib/cbcSeedData');
+  const strandRes = await seedStrands(conn, DEMO_SCHOOL_ID);
+  console.log(`✓ KICD strands seeded (${strandRes.strands_added} new, ${strandRes.sub_strands_added} sub-strands)`);
+
+  // Sub-strands per Grade 4 learning area, used to scatter exam marks
+  const [subStrandRows] = await conn.execute(
+    `SELECT ss.sub_strand_id, la.area_name
+     FROM sub_strands ss
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
+     WHERE la.school_id = ? AND la.level_name = 'Grade 4'
+     ORDER BY la.area_name, st.strand_name, ss.sub_strand_name`, [DEMO_SCHOOL_ID]);
+  const subStrandsByArea = {};
+  for (const s of subStrandRows) {
+    if (!subStrandsByArea[s.area_name]) subStrandsByArea[s.area_name] = [];
+    subStrandsByArea[s.area_name].push(s.sub_strand_id);
   }
-  // fetch existing sub areas
-  const [existingSubs] = await conn.execute(
-    `SELECT sla.sub_area_id, sla.sub_area_name, la.area_name
-     FROM sub_learning_areas sla JOIN learning_areas la ON sla.area_id = la.area_id
-     WHERE la.school_id = ?`, [DEMO_SCHOOL_ID]);
-  existingSubs.forEach(s => {
-    if (!subAreaIds[s.area_name]) subAreaIds[s.area_name] = {};
-    subAreaIds[s.area_name][s.sub_area_name] = s.sub_area_id;
-  });
-  console.log('✓ Sub-learning areas created');
+  console.log('✓ Sub-strands catalogued per learning area for exam results');
 
   // ── EXAM SESSION ─────────────────────────────────────────────
   const [sessionResult] = await conn.execute(`INSERT IGNORE INTO exam_sessions
@@ -167,38 +160,33 @@ async function main() {
   console.log('✓ Exam session created, session_id:', sessionId);
 
   // ── EXAM RESULTS ─────────────────────────────────────────────
-  const scores = {
-    'STU000001': { English: [72, 65, 78], Mathematics: [85, 70, 88, 75], Science: [68, 72, 65] },
-    'STU000002': { English: [55, 60, 52], Mathematics: [45, 50, 48, 55], Science: [58, 45, 62] },
-    'STU000003': { English: [90, 85, 92], Mathematics: [95, 88, 92, 90], Science: [88, 85, 90] },
-    'STU000004': { English: [63, 70, 68], Mathematics: [72, 65, 75, 68], Science: [70, 68, 72] },
-    'STU000005': { English: [82, 78, 85], Mathematics: [80, 75, 82, 78], Science: [85, 80, 88] },
-    'STU000006': { English: [48, 52, 45], Mathematics: [55, 48, 52, 60], Science: [50, 55, 48] },
-    'STU000007': { English: [76, 72, 80], Mathematics: [68, 72, 75, 70], Science: [75, 70, 78] },
-    'STU000008': { English: [60, 65, 58], Mathematics: [62, 58, 65, 60], Science: [65, 60, 68] },
-    'STU000009': { English: [88, 82, 90], Mathematics: [85, 82, 88, 85], Science: [80, 85, 82] },
-    'STU000010': { English: [70, 68, 72], Mathematics: [75, 70, 78, 72], Science: [72, 68, 75] },
-  };
-
-  for (const [studentId, areaScores] of Object.entries(scores)) {
-    for (const [areaName, scoreList] of Object.entries(areaScores)) {
-      const subs = Object.entries(subAreaIds[areaName] || {});
-      for (let i = 0; i < subs.length && i < scoreList.length; i++) {
-        const [, subId] = subs[i];
-        const score = scoreList[i];
-        const outOf = 100;
-        const pct = score / outOf;
-        const level = pct >= 0.8 ? 'EE' : pct >= 0.6 ? 'ME' : pct >= 0.4 ? 'AE' : 'BE';
-        if (sessionId) {
+  // Keyed by KICD sub-strand. Each area's 100 marks are split across its
+  // sub-strands; students score deterministically by their rank.
+  const pctByRank = (idx) => 0.42 + idx * 0.05; // 0.42 → 0.87 across 10 students
+  let resultsSeeded = 0;
+  if (sessionId) {
+    for (const [areaName, subIds] of Object.entries(subStrandsByArea)) {
+      if (subIds.length === 0) continue;
+      const outOfEach = Math.floor(100 / subIds.length);
+      const outOfFirst = 100 - outOfEach * (subIds.length - 1);
+      for (let rank = 0; rank < students.length; rank++) {
+        const [studentId] = students[rank];
+        const basePct = pctByRank(rank);
+        for (let i = 0; i < subIds.length; i++) {
+          const outOf = i === 0 ? outOfFirst : outOfEach;
+          const scored = Math.min(Math.round(outOf * basePct), outOf);
+          const pct = outOf > 0 ? scored / outOf : 0;
+          const level = pct >= 0.8 ? 'EE' : pct >= 0.6 ? 'ME' : pct >= 0.4 ? 'AE' : 'BE';
           await conn.execute(`INSERT IGNORE INTO exam_results
-            (session_id, student_id, sub_area_id, score, out_of, performance_level, entered_by)
+            (session_id, student_id, sub_strand_id, score, out_of, performance_level, entered_by)
             VALUES (?, ?, ?, ?, ?, ?, 'TCHWX002')`,
-            [sessionId, studentId, subId, score, outOf, level]);
+            [sessionId, studentId, subIds[i], scored, outOf, level]);
+          resultsSeeded++;
         }
       }
     }
   }
-  console.log('✓ Exam results seeded');
+  console.log(`✓ ${resultsSeeded} exam results seeded (KICD sub-strand marks, 100 per area)`);
 
   // ── ATTENDANCE (last 5 days) ──────────────────────────────────
   const today = new Date();

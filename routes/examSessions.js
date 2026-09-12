@@ -71,84 +71,167 @@ router.delete('/:id', async (req, res) => {
   res.json({ deleted: true });
 });
 
-// ─── SUB-LEARNING AREAS ─────────────────────────────────────────
+// ─── KICD STRAND TREE (Learning Area → Strand → Sub-strand) ─────
 
-// GET /api/sub-learning-areas?area_id=X or school_id=X&class_id=Y
-router.get('/sub-learning-areas', async (req, res) => {
-  const { area_id, school_id, class_id } = req.query;
-  console.log('[DEBUG /sub-learning-areas] Query params:', { area_id, school_id, class_id });
-  
+// GET /api/exam-sessions/strand-tree?area_id=X
+//   → { strands: [ { strand_id, strand_name, term, sub_strands: [] } ] }
+// GET /api/exam-sessions/strand-tree?school_id=X&class_id=Y[&term=T]
+//   → { areas: [ { area_id, area_name, strands: [ { strand_id, strand_name, term, sub_strands: [...] } ] } ] }
+//     Areas are scoped to the class's level_name (grade) so only the relevant
+//     KICD strands for that class appear. term filters to one term's strands.
+router.get('/strand-tree', async (req, res) => {
+  const { area_id, school_id, class_id, term } = req.query;
+
   if (area_id) {
+    const sqlTerm = term ? ' AND st.term = ?' : '';
+    const params = term ? [area_id, term] : [area_id];
     const [rows] = await req.db.execute(
-      'SELECT * FROM sub_learning_areas WHERE area_id = ? ORDER BY display_order, sub_area_name',
-      [area_id]
+      `SELECT st.strand_id, st.strand_name, st.term, ss.sub_strand_id, ss.sub_strand_name
+       FROM strands st
+       LEFT JOIN sub_strands ss ON st.strand_id = ss.strand_id
+       WHERE st.area_id = ?${sqlTerm}
+       ORDER BY st.strand_name, ss.sub_strand_name`,
+      params
     );
-    console.log('[DEBUG /sub-learning-areas] area_id path, rows:', rows.length);
-    return res.json({ sub_areas: rows });
+    const strandMap = new Map();
+    for (const r of rows) {
+      if (!strandMap.has(r.strand_id)) {
+        strandMap.set(r.strand_id, { strand_id: r.strand_id, strand_name: r.strand_name, term: r.term, sub_strands: [] });
+      }
+      if (r.sub_strand_id) {
+        strandMap.get(r.strand_id).sub_strands.push({ sub_strand_id: r.sub_strand_id, sub_strand_name: r.sub_strand_name });
+      }
+    }
+    return res.json({ strands: Array.from(strandMap.values()).filter(s => s.sub_strands.length > 0) });
   }
+
   if (school_id) {
     if (!class_id) {
-      console.log('[DEBUG /sub-learning-areas] Missing class_id');
       return res.status(400).json({ error: 'class_id required to filter learning areas by grade' });
     }
-    
-    // Get class level_name to filter learning areas by grade
+
     const [classRows] = await req.db.execute('SELECT level_name FROM classes WHERE class_id = ?', [class_id]);
-    console.log('[DEBUG /sub-learning-areas] Class lookup:', { class_id, classRows: classRows.length > 0 ? classRows[0] : null });
-    
     if (classRows.length === 0) {
       return res.status(404).json({ error: 'Class not found' });
     }
     if (!classRows[0].level_name) {
-      console.log('[DEBUG /sub-learning-areas] Class missing level_name:', classRows[0]);
       return res.status(400).json({ error: 'Class has no grade level assigned (level_name is required)' });
     }
-    
+
+    const sqlTerm = term ? 'AND st.term = ?' : '';
+    const params = term ? [school_id, classRows[0].level_name, term] : [school_id, classRows[0].level_name];
     const [rows] = await req.db.execute(
-      `SELECT sla.*, la.area_name FROM sub_learning_areas sla
-       JOIN learning_areas la ON sla.area_id = la.area_id
+      `SELECT la.area_id, la.area_name,
+              st.strand_id, st.strand_name, st.term,
+              ss.sub_strand_id, ss.sub_strand_name
+       FROM learning_areas la
+       JOIN strands st ON la.area_id = st.area_id ${sqlTerm}
+       JOIN sub_strands ss ON st.strand_id = ss.strand_id
        WHERE la.school_id = ? AND la.level_name = ?
-       ORDER BY la.area_name, sla.display_order, sla.sub_area_name`,
-      [school_id, classRows[0].level_name]
+       ORDER BY la.area_name, st.strand_name, ss.sub_strand_name`,
+      params
     );
-    console.log('[DEBUG /sub-learning-areas] Filtered rows:', rows.length, 'for level:', classRows[0].level_name);
-    return res.json({ sub_areas: rows });
+
+    const areaMap = new Map();
+    for (const r of rows) {
+      if (!areaMap.has(r.area_id)) {
+        areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name, strands: new Map() });
+      }
+      const area = areaMap.get(r.area_id);
+      if (!area.strands.has(r.strand_id)) {
+        area.strands.set(r.strand_id, { strand_id: r.strand_id, strand_name: r.strand_name, term: r.term, sub_strands: [] });
+      }
+      area.strands.get(r.strand_id).sub_strands.push({ sub_strand_id: r.sub_strand_id, sub_strand_name: r.sub_strand_name });
+    }
+
+    const areas = Array.from(areaMap.values()).map(a => ({
+      area_id: a.area_id,
+      area_name: a.area_name,
+      strands: Array.from(a.strands.values())
+    }));
+    return res.json({ areas });
   }
+
   res.status(400).json({ error: 'area_id or school_id required' });
 });
 
-// POST /api/sub-learning-areas — create
-router.post('/sub-learning-areas', async (req, res) => {
-  const { area_id, sub_area_name, display_order } = req.body;
-  if (!area_id || !sub_area_name) return res.status(400).json({ error: 'area_id, sub_area_name required' });
-
-  const [r] = await req.db.execute(
-    'INSERT INTO sub_learning_areas (area_id, sub_area_name, display_order) VALUES (?, ?, ?)',
-    [area_id, sub_area_name, display_order || 0]
-  );
-  const [saved] = await req.db.execute('SELECT * FROM sub_learning_areas WHERE sub_area_id = ?', [r.insertId]);
-  res.json(saved[0]);
+// Legacy alias — returns the strand tree plus a flat sub_strand list for older clients.
+router.get('/sub-learning-areas', async (req, res) => {
+  const { area_id, school_id, class_id, term } = req.query;
+  if (!area_id && !(school_id && class_id)) {
+    return res.status(400).json({ error: 'area_id or school_id required' });
+  }
+  const tree = await computeStrandTree(req.db, null, { area_id, school_id, class_id, term });
+  if (tree.error) return res.status(400).json({ error: tree.error });
+  const areas = tree.areas || [];
+  const sub_areas = areas.flatMap(a => (a.strands || []).flatMap(s => (s.sub_strands || []).map(ss => ({
+    sub_strand_id: ss.sub_strand_id,
+    sub_strand_name: ss.sub_strand_name,
+    strand_id: s.strand_id,
+    strand_name: s.strand_name,
+    term: s.term,
+    area_id: a.area_id,
+    area_name: a.area_name
+  }))));
+  return res.json({ ...tree, sub_areas });
 });
 
-// PUT /api/sub-learning-areas/:id
-router.put('/sub-learning-areas/:id', async (req, res) => {
-  const { sub_area_name, display_order } = req.body;
-  const fields = [];
-  const params = [];
-  if (sub_area_name) { fields.push('sub_area_name = ?'); params.push(sub_area_name); }
-  if (display_order !== undefined) { fields.push('display_order = ?'); params.push(display_order); }
-  if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
-  params.push(req.params.id);
-  await req.db.execute(`UPDATE sub_learning_areas SET ${fields.join(', ')} WHERE sub_area_id = ?`, params);
-  const [saved] = await req.db.execute('SELECT * FROM sub_learning_areas WHERE sub_area_id = ?', [req.params.id]);
-  res.json(saved[0]);
-});
+async function computeStrandTree(db, res, { area_id, school_id, class_id, term }) {
+  if (area_id) {
+    const sqlTerm = term ? ' AND st.term = ?' : '';
+    const params = term ? [area_id, term] : [area_id];
+    const [rows] = await db.execute(
+      `SELECT st.strand_id, st.strand_name, st.term, ss.sub_strand_id, ss.sub_strand_name
+       FROM strands st
+       LEFT JOIN sub_strands ss ON st.strand_id = ss.strand_id
+       WHERE st.area_id = ?${sqlTerm}
+       ORDER BY st.strand_name, ss.sub_strand_name`,
+      params
+    );
+    const strandMap = new Map();
+    for (const r of rows) {
+      if (!strandMap.has(r.strand_id)) {
+        strandMap.set(r.strand_id, { strand_id: r.strand_id, strand_name: r.strand_name, term: r.term, sub_strands: [] });
+      }
+      if (r.sub_strand_id) {
+        strandMap.get(r.strand_id).sub_strands.push({ sub_strand_id: r.sub_strand_id, sub_strand_name: r.sub_strand_name });
+      }
+    }
+    return { strands: Array.from(strandMap.values()).filter(s => s.sub_strands.length > 0) };
+  }
+  if (school_id && class_id) {
+    const [classRows] = await db.execute('SELECT level_name FROM classes WHERE class_id = ?', [class_id]);
+    if (classRows.length === 0) return { error: 'Class not found' };
+    if (!classRows[0].level_name) return { error: 'Class has no grade level assigned (level_name is required)' };
 
-// DELETE /api/sub-learning-areas/:id
-router.delete('/sub-learning-areas/:id', async (req, res) => {
-  await req.db.execute('DELETE FROM sub_learning_areas WHERE sub_area_id = ?', [req.params.id]);
-  res.json({ deleted: true });
-});
+    const sqlTerm = term ? 'AND st.term = ?' : '';
+    const params = term ? [school_id, classRows[0].level_name, term] : [school_id, classRows[0].level_name];
+    const [rows] = await db.execute(
+      `SELECT la.area_id, la.area_name,
+              st.strand_id, st.strand_name, st.term,
+              ss.sub_strand_id, ss.sub_strand_name
+       FROM learning_areas la
+       JOIN strands st ON la.area_id = st.area_id ${sqlTerm}
+       JOIN sub_strands ss ON st.strand_id = ss.strand_id
+       WHERE la.school_id = ? AND la.level_name = ?
+       ORDER BY la.area_name, st.strand_name, ss.sub_strand_name`,
+      params
+    );
+    const areaMap = new Map();
+    for (const r of rows) {
+      if (!areaMap.has(r.area_id)) {
+        areaMap.set(r.area_id, { area_id: r.area_id, area_name: r.area_name, strands: new Map() });
+      }
+      const area = areaMap.get(r.area_id);
+      if (!area.strands.has(r.strand_id)) {
+        area.strands.set(r.strand_id, { strand_id: r.strand_id, strand_name: r.strand_name, term: r.term, sub_strands: [] });
+      }
+      area.strands.get(r.strand_id).sub_strands.push({ sub_strand_id: r.sub_strand_id, sub_strand_name: r.sub_strand_name });
+    }
+    return { areas: Array.from(areaMap.values()).map(a => ({ area_id: a.area_id, area_name: a.area_name, strands: Array.from(a.strands.values()) })) };
+  }
+  return { error: 'area_id or school_id required' };
+}
 
 // ─── EXAM RESULTS ────────────────────────────────────────────────
 
@@ -158,20 +241,22 @@ router.get('/:id/results', async (req, res) => {
   if (sessionRows.length === 0) return res.status(404).json({ error: 'Session not found' });
 
   const [results] = await req.db.execute(
-    `SELECT er.*, s.full_name AS student_name, sla.sub_area_name, la.area_id, la.area_name
+    `SELECT er.*, s.full_name AS student_name,
+            ss.sub_strand_name, st.strand_name, st.strand_id, la.area_id, la.area_name
      FROM exam_results er
      JOIN students s ON er.student_id = s.student_id
-     JOIN sub_learning_areas sla ON er.sub_area_id = sla.sub_area_id
-     JOIN learning_areas la ON sla.area_id = la.area_id
+     JOIN sub_strands ss ON er.sub_strand_id = ss.sub_strand_id
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
      WHERE er.session_id = ?
-     ORDER BY s.full_name, la.area_name, sla.display_order`,
+     ORDER BY s.full_name, la.area_name, st.strand_name, ss.sub_strand_name`,
     [req.params.id]
   );
 
   res.json({ session: sessionRows[0], results });
 });
 
-// POST /api/exam-sessions/:id/results — batch save results
+// POST /api/exam-sessions/:id/results — batch save results (keyed by sub_strand_id)
 router.post('/:id/results', async (req, res) => {
   const { results, entered_by } = req.body;
   if (!results?.length) return res.status(400).json({ error: 'results array required' });
@@ -207,17 +292,17 @@ router.post('/:id/results', async (req, res) => {
   try {
     await conn.beginTransaction();
     for (const r of results) {
-      if (!r.student_id || !r.sub_area_id || r.score === undefined || r.out_of === undefined) continue;
+      if (!r.student_id || !r.sub_strand_id || r.score === undefined || r.out_of === undefined) continue;
       const pct = r.out_of > 0 ? r.score / r.out_of : 0;
       const matched = getLevel(pct, rubricConfig);
       const level = matched ? matched.level_code : 'BE';
 
       await conn.execute(
-        `INSERT INTO exam_results (session_id, student_id, sub_area_id, score, out_of, performance_level, entered_by)
+        `INSERT INTO exam_results (session_id, student_id, sub_strand_id, score, out_of, performance_level, entered_by)
          VALUES (?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE score = VALUES(score), out_of = VALUES(out_of),
            performance_level = VALUES(performance_level), entered_by = VALUES(entered_by)`,
-        [req.params.id, r.student_id, r.sub_area_id, r.score, r.out_of, level, entered_by || null]
+        [req.params.id, r.student_id, r.sub_strand_id, r.score, r.out_of, level, entered_by || null]
       );
       savedCount++;
     }
@@ -243,31 +328,44 @@ router.get('/:id/class-report', async (req, res) => {
     [session.class_id, 'Active']
   );
 
-  const [areaRows] = await req.db.execute(
-    `SELECT la.area_id, la.area_name, sla.sub_area_id, sla.sub_area_name, sla.display_order,
+  // Resolve the class level so KICD strands are scoped to the right grade
+  const [clsRows] = await req.db.execute('SELECT level_name FROM classes WHERE class_id = ?', [session.class_id]);
+  const levelName = clsRows[0]?.level_name;
+
+  // If the class has no level_name, fall back to all strands in the school
+  const scopeWhere = levelName ? 'la.school_id = ? AND la.level_name = ?' : 'la.school_id = ?';
+  const scopeParams = levelName ? [session.school_id, levelName] : [session.school_id];
+
+  const [levelAreaRows] = await req.db.execute(
+    `SELECT la.area_id, la.area_name, st.strand_id, st.strand_name,
+            ss.sub_strand_id, ss.sub_strand_name,
             er.student_id, er.score, er.out_of, er.performance_level
      FROM learning_areas la
-     JOIN sub_learning_areas sla ON la.area_id = sla.area_id
-     LEFT JOIN exam_results er ON sla.sub_area_id = er.sub_area_id AND er.session_id = ?
-     WHERE la.school_id = ?
-     ORDER BY la.area_name, sla.display_order`,
-    [req.params.id, session.school_id]
+     JOIN strands st ON la.area_id = st.area_id AND st.term = ?
+     JOIN sub_strands ss ON st.strand_id = ss.strand_id
+     LEFT JOIN exam_results er ON ss.sub_strand_id = er.sub_strand_id AND er.session_id = ?
+     WHERE ${scopeWhere}
+     ORDER BY la.area_name, st.strand_name, ss.sub_strand_name`,
+    [session.term, req.params.id, ...scopeParams]
   );
 
-  // Group by learning area and sub-area
+  // Group by learning area → strand → sub-strand
   const areaMap = {};
-  for (const row of areaRows) {
+  for (const row of levelAreaRows) {
     if (!areaMap[row.area_id]) {
-      areaMap[row.area_id] = { area_id: row.area_id, area_name: row.area_name, sub_areas: {} };
+      areaMap[row.area_id] = { area_id: row.area_id, area_name: row.area_name, strands: {} };
     }
-    if (!areaMap[row.area_id].sub_areas[row.sub_area_id]) {
-      areaMap[row.area_id].sub_areas[row.sub_area_id] = {
-        sub_area_id: row.sub_area_id, sub_area_name: row.sub_area_name, display_order: row.display_order,
-        scores: {}
+    if (!areaMap[row.area_id].strands[row.strand_id]) {
+      areaMap[row.area_id].strands[row.strand_id] = {
+        strand_id: row.strand_id, strand_name: row.strand_name, sub_strands: {}
       };
     }
+    const strand = areaMap[row.area_id].strands[row.strand_id];
+    if (!strand.sub_strands[row.sub_strand_id]) {
+      strand.sub_strands[row.sub_strand_id] = { sub_strand_id: row.sub_strand_id, sub_strand_name: row.sub_strand_name, scores: {} };
+    }
     if (row.student_id) {
-      areaMap[row.area_id].sub_areas[row.sub_area_id].scores[row.student_id] = {
+      strand.sub_strands[row.sub_strand_id].scores[row.student_id] = {
         score: row.score, out_of: row.out_of, performance_level: row.performance_level
       };
     }
@@ -279,19 +377,31 @@ router.get('/:id/class-report', async (req, res) => {
     let totalScore = 0, totalOutOf = 0;
 
     for (const [areaId, area] of Object.entries(areaMap)) {
+      const strands = [];
       const subAreas = [];
       let areaScore = 0, areaOutOf = 0;
-      for (const [subId, sub] of Object.entries(area.sub_areas)) {
-        const result = sub.scores[s.student_id];
-        const score = result ? parseFloat(result.score) || 0 : null;
-        const outOf = result ? parseFloat(result.out_of) || 0 : null;
-        const pct = (score !== null && outOf > 0) ? Math.round(score / outOf * 100 * 10) / 10 : null;
-        subAreas.push({
-          sub_area_id: parseInt(subId),
-          sub_area_name: sub.sub_area_name,
-          score, out_of: outOf, pct, level: result?.performance_level || null
-        });
-        if (score !== null && outOf > 0) { areaScore += score; areaOutOf += outOf; }
+      for (const [strandId, strandEntry] of Object.entries(area.strands)) {
+        const strandSubs = [];
+        for (const [subId, sub] of Object.entries(strandEntry.sub_strands)) {
+          const result = sub.scores[s.student_id];
+          const score = result ? parseFloat(result.score) || 0 : null;
+          const outOf = result ? parseFloat(result.out_of) || 0 : null;
+          const pct = (score !== null && outOf > 0) ? Math.round(score / outOf * 100 * 10) / 10 : null;
+          strandSubs.push({
+            sub_strand_id: parseInt(subId),
+            sub_strand_name: sub.sub_strand_name,
+            score, out_of: outOf, pct, level: result?.performance_level || null
+          });
+          subAreas.push({
+            sub_strand_id: parseInt(subId),
+            sub_strand_name: sub.sub_strand_name,
+            strand_id: parseInt(strandId),
+            strand_name: strandEntry.strand_name,
+            score, out_of: outOf, pct, level: result?.performance_level || null
+          });
+          if (score !== null && outOf > 0) { areaScore += score; areaOutOf += outOf; }
+        }
+        strands.push({ strand_id: parseInt(strandId), strand_name: strandEntry.strand_name, sub_strands: strandSubs });
       }
       const areaPct = areaOutOf > 0 ? Math.round(areaScore / areaOutOf * 100 * 10) / 10 : null;
       let areaLevel = 'N/A';
@@ -301,7 +411,7 @@ router.get('/:id/class-report', async (req, res) => {
         else if (areaPct >= 40) areaLevel = 'AE';
         else areaLevel = 'BE';
       }
-      areas[areaId] = { area_id: parseInt(areaId), area_name: area.area_name, sub_areas, total: { score: areaScore, out_of: areaOutOf, pct: areaPct, level: areaLevel } };
+      areas[areaId] = { area_id: parseInt(areaId), area_name: area.area_name, strands, sub_areas: subAreas, total: { score: areaScore, out_of: areaOutOf, pct: areaPct, level: areaLevel } };
       if (areaOutOf > 0) { totalScore += areaScore; totalOutOf += areaOutOf; }
     }
 
@@ -328,8 +438,11 @@ router.get('/:id/class-report', async (req, res) => {
   // Class aggregates
   const areaList = Object.values(areaMap).map(a => ({
     area_id: parseInt(a.area_id), area_name: a.area_name,
-    sub_areas: Object.values(a.sub_areas).map(sa => ({
-      sub_area_id: sa.sub_area_id, sub_area_name: sa.sub_area_name, display_order: sa.display_order
+    strands: Object.values(a.strands).map(st => ({
+      strand_id: st.strand_id, strand_name: st.strand_name,
+      sub_strands: Object.values(st.sub_strands).map(ss => ({
+        sub_strand_id: ss.sub_strand_id, sub_strand_name: ss.sub_strand_name
+      }))
     }))
   }));
 

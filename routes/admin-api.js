@@ -509,9 +509,10 @@ router.post('/schools/setup', async (req, res) => {
       }
     }
 
-    // Learning areas + sub-areas per level — use shared CBC seed module
-    const { seedLearningAreas, seedTerms, seedRubric, seedExamSessions, seedFees } = require('../lib/cbcSeedData');
+    // Learning areas + KICD strands/sub-strands per level — use shared CBC seed module
+    const { seedLearningAreas, seedStrands, seedTerms, seedRubric, seedExamSessions, seedFees } = require('../lib/cbcSeedData');
     await seedLearningAreas(conn, schoolId);
+    await seedStrands(conn, schoolId);
 
     // School terms
     await seedTerms(conn, schoolId, year);
@@ -598,7 +599,7 @@ router.post('/schools/:id/seed-structure', async (req, res) => {
   }
 
   const {
-    seedLearningAreas, seedTerms, seedRubric, seedExamSessions, seedFees
+    seedLearningAreas, seedStrands, seedTerms, seedRubric, seedExamSessions, seedFees
   } = require('../lib/cbcSeedData');
 
   const conn = await req.db.getConnection();
@@ -606,6 +607,7 @@ router.post('/schools/:id/seed-structure', async (req, res) => {
     await conn.beginTransaction();
 
     const areasResult    = await seedLearningAreas(conn, schoolId);
+    const strandsResult  = await seedStrands(conn, schoolId);
     const termsResult    = await seedTerms(conn, schoolId, year);
     const rubricResult   = await seedRubric(conn, schoolId);
     const feesResult     = await seedFees(conn, schoolId, year);
@@ -620,6 +622,7 @@ router.post('/schools/:id/seed-structure', async (req, res) => {
       year,
       summary: {
         learning_areas:  areasResult,
+        strands:         strandsResult,
         terms:           termsResult,
         rubric:          rubricResult,
         fee_structures:  feesResult,
@@ -658,6 +661,18 @@ router.get('/schools/:id/details', async (req, res) => {
     `SELECT sla.sub_area_id, sla.area_id, sla.sub_area_name, sla.display_order
      FROM sub_learning_areas sla JOIN learning_areas la ON sla.area_id = la.area_id
      WHERE la.school_id = ? ORDER BY sla.display_order, sla.sub_area_name`, [id]);
+
+  const [strands] = await req.db.execute(
+    `SELECT st.strand_id, st.area_id, la.area_name, st.strand_name, st.term
+     FROM strands st JOIN learning_areas la ON st.area_id = la.area_id
+     WHERE la.school_id = ? ORDER BY la.area_name, st.strand_name`, [id]);
+
+  const [subStrands] = await req.db.execute(
+    `SELECT ss.sub_strand_id, ss.strand_id, st.strand_name, st.area_id, ss.sub_strand_name
+     FROM sub_strands ss
+     JOIN strands st ON ss.strand_id = st.strand_id
+     JOIN learning_areas la ON st.area_id = la.area_id
+     WHERE la.school_id = ? ORDER BY st.strand_name, ss.sub_strand_name`, [id]);
 
   const [fees] = await req.db.execute(
     'SELECT fee_id, fee_name, amount, term, academic_year, is_optional FROM fee_structures WHERE school_id = ? AND academic_year = ? ORDER BY term, fee_name', [id, year]);
@@ -734,6 +749,8 @@ router.get('/schools/:id/details', async (req, res) => {
     classes,
     learning_areas: learningAreas,
     sub_learning_areas: subLearningAreas,
+    strands,
+    sub_strands: subStrands,
     fees,
     teachers,
     students: studentCount[0]?.total || 0,
