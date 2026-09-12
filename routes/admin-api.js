@@ -1396,7 +1396,8 @@ async function calcRepCommission(db, repId, term, year) {
   const [bulkRows] = await db.execute(
     `SELECT
        sc.school_id,
-       COALESCE(SUM(bp.amount), 0) AS bulk_revenue
+       COALESCE(SUM(bp.amount), 0)  AS bulk_revenue,
+       COUNT(bp.payment_id)          AS bulk_transactions
      FROM schools sc
      LEFT JOIN premium_bulk_payments bp
             ON bp.school_id = sc.school_id
@@ -1408,10 +1409,13 @@ async function calcRepCommission(db, repId, term, year) {
     [term, year, repId]
   );
 
-  // Index bulk revenue by school_id for fast lookup
+  // Index bulk revenue and transaction count by school_id for fast lookup
   const bulkBySchool = {};
   for (const b of bulkRows) {
-    bulkBySchool[b.school_id] = Number(b.bulk_revenue);
+    bulkBySchool[b.school_id] = {
+      revenue:      Number(b.bulk_revenue),
+      transactions: Number(b.bulk_transactions),
+    };
   }
 
   let totalRevenue = 0;
@@ -1419,12 +1423,14 @@ async function calcRepCommission(db, repId, term, year) {
   const breakdown = [];
 
   for (const row of parentRows) {
-    const parentRev = Number(row.parent_revenue);
-    const bulkRev   = bulkBySchool[row.school_id] || 0;
-    const rev       = parentRev + bulkRev;
+    const parentRev   = Number(row.parent_revenue);
+    const bulk        = bulkBySchool[row.school_id] || { revenue: 0, transactions: 0 };
+    const rev         = parentRev + bulk.revenue;
+    // Total transactions = parent subscriptions + bulk payment events
+    const totalTxns   = Number(row.transactions) + bulk.transactions;
 
     const comm = row.commission_type === 'flat'
-      ? Number(row.commission_value) * Number(row.transactions)
+      ? Number(row.commission_value) * totalTxns
       : rev * (Number(row.commission_value) / 100);
 
     totalRevenue    += rev;
@@ -1434,7 +1440,7 @@ async function calcRepCommission(db, repId, term, year) {
       school_id:    row.school_id,
       school_name:  row.school_name,
       revenue:      rev,
-      transactions: Number(row.transactions),
+      transactions: totalTxns,
       commission:   Math.round(comm * 100) / 100
     });
   }
