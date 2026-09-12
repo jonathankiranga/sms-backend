@@ -1,9 +1,9 @@
-const express = require('express');
+﻿const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const { sendEmailOtp } = require('../services/messaging');
 
-// Express 4 does not catch rejected promises from async handlers — without this
+// Express 4 does not catch rejected promises from async handlers â€” without this
 // wrapper any thrown error leaves the request hanging forever.
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -24,25 +24,66 @@ function normalizePhone(raw) {
 }
 
 // Resolve the premium parent by phone OR email; returns canonical contact row.
+// Accepts parents active via:
+//   1. parent_profiles.is_premium = TRUE
+//   2. An active premium_subscriptions row (school-pays model may lag the profile flag)
+//   3. Their school uses payment_model = 'school' (covers all parents unconditionally)
 async function findPremiumParent(db, phone, email) {
-  if (phone) {
-    const [rows] = await db.execute(
-      "SELECT parent_phone, email FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
-      [phone]
-    );
-    if (rows.length > 0) return rows[0];
-  }
-  if (email) {
-    const [rows] = await db.execute(
-      "SELECT parent_phone, email FROM parent_profiles WHERE email = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())",
+  // Resolve canonical phone from email if needed
+  let resolvedPhone = phone;
+  if (!resolvedPhone && email) {
+    const [pp] = await db.execute(
+      'SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1',
       [String(email).trim().toLowerCase()]
     );
-    if (rows.length > 0) return rows[0];
+    resolvedPhone = pp[0]?.parent_phone || null;
   }
+  if (!resolvedPhone) return null;
+
+  // Check 1: direct is_premium flag (paid or prepaid)
+  const [profileRows] = await db.execute(
+    'SELECT parent_phone, email FROM parent_profiles WHERE parent_phone = ? AND is_premium = TRUE AND (premium_expires_at IS NULL OR premium_expires_at > NOW())',
+    [resolvedPhone]
+  );
+  if (profileRows.length > 0) return profileRows[0];
+
+  // Check 2: active premium_subscriptions row (school-pays model)
+  const [subRows] = await db.execute(
+    `SELECT pp.parent_phone, pp.email
+     FROM premium_subscriptions ps
+     JOIN parent_profiles pp ON ps.parent_phone = pp.parent_phone
+     WHERE ps.parent_phone = ?
+       AND ps.payment_status = 'paid'
+       AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+     LIMIT 1`,
+    [resolvedPhone]
+  );
+  if (subRows.length > 0) return subRows[0];
+
+  // Check 3: school covers all parents via school-pays model
+  const [schoolRows] = await db.execute(
+    `SELECT sc.school_id
+     FROM schools sc
+     JOIN students s ON s.school_id = sc.school_id
+     JOIN student_parent_map m ON m.student_id = s.student_id
+     WHERE m.parent_phone = ?
+       AND sc.premium_payment_model = 'school'
+       AND s.enrollment_status = 'Active'
+     LIMIT 1`,
+    [resolvedPhone]
+  );
+  if (schoolRows.length > 0) {
+    const [pp] = await db.execute(
+      'SELECT parent_phone, email FROM parent_profiles WHERE parent_phone = ?',
+      [resolvedPhone]
+    );
+    return pp.length > 0 ? pp[0] : { parent_phone: resolvedPhone, email: null };
+  }
+
   return null;
 }
 
-// POST /api/merchants/auto-login — premium parent opens merchant portal without OTP.
+// POST /api/merchants/auto-login â€” premium parent opens merchant portal without OTP.
 // Returns an existing merchant for their phone, or creates one with a default business name.
 router.post('/auto-login', wrap(async (req, res) => {
   const normPhone = normalizePhone(req.body.phone);
@@ -72,7 +113,7 @@ router.post('/register', wrap(async (req, res) => {
   if (!business_name) return res.status(400).json({ error: 'Business name required' });
   if (!normPhone && !emailInput) return res.status(400).json({ error: 'Phone or email required' });
 
-  // Must be a premium parent — identified by phone OR email
+  // Must be a premium parent â€” identified by phone OR email
   const parent = await findPremiumParent(req.db, normPhone, emailInput);
   if (!parent) return res.status(403).json({ error: 'Only premium parents can register as merchants. Upgrade first.' });
 
@@ -149,7 +190,7 @@ router.get('/campaigns', wrap(async (req, res) => {
 }));
 
 // POST /api/merchants/campaigns
-// Ads run across ALL schools — no targeting. target_school_id stays NULL.
+// Ads run across ALL schools â€” no targeting. target_school_id stays NULL.
 router.post('/campaigns', wrap(async (req, res) => {
   const { merchant_id, message, days } = req.body;
   if (!merchant_id || !message || !days) return res.status(400).json({ error: 'Missing fields' });
@@ -192,7 +233,7 @@ async function ensureMarketTables(db) {
   marketTablesReady = true;
 }
 
-// GET /api/market/products?q=&category= — searchable catalog for parents
+// GET /api/market/products?q=&category= â€” searchable catalog for parents
 router.get('/market/products', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const q = String(req.query.q || '').trim();
@@ -213,7 +254,7 @@ router.get('/market/products', wrap(async (req, res) => {
   res.json({ products: rows });
 }));
 
-// POST /api/merchants/products — merchant adds a listing
+// POST /api/merchants/products â€” merchant adds a listing
 router.post('/products', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const { merchant_id, name, description, category, price, image_url } = req.body;
@@ -229,7 +270,7 @@ router.post('/products', wrap(async (req, res) => {
   res.json({ message: 'Product listed', product_id: pid });
 }));
 
-// GET /api/merchants/products?merchant_id=X — merchant's own listings
+// GET /api/merchants/products?merchant_id=X â€” merchant's own listings
 router.get('/products', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const { merchant_id } = req.query;
@@ -241,7 +282,7 @@ router.get('/products', wrap(async (req, res) => {
   res.json({ products: rows });
 }));
 
-// POST /api/merchants/products/deactivate — merchant hides a listing
+// POST /api/merchants/products/deactivate â€” merchant hides a listing
 router.post('/products/deactivate', wrap(async (req, res) => {
   await ensureMarketTables(req.db);
   const { merchant_id, product_id } = req.body;
@@ -252,3 +293,4 @@ router.post('/products/deactivate', wrap(async (req, res) => {
 }));
 
 module.exports = router;
+
