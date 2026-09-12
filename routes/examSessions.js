@@ -76,30 +76,42 @@ router.delete('/:id', async (req, res) => {
 // GET /api/sub-learning-areas?area_id=X or school_id=X&class_id=Y
 router.get('/sub-learning-areas', async (req, res) => {
   const { area_id, school_id, class_id } = req.query;
+  console.log('[DEBUG /sub-learning-areas] Query params:', { area_id, school_id, class_id });
+  
   if (area_id) {
     const [rows] = await req.db.execute(
       'SELECT * FROM sub_learning_areas WHERE area_id = ? ORDER BY display_order, sub_area_name',
       [area_id]
     );
+    console.log('[DEBUG /sub-learning-areas] area_id path, rows:', rows.length);
     return res.json({ sub_areas: rows });
   }
   if (school_id) {
-    let sql = `SELECT sla.*, la.area_name FROM sub_learning_areas sla
-               JOIN learning_areas la ON sla.area_id = la.area_id
-               WHERE la.school_id = ?`;
-    const params = [school_id];
-    
-    if (class_id) {
-      // Get class level_name to filter learning areas by grade
-      const [classRows] = await req.db.execute('SELECT level_name FROM classes WHERE class_id = ?', [class_id]);
-      if (classRows.length > 0 && classRows[0].level_name) {
-        sql += ' AND la.level_name = ?';
-        params.push(classRows[0].level_name);
-      }
+    if (!class_id) {
+      console.log('[DEBUG /sub-learning-areas] Missing class_id');
+      return res.status(400).json({ error: 'class_id required to filter learning areas by grade' });
     }
     
-    sql += ' ORDER BY la.area_name, sla.display_order, sla.sub_area_name';
-    const [rows] = await req.db.execute(sql, params);
+    // Get class level_name to filter learning areas by grade
+    const [classRows] = await req.db.execute('SELECT level_name FROM classes WHERE class_id = ?', [class_id]);
+    console.log('[DEBUG /sub-learning-areas] Class lookup:', { class_id, classRows: classRows.length > 0 ? classRows[0] : null });
+    
+    if (classRows.length === 0) {
+      return res.status(404).json({ error: 'Class not found' });
+    }
+    if (!classRows[0].level_name) {
+      console.log('[DEBUG /sub-learning-areas] Class missing level_name:', classRows[0]);
+      return res.status(400).json({ error: 'Class has no grade level assigned (level_name is required)' });
+    }
+    
+    const [rows] = await req.db.execute(
+      `SELECT sla.*, la.area_name FROM sub_learning_areas sla
+       JOIN learning_areas la ON sla.area_id = la.area_id
+       WHERE la.school_id = ? AND la.level_name = ?
+       ORDER BY la.area_name, sla.display_order, sla.sub_area_name`,
+      [school_id, classRows[0].level_name]
+    );
+    console.log('[DEBUG /sub-learning-areas] Filtered rows:', rows.length, 'for level:', classRows[0].level_name);
     return res.json({ sub_areas: rows });
   }
   res.status(400).json({ error: 'area_id or school_id required' });
