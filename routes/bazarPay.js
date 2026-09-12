@@ -212,8 +212,8 @@ router.get('/payments', async (req, res) => {
     const offset = (pg - 1) * lim;
 
     const [rows] = await req.db.execute(
-      `SELECT p.*, s.full_name AS student_name, c.class_name ${joins} ${whereClause} ORDER BY p.logged_at DESC LIMIT ? OFFSET ?`,
-      [...params, lim, offset]
+      `SELECT p.*, s.full_name AS student_name, c.class_name ${joins} ${whereClause} ORDER BY p.logged_at DESC LIMIT ${lim} OFFSET ${offset}`,
+      params
     );
 
     res.json({
