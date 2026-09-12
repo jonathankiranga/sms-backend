@@ -176,7 +176,7 @@ router.get('/payments', async (req, res) => {
   try {
     const school_id = req.bursar.school_id;
     const { term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
-    console.log('[PAYMENTS] bursar school_id:', school_id);
+    console.log('[PAYMENTS] bursar school_id:', school_id, 'page:', page, 'limit:', limit, 'pg:', Math.max(1, parseInt(page) || 1), 'lim:', Math.max(1, Math.min(200, parseInt(limit) || 50)));
 
     const where = ['p.school_id = ?'];
     const params = [school_id];
@@ -199,10 +199,12 @@ router.get('/payments', async (req, res) => {
     const whereClause = 'WHERE ' + where.join(' AND ');
     const joins = 'FROM payment_ledger p LEFT JOIN students s ON p.student_reference = s.student_id LEFT JOIN classes c ON s.class_id = c.class_id';
 
+    console.log('[PAYMENTS] count params:', JSON.stringify(params));
     const [[countRow]] = await req.db.execute(
       `SELECT COUNT(*) AS total ${joins} ${whereClause}`,
       params
     );
+    console.log('[PAYMENTS] totalRecords:', countRow?.total);
     const totalRecords = Number(countRow?.total || 0);
 
     const pg = Math.max(1, parseInt(page) || 1);
