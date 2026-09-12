@@ -73,9 +73,9 @@ router.delete('/:id', async (req, res) => {
 
 // ─── SUB-LEARNING AREAS ─────────────────────────────────────────
 
-// GET /api/sub-learning-areas?area_id=X
+// GET /api/sub-learning-areas?area_id=X or school_id=X&class_id=Y
 router.get('/sub-learning-areas', async (req, res) => {
-  const { area_id, school_id } = req.query;
+  const { area_id, school_id, class_id } = req.query;
   if (area_id) {
     const [rows] = await req.db.execute(
       'SELECT * FROM sub_learning_areas WHERE area_id = ? ORDER BY display_order, sub_area_name',
@@ -84,12 +84,22 @@ router.get('/sub-learning-areas', async (req, res) => {
     return res.json({ sub_areas: rows });
   }
   if (school_id) {
-    const [rows] = await req.db.execute(
-      `SELECT sla.*, la.area_name FROM sub_learning_areas sla
-       JOIN learning_areas la ON sla.area_id = la.area_id
-       WHERE la.school_id = ? ORDER BY la.area_name, sla.display_order, sla.sub_area_name`,
-      [school_id]
-    );
+    let sql = `SELECT sla.*, la.area_name FROM sub_learning_areas sla
+               JOIN learning_areas la ON sla.area_id = la.area_id
+               WHERE la.school_id = ?`;
+    const params = [school_id];
+    
+    if (class_id) {
+      // Get class level_name to filter learning areas by grade
+      const [classRows] = await req.db.execute('SELECT level_name FROM classes WHERE class_id = ?', [class_id]);
+      if (classRows.length > 0 && classRows[0].level_name) {
+        sql += ' AND la.level_name = ?';
+        params.push(classRows[0].level_name);
+      }
+    }
+    
+    sql += ' ORDER BY la.area_name, sla.display_order, sla.sub_area_name';
+    const [rows] = await req.db.execute(sql, params);
     return res.json({ sub_areas: rows });
   }
   res.status(400).json({ error: 'area_id or school_id required' });
