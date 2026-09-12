@@ -205,8 +205,8 @@ router.get('/payments', async (req, res) => {
     );
     const totalRecords = Number(countRow?.total || 0);
 
-    const pg = Math.max(1, parseInt(page));
-    const lim = Math.max(1, Math.min(200, parseInt(limit)));
+    const pg = Math.max(1, parseInt(page) || 1);
+    const lim = Math.max(1, Math.min(200, parseInt(limit) || 50));
     const offset = (pg - 1) * lim;
 
     const [rows] = await req.db.execute(
