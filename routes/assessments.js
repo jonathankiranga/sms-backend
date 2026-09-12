@@ -182,14 +182,36 @@ router.get('/class-report/:class_id/:term', async (req, res) => {
   });
 });
 
-// GET /api/assessments/areas?school_id=X&level=Grade 4
+// GET /api/assessments/areas?school_id=X&level=Grade 4 or class_id=Y
 router.get('/areas', async (req, res) => {
-  const { school_id, level } = req.query;
+  const { school_id, level, class_id } = req.query;
+  console.log('[DEBUG /api/assessments/areas] Query:', { school_id, level, class_id });
+  
   if (!school_id) return res.status(400).json({ error: 'school_id required' });
+  
+  let targetLevel = level;
+  
+  if (class_id) {
+    // Look up class to get its level_name
+    const [classRows] = await req.db.execute('SELECT level_name FROM classes WHERE class_id = ?', [class_id]);
+    if (classRows.length === 0) {
+      return res.status(404).json({ error: 'Class not found' });
+    }
+    if (!classRows[0].level_name) {
+      return res.status(400).json({ error: 'Class has no grade level assigned (level_name is required)' });
+    }
+    targetLevel = classRows[0].level_name;
+  }
+  
+  if (!targetLevel || targetLevel.trim() === '') {
+    return res.status(400).json({ error: 'level (grade) required to filter learning areas' });
+  }
+  
   const [rows] = await req.db.execute(
-    'SELECT area_id, area_name, level_name FROM learning_areas WHERE school_id = ? AND (level_name = ? OR ? IS NULL) ORDER BY area_name',
-    [school_id, level || '', level || null]
+    'SELECT area_id, area_name, level_name FROM learning_areas WHERE school_id = ? AND level_name = ? ORDER BY area_name',
+    [school_id, targetLevel]
   );
+  console.log('[DEBUG /api/assessments/areas] Rows:', rows.length, 'for level:', targetLevel);
   res.json({ areas: rows });
 });
 
