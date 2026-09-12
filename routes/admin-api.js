@@ -1666,6 +1666,24 @@ router.put('/commission/payments/:paymentId/mark-paid', async (req, res) => {
        JSON.stringify({ commission_amount: rows[0].commission_amount, payment_reference })]
     );
 
+    // Credit the rep's wallet
+    try {
+      const commAmt = Number(rows[0].commission_amount);
+      const repId   = rows[0].rep_id;
+      await req.db.execute(
+        'INSERT INTO rep_wallets (rep_id, balance, total_credited, total_withdrawn) VALUES (?, ?, ?, 0) ON DUPLICATE KEY UPDATE balance = balance + VALUES(balance), total_credited = total_credited + VALUES(total_credited)',
+        [repId, commAmt, commAmt]
+      );
+      const [[w]] = await req.db.execute('SELECT balance FROM rep_wallets WHERE rep_id = ?', [repId]);
+      await req.db.execute(
+        "INSERT INTO wallet_transactions (rep_id, txn_type, amount, balance_after, description, reference_id, reference_type) VALUES (?, 'credit', ?, ?, ?, ?, 'commission_payment')",
+        [repId, commAmt, Number(w.balance), `Commission payout: ${rows[0].term} ${rows[0].year}`, String(paymentId)]
+      );
+    } catch (walletErr) {
+      console.error('[WALLET CREDIT]', walletErr.message);
+      // Non-blocking — commission payment still marked paid
+    }
+
     res.json({ updated: true, payment_id: parseInt(paymentId), payment_status: 'paid' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1723,6 +1741,57 @@ router.get('/revenue/sales-reps-by-term', async (req, res) => {
     });
 
     res.json({ sales_rep_revenue: result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Wallet Admin Routes ──────────────────────────────────────────────────────
+
+// GET /admin/api/wallets — all rep wallets summary
+router.get('/wallets', async (req, res) => {
+  try {
+    const [rows] = await req.db.execute(
+      `SELECT sr.rep_id, sr.full_name, sr.phone,
+              COALESCE(w.balance, 0)          AS balance,
+              COALESCE(w.total_credited, 0)   AS total_credited,
+              COALESCE(w.total_withdrawn, 0)  AS total_withdrawn
+       FROM sales_reps sr
+       LEFT JOIN rep_wallets w ON w.rep_id = sr.rep_id
+       ORDER BY sr.full_name`
+    );
+    res.json({ wallets: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /admin/api/wallets/:repId — single rep wallet detail
+router.get('/wallets/:repId', async (req, res) => {
+  try {
+    const [repRows] = await req.db.execute('SELECT rep_id, full_name, phone FROM sales_reps WHERE rep_id = ?', [req.params.repId]);
+    if (!repRows.length) return res.status(404).json({ error: 'Rep not found' });
+    await req.db.execute(
+      'INSERT IGNORE INTO rep_wallets (rep_id, balance, total_credited, total_withdrawn) VALUES (?, 0, 0, 0)',
+      [req.params.repId]
+    );
+    const [[wallet]] = await req.db.execute('SELECT balance, total_credited, total_withdrawn FROM rep_wallets WHERE rep_id = ?', [req.params.repId]);
+    const [txns] = await req.db.execute(
+      'SELECT txn_id, txn_type, amount, balance_after, description, reference_type, created_at FROM wallet_transactions WHERE rep_id = ? ORDER BY created_at DESC LIMIT 100',
+      [req.params.repId]
+    );
+    const [withdrawals] = await req.db.execute(
+      'SELECT withdrawal_id, amount, status, mpesa_phone, mpesa_reference, requested_at, completed_at, failure_reason FROM wallet_withdrawals WHERE rep_id = ? ORDER BY requested_at DESC',
+      [req.params.repId]
+    );
+    res.json({
+      rep: repRows[0],
+      balance:         Number(wallet.balance),
+      total_credited:  Number(wallet.total_credited),
+      total_withdrawn: Number(wallet.total_withdrawn),
+      transactions:    txns,
+      withdrawals:     withdrawals,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

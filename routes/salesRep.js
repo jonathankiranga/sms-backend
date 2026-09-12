@@ -402,4 +402,159 @@ router.post('/payments', requireSalesRepAuth, async (req, res) => {
   }
 });
 
+// ─── Wallet ───────────────────────────────────────────────────────────────────
+// GET /api/sales-rep/wallet  — get wallet balance + recent transactions
+router.get('/wallet', requireSalesRepAuth, async (req, res) => {
+  const { rep_id } = req.salesRep;
+  try {
+    // Ensure wallet row exists
+    await req.db.execute(
+      'INSERT IGNORE INTO rep_wallets (rep_id, balance, total_credited, total_withdrawn) VALUES (?, 0, 0, 0)',
+      [rep_id]
+    );
+    const [[wallet]] = await req.db.execute(
+      'SELECT balance, total_credited, total_withdrawn FROM rep_wallets WHERE rep_id = ?',
+      [rep_id]
+    );
+    const [txns] = await req.db.execute(
+      'SELECT txn_id, txn_type, amount, balance_after, description, reference_type, created_at FROM wallet_transactions WHERE rep_id = ? ORDER BY created_at DESC LIMIT 50',
+      [rep_id]
+    );
+    const [withdrawals] = await req.db.execute(
+      'SELECT withdrawal_id, amount, status, mpesa_phone, mpesa_reference, requested_at, completed_at FROM wallet_withdrawals WHERE rep_id = ? ORDER BY requested_at DESC LIMIT 20',
+      [rep_id]
+    );
+    res.json({
+      balance:          Number(wallet.balance),
+      total_credited:   Number(wallet.total_credited),
+      total_withdrawn:  Number(wallet.total_withdrawn),
+      transactions:     txns,
+      withdrawals:      withdrawals,
+    });
+  } catch (err) {
+    console.error('[WALLET GET]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/sales-rep/wallet/withdraw  — request M-Pesa withdrawal
+// Body: { amount, mpesa_phone }
+router.post('/wallet/withdraw', requireSalesRepAuth, async (req, res) => {
+  const { rep_id, phone } = req.salesRep;
+  const { amount, mpesa_phone } = req.body;
+
+  if (!amount || isNaN(amount) || Number(amount) <= 0) {
+    return res.status(400).json({ error: 'Valid amount required' });
+  }
+  const withdrawAmount = Math.round(Number(amount) * 100) / 100;
+  const targetPhone = mpesa_phone || phone;
+  if (!targetPhone) return res.status(400).json({ error: 'M-Pesa phone number required' });
+
+  const conn = await req.db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Ensure wallet exists and lock the row
+    await conn.execute(
+      'INSERT IGNORE INTO rep_wallets (rep_id, balance, total_credited, total_withdrawn) VALUES (?, 0, 0, 0)',
+      [rep_id]
+    );
+    const [[wallet]] = await conn.execute(
+      'SELECT balance FROM rep_wallets WHERE rep_id = ? FOR UPDATE',
+      [rep_id]
+    );
+    const currentBalance = Number(wallet.balance);
+    if (withdrawAmount > currentBalance) {
+      await conn.rollback();
+      return res.status(400).json({
+        error: `Insufficient balance. Available: KSh ${currentBalance.toLocaleString()}, Requested: KSh ${withdrawAmount.toLocaleString()}`
+      });
+    }
+
+    // Create withdrawal record
+    const [wResult] = await conn.execute(
+      "INSERT INTO wallet_withdrawals (rep_id, amount, status, mpesa_phone) VALUES (?, ?, 'processing', ?)",
+      [rep_id, withdrawAmount, targetPhone]
+    );
+    const withdrawalId = wResult.insertId;
+
+    // Deduct from wallet immediately (holds the funds while processing)
+    const newBalance = currentBalance - withdrawAmount;
+    await conn.execute(
+      'UPDATE rep_wallets SET balance = ?, total_withdrawn = total_withdrawn + ? WHERE rep_id = ?',
+      [newBalance, withdrawAmount, rep_id]
+    );
+
+    // Record wallet transaction
+    await conn.execute(
+      "INSERT INTO wallet_transactions (rep_id, txn_type, amount, balance_after, description, reference_id, reference_type) VALUES (?, 'debit', ?, ?, ?, ?, 'withdrawal')",
+      [rep_id, withdrawAmount, newBalance, `Withdrawal via M-Pesa to ${targetPhone}`, String(withdrawalId)]
+    );
+
+    await conn.commit();
+
+    // Trigger M-Pesa STK push (non-blocking after commit)
+    try {
+      const mpesa = require('../services/mpesa');
+      // Use a school's mpesa credentials — find any school assigned to this rep
+      const [schoolRows] = await req.db.execute(
+        'SELECT school_id FROM schools WHERE sales_rep_id = ? AND mpesa_callback_key IS NOT NULL LIMIT 1',
+        [rep_id]
+      );
+      let stkResult = null;
+      if (schoolRows.length > 0) {
+        const schoolId = schoolRows[0].school_id;
+        const [keyRows] = await req.db.execute('SELECT mpesa_callback_key FROM schools WHERE school_id = ?', [schoolId]);
+        const callbackKey = keyRows[0]?.mpesa_callback_key;
+        const reference = `WDR-${withdrawalId}`;
+        stkResult = await mpesa.stkPush(targetPhone, withdrawAmount, reference, 'Commission withdrawal', { callbackKey });
+        if (stkResult?.CheckoutRequestID) {
+          await req.db.execute(
+            'UPDATE wallet_withdrawals SET checkout_request_id = ?, mpesa_reference = ? WHERE withdrawal_id = ?',
+            [stkResult.CheckoutRequestID, reference, withdrawalId]
+          );
+        }
+      } else {
+        // No school with M-Pesa credentials — mark as completed (manual payout)
+        await req.db.execute(
+          "UPDATE wallet_withdrawals SET status = 'completed', completed_at = NOW() WHERE withdrawal_id = ?",
+          [withdrawalId]
+        );
+      }
+    } catch (mpesaErr) {
+      // M-Pesa failed — reverse the deduction
+      console.error('[WALLET WITHDRAW MPESA]', mpesaErr.message);
+      await req.db.execute(
+        'UPDATE rep_wallets SET balance = balance + ?, total_withdrawn = total_withdrawn - ? WHERE rep_id = ?',
+        [withdrawAmount, withdrawAmount, rep_id]
+      );
+      await req.db.execute(
+        "UPDATE wallet_withdrawals SET status = 'failed', failure_reason = ? WHERE withdrawal_id = ?",
+        [mpesaErr.message, withdrawalId]
+      );
+      // Remove the debit transaction
+      await req.db.execute(
+        "DELETE FROM wallet_transactions WHERE reference_id = ? AND reference_type = 'withdrawal'",
+        [String(withdrawalId)]
+      );
+      return res.status(502).json({ error: 'M-Pesa STK push failed: ' + mpesaErr.message });
+    }
+
+    res.json({
+      withdrawal_id: withdrawalId,
+      amount:        withdrawAmount,
+      balance_after: newBalance,
+      mpesa_phone:   targetPhone,
+      status:        'processing',
+      message:       `KSh ${withdrawAmount.toLocaleString()} withdrawal initiated. Check your phone for M-Pesa prompt.`
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error('[WALLET WITHDRAW]', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 module.exports = router;
