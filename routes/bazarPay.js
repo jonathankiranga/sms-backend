@@ -174,8 +174,9 @@ router.post('/reverse-payment', async (req, res) => {
 // GET /api/bazar-pay/payments — list payments with filters
 router.get('/payments', async (req, res) => {
   try {
-    const { school_id, term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
-    if (!school_id) return res.status(400).json({ error: 'school_id required' });
+    const school_id = req.bursar.school_id;
+    const { term, year, method, student_id, search, page = 1, limit = 50 } = req.query;
+    console.log('[PAYMENTS] bursar school_id:', school_id);
 
     const where = ['p.school_id = ?'];
     const params = [school_id];
