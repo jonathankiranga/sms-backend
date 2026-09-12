@@ -29,14 +29,22 @@ router.get('/class-report/:class_id/:term', async (req, res) => {
     [klass.class_id, term, year]
   );
 
-  // Learning areas for this class (all areas that have sub_learning_areas with results)
+  // Learning areas for this class — scoped to the class's level_name so we only
+  // show columns relevant to this grade, not all areas across the whole school.
+  // Falls back to all school areas if level_name is not set on the class.
+  const areaParams = klass.level_name
+    ? [klass.school_id, klass.level_name]
+    : [klass.school_id];
+  const areaWhere = klass.level_name
+    ? 'la.school_id = ? AND la.level_name = ?'
+    : 'la.school_id = ?';
   const [allAreas] = await req.db.execute(
     `SELECT DISTINCT la.area_id, la.area_name
      FROM learning_areas la
      JOIN sub_learning_areas sla ON la.area_id = sla.area_id
-     WHERE la.school_id = ?
+     WHERE ${areaWhere}
      ORDER BY la.area_name`,
-    [klass.school_id]
+    areaParams
   );
 
   if (sessions.length === 0) {
