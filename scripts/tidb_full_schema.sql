@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS teachers (
   full_name       VARCHAR(100) NOT NULL,
   phone           VARCHAR(20)  NOT NULL,
   email           VARCHAR(120) NULL,
-  role            ENUM('teacher','head','bursar') DEFAULT 'teacher',
+  role            ENUM('teacher','head','bursar','school_admin') DEFAULT 'teacher',
   school_id       CHAR(9)      NOT NULL,
   subjects_taught JSON         NULL,
   push_subscription JSON       NULL,
