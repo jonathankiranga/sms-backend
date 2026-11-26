@@ -322,7 +322,7 @@ router.post('/query', async (req, res) => {
 
 // M-Pesa C2B confirmation callback (Safaricom → us)
 router.post('/mpesa', async (req, res) => {
-  return handleC2BConfirmation(req, res, school.school_id);
+  return handleC2BConfirmation(req, res);
 });
 
 router.post('/secret/:callback_key/v', async (req, res) => {
@@ -330,6 +330,14 @@ router.post('/secret/:callback_key/v', async (req, res) => {
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) {
     return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
+  }
+  const billRef = String(req.body.BillRefNumber || '').trim();
+  const [learners] = await req.db.execute(
+    'SELECT student_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+    [billRef, school.school_id]
+  );
+  if (learners.length === 0) {
+    return res.status(200).json({ ResultCode: 1, ResultDesc: 'Unknown learner account reference' });
   }
   return res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
@@ -340,7 +348,7 @@ router.post('/secret/:callback_key/c', async (req, res) => {
   if (!school) {
     return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
   }
-  return handleC2BConfirmation(req, res);
+  return handleC2BConfirmation(req, res, school.school_id);
 });
 
 router.post('/secret/:callback_key/s', async (req, res) => {
@@ -357,6 +365,14 @@ router.post('/cb/:callback_key/v', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
+  const billRef = String(req.body.BillRefNumber || '').trim();
+  const [learners] = await req.db.execute(
+    'SELECT student_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+    [billRef, school.school_id]
+  );
+  if (learners.length === 0) {
+    return res.status(200).json({ ResultCode: 1, ResultDesc: 'Unknown learner account reference' });
+  }
   return res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
@@ -364,7 +380,7 @@ router.post('/cb/:callback_key/c', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
-  return handleC2BConfirmation(req, res);
+  return handleC2BConfirmation(req, res, school.school_id);
 });
 
 router.post('/cb/:callback_key/s', async (req, res) => {
