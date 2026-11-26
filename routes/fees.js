@@ -42,7 +42,8 @@ async function requireFeeStaff(req, res, next) {
     const session = await readSession(req);
     if (!session) return res.status(401).json({ error: 'Authentication required' });
     const staff = await resolveStaff(req.db, session);
-    if (!staff || !['head', 'bursar'].includes(staff.role) || staff.active === 0) {
+    const allowedRoles = req.method === 'GET' && req.path === '/classes' ? ['teacher', 'head', 'bursar'] : ['head', 'bursar'];
+    if (!staff || !allowedRoles.includes(staff.role) || staff.active === 0) {
       return res.status(403).json({ error: 'Headteacher or bursar access is required' });
     }
 
