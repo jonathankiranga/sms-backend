@@ -62,7 +62,7 @@ async function requireFeeStaff(req, res, next) {
       }
     }
 
-    const requestedSchool = req.body.school_id || req.query.school_id;
+    const requestedSchool = (req.body && req.body.school_id) || req.query.school_id;
     if (requestedSchool && requestedSchool !== staff.school_id) {
       return res.status(403).json({ error: 'You cannot access another school' });
     }
