@@ -62,6 +62,24 @@ async function requireFeeStaff(req, res, next) {
       }
     }
 
+    const requestedClassId = req.body && req.body.class_id;
+    if (requestedClassId) {
+      const [classes] = await req.db.execute(
+        'SELECT class_id FROM classes WHERE class_id = ? AND school_id = ? LIMIT 1',
+        [requestedClassId, staff.school_id]
+      );
+      if (!classes[0]) return res.status(403).json({ error: 'Class does not belong to your school' });
+    }
+
+    const requestedStudentId = req.body && req.body.student_id;
+    if (requestedStudentId) {
+      const [students] = await req.db.execute(
+        'SELECT student_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+        [requestedStudentId, staff.school_id]
+      );
+      if (!students[0]) return res.status(403).json({ error: 'Learner does not belong to your school' });
+    }
+
     const requestedSchool = (req.body && req.body.school_id) || req.query.school_id;
     if (requestedSchool && requestedSchool !== staff.school_id) {
       return res.status(403).json({ error: 'You cannot access another school' });
