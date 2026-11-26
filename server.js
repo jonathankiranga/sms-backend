@@ -177,6 +177,7 @@ app.use((req, res, next) => {
 // Apply rate limiting to OTP routes
 app.use('/api/teachers/request-otp', otpLimiter);
 app.use('/api/parents/request-otp', otpLimiter);
+app.use('/api/parents/premium-status', otpLimiter);
 app.use('/api/merchants/request-otp', otpLimiter);
 app.use('/api/merchants/register', otpLimiter);
 app.use('/api/sales-rep/request-otp', otpLimiter);
