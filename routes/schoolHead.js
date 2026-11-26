@@ -457,17 +457,44 @@ router.post('/:schoolId/students/import', async (req, res) => {
 
   const { class_id, csv } = req.body;
   if (!class_id || !csv) return res.status(400).json({ error: 'class_id and csv required' });
-  const lines = csv.trim().split('\n');
+
+  const [classRows] = await req.db.execute(
+    'SELECT class_id FROM classes WHERE class_id = ? AND school_id = ?',
+    [class_id, req.params.schoolId]
+  );
+  if (classRows.length === 0) return res.status(400).json({ error: 'Class not found for this school' });
+
+  const normalizeParentPhone = value => {
+    const phone = String(value || '').replace(/[\\s-]/g, '').replace(/^\\+/, '');
+    if (/^0[17]\\d{8}$/.test(phone)) return '254' + phone.slice(1);
+    if (/^[17]\\d{8}$/.test(phone)) return '254' + phone;
+    if (/^254[17]\\d{8}$/.test(phone)) return phone;
+    return '';
+  };
+
+  const lines = csv.trim().split(/\\r?\\n/);
   let imported = 0, errors = 0, parentsLinked = 0;
-  for (const line of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+    const line = lines[lineIndex];
     const parts = line.split(',');
+    if (lineIndex === 0 && /^student[_ ]?id$/i.test((parts[0] || '').trim())) continue;
     if (parts.length < 2) { errors++; continue; }
+
     const student_id = parts[0].trim();
     const full_name = parts[1].trim();
-    if (!student_id || !full_name) { errors++; continue; }
-    const nemis_number = parts.length >= 3 && parts[2].trim() && !parts[2].trim().startsWith('254') ? parts[2].trim() : '';
-    const parent_phone = parts.length >= 4 ? parts[3].trim() : (parts.length >= 3 && parts[2].trim().startsWith('254') ? parts[2].trim() : '');
-    const parent_name = parts.length >= 5 ? parts.slice(4).join(',').trim() : '';
+    if (!student_id || student_id.length !== 9 || !full_name) { errors++; continue; }
+
+    const third = (parts[2] || '').trim();
+    const thirdIsPhone = !!normalizeParentPhone(third);
+    const nemis_number = third && !thirdIsPhone ? third : '';
+    const parentPhoneRaw = thirdIsPhone ? third : (parts[3] || '').trim();
+    const parent_phone = normalizeParentPhone(parentPhoneRaw);
+    const parent_name = thirdIsPhone
+      ? parts.slice(3).join(',').trim()
+      : parts.slice(4).join(',').trim();
+
+    if (parentPhoneRaw && !parent_phone) { errors++; continue; }
+
     try {
       await req.db.execute('INSERT INTO students (student_id, full_name, class_id, school_id, nemis_number) VALUES (?, ?, ?, ?, ?)',
         [student_id, full_name, class_id, req.params.schoolId, nemis_number || null]);
