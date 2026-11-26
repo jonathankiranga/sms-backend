@@ -954,7 +954,7 @@ router.post('/teachers', async (req, res) => {
 router.put('/teachers/:id', async (req, res) => {
   try {
     const { full_name, phone, email, role, active, school_id } = req.body;
-    if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
+    if (role && !['teacher', 'head', 'bursar', 'school_admin'].includes(role)) return res.status(400).json({ error: 'Invalid staff role.' });
     const fields = [];
     const params = [];
     if (full_name) { fields.push('full_name = ?'); params.push(full_name); }
