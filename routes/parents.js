@@ -110,7 +110,7 @@ router.post('/verify-otp', wrap(async (req, res) => {
     linkedChildren = childrenCountRows[0]?.cnt || 0;
   }
 
-  res.json({ phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
+  res.json({ session_id, phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
 }));
 
 // Protect parent records with the verified OTP session, not a caller-supplied phone.
