@@ -3,7 +3,7 @@ const router = express.Router();
 const { verifyToken } = require('../lib/auth');
 const { genId, nextTeacherId } = require('../lib/ids');
 
-async function requireSchoolManager(req, res) {
+async function requireHead(req, res) {
   const auth = (req.headers.authorization || '').trim();
   if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
   const sessionId = auth.split(' ')[1];
