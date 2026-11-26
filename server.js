@@ -114,17 +114,12 @@ async function runMigrationsIfNeeded() {
     const path = require('path');
     const scriptsDir = path.join(__dirname, 'scripts');
     const files = await fs.readdir(scriptsDir);
-    const sqlFiles = files.filter(f => f.endsWith('.sql') && (/^\\d{4}/.test(f) || /^migration_/i.test(f) || f === 'tidb_full_schema.sql' || /^zz_\\d{8}_/.test(f))).sort();
+    const sqlFiles = files.filter(f => f.endsWith('.sql') && (/^\d{4}/.test(f) || /^migration_/i.test(f) || f === 'tidb_full_schema.sql' || /^zz_\d{8}_/.test(f))).sort();
     if (sqlFiles.length === 0) { console.log('No SQL migration files found in', scriptsDir); return; }
 
     // Use a dedicated connection with multipleStatements for running migration SQL files
     const migrationPool = mysql.createPool({
-      host: process.env.DB_HOST,
-      port: parseInt(process.env.DB_PORT || '3306'),
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME,
-      ssl: process.env.DB_SSL === 'true' ? (process.env.DB_SSL_CA ? { ca: process.env.DB_SSL_CA } : {}) : process.env.DB_SSL_CA ? { ca: process.env.DB_SSL_CA } : false,
+      ...poolConfig,
       waitForConnections: true,
       connectionLimit: 1,
       queueLimit: 0,
