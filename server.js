@@ -180,6 +180,7 @@ app.use('/api/parents/request-otp', otpLimiter);
 app.use('/api/merchants/request-otp', otpLimiter);
 app.use('/api/merchants/register', otpLimiter);
 app.use('/api/sales-rep/request-otp', otpLimiter);
+app.use('/admin/api/request-otp', otpLimiter);
 
 // Reusable auth middleware — verifies Bearer token from OTP session
 async function authenticate(req, res, next) {
