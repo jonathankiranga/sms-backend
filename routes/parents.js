@@ -133,7 +133,7 @@ async function requireParentSession(req, res, next) {
     const sessionPhone = normalizePhone(session.phone);
     if (!sessionPhone) return res.status(403).json({ error: 'Verified parent phone is not linked to this session' });
 
-    const suppliedPhone = req.params.phone || req.body.phone || req.query.phone;
+    const suppliedPhone = req.params.phone || (req.body && req.body.phone) || req.query.phone;
     if (suppliedPhone && normalizePhone(suppliedPhone) !== sessionPhone) {
       return res.status(403).json({ error: 'This session cannot access another parent account' });
     }
