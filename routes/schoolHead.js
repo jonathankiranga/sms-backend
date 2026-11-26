@@ -55,28 +55,28 @@ async function requireSchoolManager(req, res) {
   let teachers = [];
   if (session.teacher_id) {
     const [rows] = await req.db.execute(
-      'SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ? LIMIT 1',
+      'SELECT teacher_id, role, school_id, active FROM teachers WHERE teacher_id = ? LIMIT 1',
       [session.teacher_id]
     );
     teachers = rows;
   }
   if (teachers.length === 0 && session.phone) {
     const [rows] = await req.db.execute(
-      "SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? AND role IN ('head','school_admin') LIMIT 1",
+      "SELECT teacher_id, role, school_id, active FROM teachers WHERE phone = ? AND role IN ('head','school_admin') LIMIT 1",
       [session.phone]
     );
     teachers = rows;
   }
   if (teachers.length === 0 && session.email) {
     const [rows] = await req.db.execute(
-      "SELECT teacher_id, role, school_id FROM teachers WHERE email = ? AND role IN ('head','school_admin') LIMIT 1",
+      "SELECT teacher_id, role, school_id, active FROM teachers WHERE email = ? AND role IN ('head','school_admin') LIMIT 1",
       [session.email]
     );
     teachers = rows;
   }
 
   const staff = teachers[0];
-  if (!staff || !['head', 'school_admin'].includes(staff.role)) {
+  if (!staff || !['head', 'school_admin'].includes(staff.role) || staff.active === 0) {
     res.status(403).json({ error: 'Headteacher or school administrator access is required' });
     return null;
   }
