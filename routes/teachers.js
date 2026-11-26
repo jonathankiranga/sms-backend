@@ -52,7 +52,7 @@ router.post('/verify-otp', async (req, res) => {
   const { session_id, code } = req.body;
   const role = (req.body.role || '').toLowerCase();
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
-  if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required (teacher, head or bursar)' });
+  if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required (teacher, head, bursar or school_admin)' });
 
   const [rows] = await req.db.execute(
     'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
