@@ -36,6 +36,8 @@ async function requireHead(req, res) {
 
 // List teachers for the school (public-ish)
 router.get('/:schoolId/teachers', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const [rows] = await req.db.execute(
     'SELECT teacher_id, full_name, phone, email, role, active FROM teachers WHERE school_id = ? ORDER BY full_name',
     [req.params.schoolId]
@@ -45,6 +47,8 @@ router.get('/:schoolId/teachers', async (req, res) => {
 
 // List classes for the school
 router.get('/:schoolId/classes', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const [rows] = await req.db.execute(
     'SELECT class_id, class_name, stream, level_name, academic_year, class_rank FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
     [req.params.schoolId]
@@ -54,6 +58,8 @@ router.get('/:schoolId/classes', async (req, res) => {
 
 // List students for the school (optional ?class_id= filter)
 router.get('/:schoolId/students', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const { class_id } = req.query;
   let sql = 'SELECT st.*, c.class_name FROM students st JOIN classes c ON st.class_id = c.class_id WHERE st.school_id = ?';
   const params = [req.params.schoolId];
@@ -65,6 +71,8 @@ router.get('/:schoolId/students', async (req, res) => {
 
 // Get one student (used by the report-card header for profile fields)
 router.get('/:schoolId/students/:studentId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   try {
     const [rows] = await req.db.execute(
       `SELECT st.*, c.class_name FROM students st JOIN classes c ON st.class_id = c.class_id
@@ -189,6 +197,8 @@ router.delete('/:schoolId/classes/:classId', async (req, res) => {
 
 // List streams for the school
 router.get('/:schoolId/streams', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const [rows] = await req.db.execute(
     'SELECT stream_id, stream_name, display_order FROM school_streams WHERE school_id = ? ORDER BY display_order, stream_name',
     [req.params.schoolId]
@@ -511,6 +521,8 @@ router.post('/:schoolId/students/import', async (req, res) => {
 
 // Analytics — attendance summary per class for school head
 router.get('/:schoolId/analytics/attendance', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const { days } = req.query;
   const period = parseInt(days) || 30;
   const [rows] = await req.db.execute(
@@ -713,6 +725,8 @@ module.exports = router;
 // DELETE /:schoolId/terms/:id  — delete a term (head only)
 
 router.get('/:schoolId/terms', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   try {
     const [rows] = await req.db.execute(
       'SELECT id AS term_id, term_name, start_date, end_date, academic_year FROM school_terms WHERE school_id = ? ORDER BY academic_year DESC, start_date ASC',
@@ -784,6 +798,8 @@ router.delete('/:schoolId/terms/:termId', async (req, res) => {
 // for that year. Used by the headteacher dashboard to show a promotion reminder.
 
 router.get('/:schoolId/year-end-status', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   try {
     const schoolId = req.params.schoolId;
     const today = new Date();
