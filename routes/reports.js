@@ -39,7 +39,7 @@ async function ensureAssignmentsTable(db) {
 
 // ---- Scope helper: returns class_ids the staff may access ----
 async function getScopedClassIds(db, staff, explicitClassId) {
-  if (staff.role === 'head') {
+  if (staff.role === 'head' || staff.role === 'school_admin') {
     const [rows] = await db.execute('SELECT class_id FROM classes WHERE school_id = ?', [staff.school_id]);
     const all = rows.map(r => r.class_id);
     if (explicitClassId && !all.includes(Number(explicitClassId))) return []; // head can't peek another school
