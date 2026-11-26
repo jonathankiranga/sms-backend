@@ -1,6 +1,7 @@
 const express = require('express');
 const path = require('path');
 const axios = require('axios');
+const crypto = require('crypto');
 const router = express.Router();
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'jonathankiranga@gmail.com';
@@ -13,7 +14,8 @@ router.get('/', (req, res) => {
 
 // Legacy password login (simple admin password via x-admin-key)
 router.post('/login', express.json(), (req, res) => {
-  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+  const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+  if (!ADMIN_PASSWORD) return res.status(503).json({ error: 'Admin password login is not configured' });
   if (req.body.password && req.body.password === ADMIN_PASSWORD) {
     return res.json({ token: 'authenticated' });
   }
@@ -58,12 +60,17 @@ router.get('/auth/google', (req, res) => {
 
 // Development fallback: immediately redirect back to admin UI with default admin email
 // This endpoint is intentionally restricted in production. Set ALLOW_DEV_FALLBACK=true to permit in non-local environments.
-router.get('/auth/google/dev', (req, res) => {
-  if (process.env.NODE_ENV === 'production' && (process.env.ALLOW_DEV_FALLBACK || '').toLowerCase() !== 'true') {
+router.get('/auth/google/dev', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
     return res.status(403).send('Dev fallback disabled in production');
   }
-  // WARNING: dev fallback — ONLY for local/dev usage. This does not authenticate with Google.
-  return res.redirect(`/admin?admin_email=${encodeURIComponent(ADMIN_EMAIL)}&dev=1`);
+  // Local development only: issue a short-lived server-side admin session.
+  const sessionId = crypto.randomBytes(32).toString('hex');
+  await req.db.execute(
+    "INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, '', ?, 'DEV-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)",
+    [sessionId, ADMIN_EMAIL]
+  );
+  return res.redirect(`/admin?admin_token=${encodeURIComponent(sessionId)}&admin_email=${encodeURIComponent(ADMIN_EMAIL)}&dev=1`);
 });
 
 // OAuth callback - only functional when GOOGLE_CLIENT_ID/SECRET are configured
@@ -87,8 +94,13 @@ router.get('/auth/google/callback', async (req, res) => {
     const email = userInfo.data.email;
     const emailVerified = userInfo.data.email_verified;
     if (emailVerified && email && email.toLowerCase() === ADMIN_EMAIL.toLowerCase()) {
-      // Successful — redirect back to admin UI with admin_email param
-      return res.redirect(`/admin?admin_email=${encodeURIComponent(email)}`);
+      // Issue an opaque, short-lived server-side session after Google verifies the identity.
+      const sessionId = crypto.randomBytes(32).toString('hex');
+      await req.db.execute(
+        "INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, '', ?, 'GOOGLE-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)",
+        [sessionId, email]
+      );
+      return res.redirect(`/admin?admin_token=${encodeURIComponent(sessionId)}&admin_email=${encodeURIComponent(email)}`);
     }
     return res.redirect('/admin?error=unauthorized');
   } catch (err) {
