@@ -106,9 +106,12 @@ CREATE TABLE IF NOT EXISTS students (
 CREATE TABLE IF NOT EXISTS parent_profiles (
   parent_phone       VARCHAR(20)  PRIMARY KEY,
   full_name          VARCHAR(100) NULL,
+  email              VARCHAR(120) NULL,
   is_premium         BOOLEAN      DEFAULT FALSE,
   premium_expires_at DATETIME     NULL,
-  created_at         DATETIME     DEFAULT CURRENT_TIMESTAMP
+  prepaid_balance    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  created_at         DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_parent_profiles_email (email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS student_parent_map (
