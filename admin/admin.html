@@ -172,13 +172,14 @@ tbody tr:hover{background:var(--hover)}
 
 <script>
 var ADMIN_KEY = sessionStorage.getItem('admin_key') || '';
+var ADMIN_TOKEN = sessionStorage.getItem('admin_token') || '';
 var ADMIN_OAUTH_EMAIL = sessionStorage.getItem('admin_oauth_email') || '';
 var API_BASE = '/admin/api';
 
 function getHeaders() {
   const headers = { 'Content-Type': 'application/json' };
   if (ADMIN_KEY) headers['x-admin-key'] = ADMIN_KEY;
-  if (ADMIN_OAUTH_EMAIL) headers['x-admin-oauth-email'] = ADMIN_OAUTH_EMAIL;
+  if (ADMIN_TOKEN) headers['Authorization'] = 'Bearer ' + ADMIN_TOKEN;
   return headers;
 }
 
@@ -193,10 +194,14 @@ function getHeaders() {
     document.getElementById('login-error').style.display = 'block';
     document.getElementById('login-error').textContent = 'OAuth error: ' + err;
   }
-  if (ae) {
+  const token = params.get('admin_token');
+  if (token && ae) {
+    sessionStorage.setItem('admin_token', token);
     sessionStorage.setItem('admin_oauth_email', ae);
+    ADMIN_TOKEN = token;
     ADMIN_OAUTH_EMAIL = ae;
-    // Auto-open admin UI
+    // Remove the one-time bearer token from the address bar after storing it.
+    window.history.replaceState({}, document.title, window.location.pathname);
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
     loadSection('dashboard');
@@ -240,7 +245,11 @@ function login() {
 
 function logout() {
   sessionStorage.removeItem('admin_key');
+  sessionStorage.removeItem('admin_token');
+  sessionStorage.removeItem('admin_oauth_email');
   ADMIN_KEY = '';
+  ADMIN_TOKEN = '';
+  ADMIN_OAUTH_EMAIL = '';
   document.getElementById('app').style.display = 'none';
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('admin-password').value = '';
