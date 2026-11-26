@@ -256,7 +256,7 @@ function logout() {
 }
 
 // Check session
-if (ADMIN_KEY) {
+if (ADMIN_KEY || ADMIN_TOKEN) {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
 }
