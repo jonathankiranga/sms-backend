@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+const { requireStaffSession } = require('../lib/staffAuth');
+router.use(requireStaffSession);
 
 // ---- Staff auth: resolves teacher from Bearer session (OTP) ----
 async function requireStaff(req, res) {
