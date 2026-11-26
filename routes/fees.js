@@ -47,8 +47,8 @@ async function requireFeeStaff(req, res, next) {
       return res.status(403).json({ error: 'Headteacher or bursar access is required' });
     }
 
-    let feeId = req.params.fee_id || req.body.fee_id || null;
-    if (!feeId && req.body.assignment_id) {
+    let feeId = req.params.fee_id || (req.body && req.body.fee_id) || null;
+    if (!feeId && req.body && req.body.assignment_id) {
       const [assignments] = await req.db.execute(
         'SELECT fee_id FROM fee_assignments WHERE assignment_id = ? LIMIT 1',
         [req.body.assignment_id]
