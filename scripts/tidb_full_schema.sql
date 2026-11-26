@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS teachers (
   subjects_taught JSON         NULL,
   push_subscription JSON       NULL,
   password_hash   VARCHAR(255) NULL,
+  active          TINYINT(1)  NOT NULL DEFAULT 1,
   UNIQUE KEY uq_phone_role (phone, role),
   UNIQUE KEY uq_email_role (email, role),
   FOREIGN KEY (school_id) REFERENCES schools(school_id)
