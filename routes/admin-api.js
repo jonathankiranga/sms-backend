@@ -936,7 +936,7 @@ router.post('/teachers', async (req, res) => {
   try {
     const { school_id, full_name, phone, role, email } = req.body;
     if (!school_id || !full_name || !phone) return res.status(400).json({ error: 'school_id, full_name, phone required' });
-    if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
+    if (role && !['teacher', 'head', 'bursar', 'school_admin'].includes(role)) return res.status(400).json({ error: 'Invalid staff role.' });
     const requestedRole = role || 'teacher';
     const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ? AND role = ?', [phone, requestedRole]);
     if (existing.length > 0) return res.status(409).json({ error: `Phone ${phone} is already registered as ${requestedRole}` });
