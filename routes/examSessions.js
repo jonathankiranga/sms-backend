@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+const { requireStaffSession } = require('../lib/staffAuth');
+router.use(requireStaffSession);
 
 // ─── EXAM SESSIONS ───────────────────────────────────────────────
 
