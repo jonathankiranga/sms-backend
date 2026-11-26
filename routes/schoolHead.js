@@ -3,7 +3,7 @@ const router = express.Router();
 const { verifyToken } = require('../lib/auth');
 const { genId, nextTeacherId } = require('../lib/ids');
 
-async function requireHead(req, res) {
+async function requireSchoolManager(req, res) {
   const auth = (req.headers.authorization || '').trim();
   if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
   const sessionId = auth.split(' ')[1];
@@ -89,7 +89,7 @@ async function requireSchoolManager(req, res) {
 
 // List teachers for the school (public-ish)
 router.get('/:schoolId/teachers', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const [rows] = await req.db.execute(
     'SELECT teacher_id, full_name, phone, email, role, active FROM teachers WHERE school_id = ? ORDER BY full_name',
@@ -100,7 +100,7 @@ router.get('/:schoolId/teachers', async (req, res) => {
 
 // List classes for the school
 router.get('/:schoolId/classes', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const [rows] = await req.db.execute(
     'SELECT class_id, class_name, stream, level_name, academic_year, class_rank FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
@@ -111,7 +111,7 @@ router.get('/:schoolId/classes', async (req, res) => {
 
 // List students for the school (optional ?class_id= filter)
 router.get('/:schoolId/students', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const { class_id } = req.query;
   let sql = 'SELECT st.*, c.class_name FROM students st JOIN classes c ON st.class_id = c.class_id WHERE st.school_id = ?';
@@ -124,7 +124,7 @@ router.get('/:schoolId/students', async (req, res) => {
 
 // Get one student (used by the report-card header for profile fields)
 router.get('/:schoolId/students/:studentId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   try {
     const [rows] = await req.db.execute(
@@ -139,7 +139,7 @@ router.get('/:schoolId/students/:studentId', async (req, res) => {
 
 // Create a teacher or bursar (only headteacher). Creating headteachers is restricted to admin only.
 router.post('/:schoolId/teachers', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return; // response already sent
 
   const { full_name, phone, email, role } = req.body;
@@ -166,7 +166,7 @@ router.post('/:schoolId/teachers', async (req, res) => {
 
 // Delete a teacher (only headteacher)
 router.delete('/:schoolId/teachers/:teacherId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const [t] = await req.db.execute('SELECT role FROM teachers WHERE teacher_id = ? AND school_id = ?', [req.params.teacherId, req.params.schoolId]);
@@ -181,7 +181,7 @@ router.delete('/:schoolId/teachers/:teacherId', async (req, res) => {
 // a teacher active/deactivated. Reassigning a teacher to a different school is
 // restricted to the global admin (admin-api.js), since that changes their scope.
 router.patch('/:schoolId/teachers/:teacherId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { active } = req.body;
@@ -197,7 +197,7 @@ router.patch('/:schoolId/teachers/:teacherId', async (req, res) => {
 
 // Create a class — only headteacher of the school may create classes
 router.post('/:schoolId/classes', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { class_name, academic_year, stream, level_name } = req.body;
@@ -216,7 +216,7 @@ router.post('/:schoolId/classes', async (req, res) => {
 
 // Update a class — only headteacher
 router.put('/:schoolId/classes/:classId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { class_name, stream, level_name, academic_year } = req.body;
@@ -242,7 +242,7 @@ router.put('/:schoolId/classes/:classId', async (req, res) => {
 
 // Delete a class — only headteacher
 router.delete('/:schoolId/classes/:classId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   await req.db.execute('DELETE FROM classes WHERE class_id = ? AND school_id = ?', [req.params.classId, req.params.schoolId]);
   res.json({ deleted: true });
@@ -250,7 +250,7 @@ router.delete('/:schoolId/classes/:classId', async (req, res) => {
 
 // List streams for the school
 router.get('/:schoolId/streams', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const [rows] = await req.db.execute(
     'SELECT stream_id, stream_name, display_order FROM school_streams WHERE school_id = ? ORDER BY display_order, stream_name',
@@ -261,7 +261,7 @@ router.get('/:schoolId/streams', async (req, res) => {
 
 // Add a stream — only headteacher
 router.post('/:schoolId/streams', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const { stream_name } = req.body;
   if (!stream_name) return res.status(400).json({ error: 'stream_name required' });
@@ -276,7 +276,7 @@ router.post('/:schoolId/streams', async (req, res) => {
 
 // Delete a stream — only headteacher
 router.delete('/:schoolId/streams/:streamId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   await req.db.execute('DELETE FROM school_streams WHERE stream_id = ? AND school_id = ?', [req.params.streamId, req.params.schoolId]);
   res.json({ deleted: true });
@@ -284,7 +284,7 @@ router.delete('/:schoolId/streams/:streamId', async (req, res) => {
 
 // Create a single student — only headteacher. Optional parent_phone/parent_name links the parent.
 router.post('/:schoolId/students', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { student_id, full_name, class_id, parent_phone, parent_name } = req.body;
@@ -315,7 +315,7 @@ router.post('/:schoolId/students', async (req, res) => {
 
 // Update a student (head only)
 router.put('/:schoolId/students/:studentId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { full_name, class_id, gender, date_of_birth, admission_number, nemis_number, admission_date,
@@ -344,7 +344,7 @@ router.put('/:schoolId/students/:studentId', async (req, res) => {
 
 // Delete a student (head only)
 router.delete('/:schoolId/students/:studentId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   try {
@@ -355,7 +355,7 @@ router.delete('/:schoolId/students/:studentId', async (req, res) => {
 
 // Promote selected students to a class (manual, per-class flow)
 router.post('/:schoolId/students/promote', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { student_ids, to_class_id } = req.body;
@@ -390,7 +390,7 @@ router.post('/:schoolId/students/promote', async (req, res) => {
 
 // Graduate selected students
 router.post('/:schoolId/students/graduate', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { student_ids } = req.body;
@@ -422,7 +422,7 @@ router.post('/:schoolId/students/graduate', async (req, res) => {
 
 // END OF YEAR CLOSE — promote every Active student up one class level; top level graduates.
 router.post('/:schoolId/academic-year/close', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { from_year } = req.body || {};
@@ -515,7 +515,7 @@ router.post('/:schoolId/academic-year/close', async (req, res) => {
 // CSV Import Students — school head can bulk-import into a class.
 // Format per line: student_id,full_name  OR  student_id,full_name,parent_phone,parent_name
 router.post('/:schoolId/students/import', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
 
   const { class_id, csv } = req.body;
@@ -574,7 +574,7 @@ router.post('/:schoolId/students/import', async (req, res) => {
 
 // Analytics — attendance summary per class for school head
 router.get('/:schoolId/analytics/attendance', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const { days } = req.query;
   const period = parseInt(days) || 30;
@@ -592,7 +592,7 @@ router.get('/:schoolId/analytics/attendance', async (req, res) => {
 
 // Broadcast WhatsApp message to all premium parents in the school
 router.post('/:schoolId/broadcast', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
@@ -621,7 +621,7 @@ router.post('/:schoolId/broadcast', async (req, res) => {
 
 // Fee reminder — trigger WhatsApp fee reminder for a parent
 router.post('/:schoolId/fee-reminder/:studentId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const [student] = await req.db.execute(
     `SELECT s.full_name FROM students s WHERE s.student_id = ? AND s.school_id = ?`,
@@ -680,7 +680,7 @@ async function ensureAssignmentsTable(db) {
 
 // List all assignments for the school (head only)
 router.get('/:schoolId/assignments', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   try {
     await ensureAssignmentsTable(req.db);
@@ -699,7 +699,7 @@ router.get('/:schoolId/assignments', async (req, res) => {
 
 // Replace the class set for one teacher (head only)
 router.put('/:schoolId/assignments/:teacherId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   try {
     await ensureAssignmentsTable(req.db);
@@ -782,7 +782,7 @@ module.exports = router;
 // DELETE /:schoolId/terms/:id  — delete a term (head only)
 
 router.get('/:schoolId/terms', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   try {
     const [rows] = await req.db.execute(
@@ -794,7 +794,7 @@ router.get('/:schoolId/terms', async (req, res) => {
 });
 
 router.post('/:schoolId/terms', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const { term_name, start_date, end_date, academic_year } = req.body;
   if (!term_name || !start_date || !end_date || !academic_year) {
@@ -816,7 +816,7 @@ router.post('/:schoolId/terms', async (req, res) => {
 });
 
 router.put('/:schoolId/terms/:termId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   const { term_name, start_date, end_date, academic_year } = req.body;
   const fields = [], params = [];
@@ -840,7 +840,7 @@ router.put('/:schoolId/terms/:termId', async (req, res) => {
 });
 
 router.delete('/:schoolId/terms/:termId', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   try {
     await req.db.execute('DELETE FROM school_terms WHERE id = ? AND school_id = ?', [req.params.termId, req.params.schoolId]);
@@ -855,7 +855,7 @@ router.delete('/:schoolId/terms/:termId', async (req, res) => {
 // for that year. Used by the headteacher dashboard to show a promotion reminder.
 
 router.get('/:schoolId/year-end-status', async (req, res) => {
-  const head = await requireHead(req, res);
+  const head = await requireSchoolManager(req, res);
   if (!head) return;
   try {
     const schoolId = req.params.schoolId;
