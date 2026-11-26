@@ -539,6 +539,8 @@ router.get('/:schoolId/analytics/attendance', async (req, res) => {
 
 // Broadcast WhatsApp message to all premium parents in the school
 router.post('/:schoolId/broadcast', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'Message required' });
   const [parents] = await req.db.execute(
@@ -566,6 +568,8 @@ router.post('/:schoolId/broadcast', async (req, res) => {
 
 // Fee reminder — trigger WhatsApp fee reminder for a parent
 router.post('/:schoolId/fee-reminder/:studentId', async (req, res) => {
+  const head = await requireHead(req, res);
+  if (!head) return;
   const [student] = await req.db.execute(
     `SELECT s.full_name FROM students s WHERE s.student_id = ? AND s.school_id = ?`,
     [req.params.studentId, req.params.schoolId]
