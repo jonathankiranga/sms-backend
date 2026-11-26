@@ -12,7 +12,7 @@ function genId(prefix) {
   return `${prefix}${ts}${rand}`.toUpperCase().slice(0, 20);
 }
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'jonathankiranga@gmail.com';
 
 // ─── ADMIN EMAIL-OTP LOGIN ─────────────────────────────────────────
@@ -54,9 +54,7 @@ router.post('/verify-otp', async (req, res) => {
 
 async function requireAuth(req, res, next) {
   const key = req.headers['x-admin-key'];
-  const oauthEmail = req.headers['x-admin-oauth-email'];
-  if (key === ADMIN_PASSWORD) return next();
-  if (oauthEmail && oauthEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase()) return next();
+  if (ADMIN_PASSWORD && key && key === ADMIN_PASSWORD) return next();
   // Accept a verified OTP session as bearer token when the session's email is the admin email
   const auth = (req.headers.authorization || '').trim();
   if (auth.startsWith('Bearer ')) {
@@ -938,7 +936,7 @@ router.post('/teachers', async (req, res) => {
   try {
     const { school_id, full_name, phone, role, email } = req.body;
     if (!school_id || !full_name || !phone) return res.status(400).json({ error: 'school_id, full_name, phone required' });
-    if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
+    if (role && !['teacher', 'head', 'bursar', 'school_admin'].includes(role)) return res.status(400).json({ error: 'Invalid staff role.' });
     const requestedRole = role || 'teacher';
     const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ? AND role = ?', [phone, requestedRole]);
     if (existing.length > 0) return res.status(409).json({ error: `Phone ${phone} is already registered as ${requestedRole}` });
@@ -956,7 +954,7 @@ router.post('/teachers', async (req, res) => {
 router.put('/teachers/:id', async (req, res) => {
   try {
     const { full_name, phone, email, role, active, school_id } = req.body;
-    if (role && !['teacher', 'head'].includes(role)) return res.status(400).json({ error: 'Invalid role. Must be teacher or head.' });
+    if (role && !['teacher', 'head', 'bursar', 'school_admin'].includes(role)) return res.status(400).json({ error: 'Invalid staff role.' });
     const fields = [];
     const params = [];
     if (full_name) { fields.push('full_name = ?'); params.push(full_name); }

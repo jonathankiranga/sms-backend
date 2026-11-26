@@ -85,6 +85,11 @@ router.post('/verify-otp', wrap(async (req, res) => {
     effectivePhone = pp[0]?.parent_phone || '';
   }
 
+  // Bind email-based OTP sessions to the canonical registered parent phone.
+  if (effectivePhone) {
+    await req.db.execute('UPDATE otp_sessions SET phone = ? WHERE session_id = ?', [effectivePhone, session_id]);
+  }
+
   // Compare against registered parent profiles (by phone or email) so the client can inform the user
   let registered = false;
   if (effectivePhone || email) {
@@ -105,11 +110,43 @@ router.post('/verify-otp', wrap(async (req, res) => {
     linkedChildren = childrenCountRows[0]?.cnt || 0;
   }
 
-  res.json({ phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
+  res.json({ session_id, phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
 }));
 
+// Protect parent records with the verified OTP session, not a caller-supplied phone.
+async function requireParentSession(req, res, next) {
+  try {
+    const auth = (req.headers.authorization || '').trim();
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+    const sessionId = auth.slice(7).trim();
+    if (!sessionId) return res.status(401).json({ error: 'Invalid session' });
+
+    const [sessions] = await req.db.execute(
+      'SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+      [sessionId]
+    );
+    const session = sessions[0];
+    if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
+      return res.status(401).json({ error: 'Session expired or not verified' });
+    }
+
+    const sessionPhone = normalizePhone(session.phone);
+    if (!sessionPhone) return res.status(403).json({ error: 'Verified parent phone is not linked to this session' });
+
+    const suppliedPhone = req.params.phone || (req.body && req.body.phone) || req.query.phone;
+    if (suppliedPhone && normalizePhone(suppliedPhone) !== sessionPhone) {
+      return res.status(403).json({ error: 'This session cannot access another parent account' });
+    }
+
+    req.parentPhone = sessionPhone;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/parents/my-schools/:phone — returns all schools a parent has children in
-router.get('/my-schools/:phone', wrap(async (req, res) => {
+router.get('/my-schools/:phone', requireParentSession, wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const [rows] = await req.db.execute(
     `SELECT DISTINCT sc.school_id, sc.school_name, sc.region, sc.contact_phone,
@@ -125,7 +162,7 @@ router.get('/my-schools/:phone', wrap(async (req, res) => {
   res.json({ schools: rows });
 }));
 
-router.get('/dashboard/:phone', wrap(async (req, res) => {
+router.get('/dashboard/:phone', requireParentSession, wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   const { school_id: filterSchoolId } = req.query;
 
@@ -247,10 +284,11 @@ router.get('/dashboard/:phone', wrap(async (req, res) => {
 // POST /api/parents/upgrade — initiate premium upgrade (M-Pesa STK or simulated)
 // Accepts optional school_id so multi-school parents pay per school and the
 // payment is allocated to the correct school via the ledger row.
-router.post('/upgrade', wrap(async (req, res) => {
+router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   const { phone: rawPhone, school_id, amount: clientAmount } = req.body;
   if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
   const phone = normalizePhone(rawPhone);
+  if (phone !== req.parentPhone) return res.status(403).json({ error: 'This session cannot pay from another parent account' });
 
   // Scope to active children at the chosen school (or all schools when omitted)
   const scopeSql = school_id ? ' AND s.school_id = ?' : '';
@@ -438,7 +476,7 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
 }));
 
 // GET /api/parents/payment-status — poll after STK push to check if payment completed
-router.get('/payment-status', wrap(async (req, res) => {
+router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
   const { checkout_request_id, phone: rawPhone } = req.query;
   if (!checkout_request_id && !rawPhone) return res.status(400).json({ error: 'checkout_request_id or phone required' });
   const phone = rawPhone ? normalizePhone(rawPhone) : null;
@@ -447,9 +485,9 @@ router.get('/payment-status', wrap(async (req, res) => {
   //    (student_reference is set to CheckoutRequestID after the STK push)
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
-     WHERE student_reference = ? OR transaction_reference = ?
+     WHERE parent_phone = ? AND (student_reference = ? OR transaction_reference = ?)
      ORDER BY logged_at DESC LIMIT 1`,
-    [checkout_request_id || '', checkout_request_id || '']
+    [req.parentPhone, checkout_request_id || '', checkout_request_id || '']
   );
 
   if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
@@ -531,7 +569,7 @@ router.get('/payment-status', wrap(async (req, res) => {
 }));
 
 // GET /api/parents/academic-records/:phone — free endpoint, no premium check
-router.get('/academic-records/:phone', wrap(async (req, res) => {
+router.get('/academic-records/:phone', requireParentSession, wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
   if (!phone) return res.status(400).json({ error: 'Phone required' });
 

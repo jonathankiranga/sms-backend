@@ -1,10 +1,74 @@
 const express = require('express');
 const router = express.Router();
 
+async function requireStaffSession(req, res, next) {
+  try {
+    const auth = (req.headers.authorization || '').trim();
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+    const sessionId = auth.slice(7).trim();
+    const [sessions] = await req.db.execute(
+      'SELECT phone, email, teacher_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+      [sessionId]
+    );
+    const session = sessions[0];
+    if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
+      return res.status(401).json({ error: 'Session expired or not verified' });
+    }
+
+    let teachers = [];
+    if (session.teacher_id) {
+      const [rows] = await req.db.execute(
+        'SELECT teacher_id, school_id, role, active FROM teachers WHERE teacher_id = ? LIMIT 1',
+        [session.teacher_id]
+      );
+      teachers = rows;
+    }
+    if (teachers.length === 0 && session.phone) {
+      const [rows] = await req.db.execute(
+        'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? LIMIT 1',
+        [session.phone]
+      );
+      teachers = rows;
+    }
+    if (teachers.length === 0 && session.email) {
+      const [rows] = await req.db.execute(
+        'SELECT teacher_id, school_id, role, active FROM teachers WHERE email = ? LIMIT 1',
+        [session.email]
+      );
+      teachers = rows;
+    }
+
+    const teacher = teachers[0];
+    if (!teacher || !['teacher', 'head', 'bursar'].includes(teacher.role) || teacher.active === 0) {
+      return res.status(403).json({ error: 'An active school staff account is required' });
+    }
+    req.staff = teacher;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+router.use(requireStaffSession);
+
 router.post('/sync', async (req, res) => {
   const { school_id, teacher_id, attendance_date, records } = req.body;
   if (!school_id || !teacher_id || !attendance_date || !records?.length) {
     return res.status(400).json({ error: 'Missing required fields' });
+  }
+  if (school_id !== req.staff.school_id || teacher_id !== req.staff.teacher_id) {
+    return res.status(403).json({ error: 'Attendance can only be submitted by the signed-in teacher for their own school' });
+  }
+  if (!Array.isArray(records) || records.some(r => !r.student_id || !['Present', 'Absent', 'Late', 'Excused'].includes(r.status))) {
+    return res.status(400).json({ error: 'Attendance records contain an invalid student or status' });
+  }
+  const studentIds = [...new Set(records.map(r => r.student_id))];
+  const [validStudents] = await req.db.execute(
+    `SELECT student_id FROM students WHERE school_id = ? AND student_id IN (${studentIds.map(() => '?').join(',')})`,
+    [school_id, ...studentIds]
+  );
+  if (validStudents.length !== studentIds.length) {
+    return res.status(403).json({ error: 'One or more learners do not belong to this school' });
   }
 
   const connection = await req.db.getConnection();
@@ -117,15 +181,12 @@ router.post('/sync', async (req, res) => {
 
 router.get('/students/:teacher_id', async (req, res) => {
   try {
-    const [teacherRows] = await req.db.execute(
-      'SELECT school_id FROM teachers WHERE teacher_id = ?',
-      [req.params.teacher_id]
-    );
-    if (teacherRows.length === 0) return res.status(404).json({ error: 'Teacher not found' });
-
+    if (req.params.teacher_id !== req.staff.teacher_id) {
+      return res.status(403).json({ error: 'You can only access your own attendance roster' });
+    }
     const [students] = await req.db.execute(
       'SELECT s.student_id, s.full_name, s.class_id, c.class_name FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.school_id = ? AND s.enrollment_status = ? ORDER BY c.class_name, s.full_name',
-      [teacherRows[0].school_id, 'Active']
+      [req.staff.school_id, 'Active']
     );
     res.json({ students });
   } catch (err) {

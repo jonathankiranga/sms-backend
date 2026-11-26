@@ -1,5 +1,7 @@
 const express = require('express');
 const router = express.Router();
+const { requireAssessmentAccess } = require('../lib/staffAuth');
+router.use(requireAssessmentAccess);
 
 // GET /api/assessments/class-report/:class_id/:term?year=YYYY
 // CBC-correct class report: one column per exam session, performance_level

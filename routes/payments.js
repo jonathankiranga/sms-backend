@@ -33,7 +33,7 @@ async function ensureSchoolCallbackKey(db, school_id) {
   return key;
 }
 
-async function handleC2BConfirmation(req, res) {
+async function handleC2BConfirmation(req, res, schoolId) {
   const { TransID, TransAmount, MSISDN, BillRefNumber } = req.body;
   if (!TransID || !MSISDN || !BillRefNumber) {
     return res.status(400).json({ ResultCode: 1, ResultDesc: 'Missing required fields' });
@@ -42,6 +42,59 @@ async function handleC2BConfirmation(req, res) {
   const connection = await req.db.getConnection();
   try {
     await connection.beginTransaction();
+
+    // Per-school C2B callbacks are school-fee receipts. BillRefNumber is the
+    // learner's student_id; allocate the receipt to that learner and term.
+    if (schoolId) {
+      const [students] = await connection.execute(
+        'SELECT student_id, school_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+        [BillRefNumber, schoolId]
+      );
+      if (students.length === 0) {
+        await connection.rollback();
+        return res.status(200).json({ ResultCode: 1, ResultDesc: 'Unknown learner account reference' });
+      }
+
+      const parentPhone = String(MSISDN).replace(/\D/g, '').replace(/^0([17])/, '254$1');
+      const amount = Number(TransAmount);
+      if (!/^254[17]\d{8}$/.test(parentPhone) || !Number.isFinite(amount) || amount <= 0) {
+        await connection.rollback();
+        return res.status(200).json({ ResultCode: 1, ResultDesc: 'Invalid payer phone or payment amount' });
+      }
+
+      await connection.execute(
+        'INSERT IGNORE INTO parent_profiles (parent_phone, is_premium) VALUES (?, FALSE)',
+        [parentPhone]
+      );
+      await connection.execute(
+        'INSERT IGNORE INTO student_parent_map (student_id, parent_phone) VALUES (?, ?)',
+        [BillRefNumber, parentPhone]
+      );
+
+      // Use the active term, or the next scheduled term for advance payments.
+      const [termRows] = await connection.execute(
+        `SELECT term_name, academic_year FROM school_terms
+         WHERE school_id = ? AND end_date >= CURDATE()
+         ORDER BY start_date ASC LIMIT 1`,
+        [schoolId]
+      );
+      const termName = termRows[0]?.term_name || null;
+      const academicYear = termRows[0]?.academic_year || null;
+      const note = termName
+        ? 'C2B school fee payment'
+        : 'C2B school fee payment - term allocation required';
+
+      await connection.execute(
+        `INSERT IGNORE INTO payment_ledger
+         (transaction_reference, amount, parent_phone, student_reference, payment_method, school_id, term, academic_year, notes, logged_at)
+         VALUES (?, ?, ?, ?, 'M-Pesa', ?, ?, ?, ?, NOW())`,
+        [TransID, amount, parentPhone, BillRefNumber, schoolId, termName, academicYear, note]
+      );
+
+      await connection.commit();
+      console.log(`[SCHOOL FEE][${schoolId}] ${parentPhone} paid KSh ${amount} for learner ${BillRefNumber} — ${TransID}`);
+      return res.status(200).json({ ResultCode: 0, ResultDesc: 'School fee payment recorded successfully' });
+    }
 
     const [existing] = await connection.execute(
       'SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?',
@@ -278,6 +331,14 @@ router.post('/secret/:callback_key/v', async (req, res) => {
   if (!school) {
     return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
   }
+  const billRef = String(req.body.BillRefNumber || '').trim();
+  const [learners] = await req.db.execute(
+    'SELECT student_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+    [billRef, school.school_id]
+  );
+  if (learners.length === 0) {
+    return res.status(200).json({ ResultCode: 1, ResultDesc: 'Unknown learner account reference' });
+  }
   return res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
@@ -287,7 +348,7 @@ router.post('/secret/:callback_key/c', async (req, res) => {
   if (!school) {
     return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
   }
-  return handleC2BConfirmation(req, res);
+  return handleC2BConfirmation(req, res, school.school_id);
 });
 
 router.post('/secret/:callback_key/s', async (req, res) => {
@@ -304,6 +365,14 @@ router.post('/cb/:callback_key/v', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
+  const billRef = String(req.body.BillRefNumber || '').trim();
+  const [learners] = await req.db.execute(
+    'SELECT student_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+    [billRef, school.school_id]
+  );
+  if (learners.length === 0) {
+    return res.status(200).json({ ResultCode: 1, ResultDesc: 'Unknown learner account reference' });
+  }
   return res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
@@ -311,7 +380,7 @@ router.post('/cb/:callback_key/c', async (req, res) => {
   const { callback_key } = req.params;
   const school = await getSchoolByCallbackKey(req.db, callback_key);
   if (!school) return res.status(404).json({ ResultCode: 1, ResultDesc: 'School not found' });
-  return handleC2BConfirmation(req, res);
+  return handleC2BConfirmation(req, res, school.school_id);
 });
 
 router.post('/cb/:callback_key/s', async (req, res) => {

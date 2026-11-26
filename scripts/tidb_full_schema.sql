@@ -69,11 +69,12 @@ CREATE TABLE IF NOT EXISTS teachers (
   full_name       VARCHAR(100) NOT NULL,
   phone           VARCHAR(20)  NOT NULL,
   email           VARCHAR(120) NULL,
-  role            ENUM('teacher','head','bursar') DEFAULT 'teacher',
+  role            ENUM('teacher','head','bursar','school_admin') DEFAULT 'teacher',
   school_id       CHAR(9)      NOT NULL,
   subjects_taught JSON         NULL,
   push_subscription JSON       NULL,
   password_hash   VARCHAR(255) NULL,
+  active          TINYINT(1)  NOT NULL DEFAULT 1,
   UNIQUE KEY uq_phone_role (phone, role),
   UNIQUE KEY uq_email_role (email, role),
   FOREIGN KEY (school_id) REFERENCES schools(school_id)
@@ -105,9 +106,12 @@ CREATE TABLE IF NOT EXISTS students (
 CREATE TABLE IF NOT EXISTS parent_profiles (
   parent_phone       VARCHAR(20)  PRIMARY KEY,
   full_name          VARCHAR(100) NULL,
+  email              VARCHAR(120) NULL,
   is_premium         BOOLEAN      DEFAULT FALSE,
   premium_expires_at DATETIME     NULL,
-  created_at         DATETIME     DEFAULT CURRENT_TIMESTAMP
+  prepaid_balance    DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+  created_at         DATETIME     DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_parent_profiles_email (email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS student_parent_map (

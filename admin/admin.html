@@ -172,13 +172,14 @@ tbody tr:hover{background:var(--hover)}
 
 <script>
 var ADMIN_KEY = sessionStorage.getItem('admin_key') || '';
+var ADMIN_TOKEN = sessionStorage.getItem('admin_token') || '';
 var ADMIN_OAUTH_EMAIL = sessionStorage.getItem('admin_oauth_email') || '';
 var API_BASE = '/admin/api';
 
 function getHeaders() {
   const headers = { 'Content-Type': 'application/json' };
   if (ADMIN_KEY) headers['x-admin-key'] = ADMIN_KEY;
-  if (ADMIN_OAUTH_EMAIL) headers['x-admin-oauth-email'] = ADMIN_OAUTH_EMAIL;
+  if (ADMIN_TOKEN) headers['Authorization'] = 'Bearer ' + ADMIN_TOKEN;
   return headers;
 }
 
@@ -193,10 +194,14 @@ function getHeaders() {
     document.getElementById('login-error').style.display = 'block';
     document.getElementById('login-error').textContent = 'OAuth error: ' + err;
   }
-  if (ae) {
+  const token = params.get('admin_token');
+  if (token && ae) {
+    sessionStorage.setItem('admin_token', token);
     sessionStorage.setItem('admin_oauth_email', ae);
+    ADMIN_TOKEN = token;
     ADMIN_OAUTH_EMAIL = ae;
-    // Auto-open admin UI
+    // Remove the one-time bearer token from the address bar after storing it.
+    window.history.replaceState({}, document.title, window.location.pathname);
     document.getElementById('login-screen').style.display = 'none';
     document.getElementById('app').style.display = 'flex';
     loadSection('dashboard');
@@ -240,14 +245,18 @@ function login() {
 
 function logout() {
   sessionStorage.removeItem('admin_key');
+  sessionStorage.removeItem('admin_token');
+  sessionStorage.removeItem('admin_oauth_email');
   ADMIN_KEY = '';
+  ADMIN_TOKEN = '';
+  ADMIN_OAUTH_EMAIL = '';
   document.getElementById('app').style.display = 'none';
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('admin-password').value = '';
 }
 
 // Check session
-if (ADMIN_KEY) {
+if (ADMIN_KEY || ADMIN_TOKEN) {
   document.getElementById('login-screen').style.display = 'none';
   document.getElementById('app').style.display = 'flex';
 }
@@ -763,7 +772,11 @@ function renderTeachersTable(filter) {
       rows.map(function(t) {
         var roleBadge = t.role === 'head'
           ? '<span class="badge badge-head">School Head</span>'
-          : '<span class="badge badge-teacher">Teacher</span>';
+          : (t.role === 'school_admin'
+            ? '<span class="badge badge-head">School Administrator</span>'
+            : (t.role === 'bursar'
+              ? '<span class="badge badge-teacher">Bursar</span>'
+              : '<span class="badge badge-teacher">Teacher</span>'));
         var delBtn = t.role !== 'head'
           ? '<button class="btn-del" onclick="deleteTeacher(\'' + t.teacher_id + '\')">Delete</button>'
           : '<span class="text-muted" style="font-size:11px">&mdash;</span>';
@@ -780,7 +793,7 @@ function showAddTeacher() {
     '<label>School</label><select id="f-teacher-school">' + schoolOpts + '</select>' +
     '<label>Full Name</label><input id="f-teacher-name" placeholder="Jane Doe">' +
     '<label>Phone (2547XXXXXXXX)</label><input id="f-teacher-phone" placeholder="254712345678">' +
-    '<label>Role</label><select id="f-teacher-role"><option value="teacher">Teacher</option><option value="head">School Head</option></select>',
+    '<label>Role</label><select id="f-teacher-role"><option value="teacher">Teacher</option><option value="school_admin">School Administrator</option><option value="head">School Head</option><option value="bursar">Bursar</option></select>',
     function() {
       var school_id = document.getElementById('f-teacher-school').value;
       var full_name = document.getElementById('f-teacher-name').value.trim();
@@ -1259,7 +1272,7 @@ function showMsg(id, text, success) {
 }
 
 // Auto-load dashboard
-if (ADMIN_KEY) loadSection('dashboard');
+if (ADMIN_KEY || ADMIN_TOKEN) loadSection('dashboard');
 </script>
 </body>
 </html>
