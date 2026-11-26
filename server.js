@@ -114,7 +114,7 @@ async function runMigrationsIfNeeded() {
     const path = require('path');
     const scriptsDir = path.join(__dirname, 'scripts');
     const files = await fs.readdir(scriptsDir);
-    const sqlFiles = files.filter(f => f.endsWith('.sql')).sort();
+    const sqlFiles = files.filter(f => f.endsWith('.sql') && (/^\\d{4}/.test(f) || /^migration_/i.test(f) || f === 'tidb_full_schema.sql' || /^zz_\\d{8}_/.test(f))).sort();
     if (sqlFiles.length === 0) { console.log('No SQL migration files found in', scriptsDir); return; }
 
     // Use a dedicated connection with multipleStatements for running migration SQL files
