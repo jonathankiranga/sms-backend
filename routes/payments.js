@@ -55,9 +55,9 @@ async function handleC2BConfirmation(req, res, schoolId) {
         return res.status(200).json({ ResultCode: 1, ResultDesc: 'Unknown learner account reference' });
       }
 
-      const parentPhone = String(MSISDN).replace(/\\D/g, '').replace(/^0([17])/, '254$1');
+      const parentPhone = String(MSISDN).replace(/\D/g, '').replace(/^0([17])/, '254$1');
       const amount = Number(TransAmount);
-      if (!/^254[17]\\d{8}$/.test(parentPhone) || !Number.isFinite(amount) || amount <= 0) {
+      if (!/^254[17]\d{8}$/.test(parentPhone) || !Number.isFinite(amount) || amount <= 0) {
         await connection.rollback();
         return res.status(200).json({ ResultCode: 1, ResultDesc: 'Invalid payer phone or payment amount' });
       }
