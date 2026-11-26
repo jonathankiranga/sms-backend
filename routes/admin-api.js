@@ -12,7 +12,7 @@ function genId(prefix) {
   return `${prefix}${ts}${rand}`.toUpperCase().slice(0, 20);
 }
 
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'jonathankiranga@gmail.com';
 
 // ─── ADMIN EMAIL-OTP LOGIN ─────────────────────────────────────────
@@ -54,9 +54,7 @@ router.post('/verify-otp', async (req, res) => {
 
 async function requireAuth(req, res, next) {
   const key = req.headers['x-admin-key'];
-  const oauthEmail = req.headers['x-admin-oauth-email'];
-  if (key === ADMIN_PASSWORD) return next();
-  if (oauthEmail && oauthEmail.toLowerCase() === ADMIN_EMAIL.toLowerCase()) return next();
+  if (ADMIN_PASSWORD && key && key === ADMIN_PASSWORD) return next();
   // Accept a verified OTP session as bearer token when the session's email is the admin email
   const auth = (req.headers.authorization || '').trim();
   if (auth.startsWith('Bearer ')) {
