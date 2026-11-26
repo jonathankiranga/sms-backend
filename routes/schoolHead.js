@@ -34,6 +34,59 @@ async function requireHead(req, res) {
   return { teacher_id: teacher.teacher_id, role: teacher.role, school_id: teacher.school_id };
 }
 
+// School administrator and headteacher access for school operations.
+async function requireSchoolManager(req, res) {
+  const auth = (req.headers.authorization || '').trim();
+  if (!auth.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Missing or invalid Authorization header' });
+    return null;
+  }
+  const sessionId = auth.slice(7).trim();
+  const [sessions] = await req.db.execute(
+    'SELECT phone, email, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ? LIMIT 1',
+    [sessionId]
+  );
+  const session = sessions[0];
+  if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
+    res.status(401).json({ error: 'Session not verified or expired' });
+    return null;
+  }
+
+  let teachers = [];
+  if (session.teacher_id) {
+    const [rows] = await req.db.execute(
+      'SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ? LIMIT 1',
+      [session.teacher_id]
+    );
+    teachers = rows;
+  }
+  if (teachers.length === 0 && session.phone) {
+    const [rows] = await req.db.execute(
+      "SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? AND role IN ('head','school_admin') LIMIT 1",
+      [session.phone]
+    );
+    teachers = rows;
+  }
+  if (teachers.length === 0 && session.email) {
+    const [rows] = await req.db.execute(
+      "SELECT teacher_id, role, school_id FROM teachers WHERE email = ? AND role IN ('head','school_admin') LIMIT 1",
+      [session.email]
+    );
+    teachers = rows;
+  }
+
+  const staff = teachers[0];
+  if (!staff || !['head', 'school_admin'].includes(staff.role)) {
+    res.status(403).json({ error: 'Headteacher or school administrator access is required' });
+    return null;
+  }
+  if (staff.school_id !== req.params.schoolId) {
+    res.status(403).json({ error: 'This account cannot manage another school' });
+    return null;
+  }
+  return { teacher_id: staff.teacher_id, role: staff.role, school_id: staff.school_id };
+}
+
 // List teachers for the school (public-ish)
 router.get('/:schoolId/teachers', async (req, res) => {
   const head = await requireHead(req, res);
