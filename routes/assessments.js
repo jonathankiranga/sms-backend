@@ -367,15 +367,27 @@ router.get('/report/:student_id/:term', async (req, res) => {
   if (auth && auth.startsWith('Bearer ')) {
     try {
       const [srows] = await req.db.execute(
-        'SELECT teacher_id, parent_account_id, school_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+        'SELECT teacher_id, parent_account_id, school_id, login_role, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
         [auth.slice(7).trim()]
       );
       const sess = srows[0];
       if (sess && sess.verified && sess.expires_at && new Date(sess.expires_at) > new Date()) {
         if (sess.teacher_id) {
           const [trows] = await req.db.execute(
-            'SELECT teacher_id FROM teachers WHERE teacher_id = ? AND school_id = ? LIMIT 1',
-            [sess.teacher_id, sess.school_id]
+            `SELECT t.teacher_id
+             FROM teachers t
+             JOIN teacher_school_memberships m
+               ON m.teacher_id = t.teacher_id
+              AND m.school_id = t.school_id
+              AND m.staff_account_id = t.staff_account_id
+              AND m.role = t.role
+             WHERE t.teacher_id = ?
+               AND t.school_id = ?
+               AND t.role = ?
+               AND t.active = 1
+               AND m.status = 'active'
+             LIMIT 1`,
+            [sess.teacher_id, sess.school_id, sess.login_role]
           );
           isTeacher = trows.length > 0;
         }
