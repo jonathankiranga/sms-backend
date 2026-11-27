@@ -848,6 +848,8 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
     ? 'parent_phone IN (SELECT parent_phone FROM parent_profiles WHERE parent_account_id = ?)'
     : 'parent_phone = ?';
   const parentPaymentScopeValue = req.parentAccountId || req.parentPhone;
+  const parentProfileScope = req.parentAccountId ? 'parent_account_id = ?' : 'parent_phone = ?';
+  const parentProfileScopeValue = req.parentAccountId || phone || req.parentPhone;
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
      WHERE ${parentPaymentScope} AND (student_reference = ? OR transaction_reference = ?)
@@ -865,8 +867,8 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
   if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
     if (!phone) return res.json({ status: 'completed' });
     const [p] = await req.db.execute(
-      'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-      [phone]
+       `SELECT is_premium, premium_expires_at FROM parent_profiles WHERE ${parentProfileScope} LIMIT 1`,
+      [parentProfileScopeValue]
     );
     return res.json({
       status: 'completed',
@@ -895,8 +897,8 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
     if (bulk.length > 0 && bulk[0].payment_status === 'completed') {
       if (phone) {
         const [p] = await req.db.execute(
-          'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-          [phone]
+          `SELECT is_premium, premium_expires_at FROM parent_profiles WHERE ${parentProfileScope} LIMIT 1`,
+          [parentProfileScopeValue]
         );
         return res.json({
           status: 'completed',
@@ -933,8 +935,8 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
   // 3. No pending record found — check if already premium (paid via another path)
   if (!phone) return res.json({ status: 'pending' });
   const [p] = await req.db.execute(
-    'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-    [phone]
+    `SELECT is_premium, premium_expires_at FROM parent_profiles WHERE ${parentProfileScope} LIMIT 1`,
+    [parentProfileScopeValue]
   );
   const active = p[0]?.is_premium && (!p[0]?.premium_expires_at || new Date(p[0].premium_expires_at) > new Date());
   return res.json({ status: active ? 'completed' : 'pending' });
