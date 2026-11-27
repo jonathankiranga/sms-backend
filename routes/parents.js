@@ -312,6 +312,18 @@ router.get('/account-dashboard', requireParentSession, wrap(async (req, res) => 
   }
 
   const schoolList = Array.from(schoolMap.values());
+  const [priceRows] = await req.db.execute(
+    "SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price' LIMIT 1"
+  );
+  const premiumPrice = parseFloat(priceRows[0]?.setting_value || '200');
+  const premiumDueSchools = schoolList.filter(s => !s.premium_active && s.payment_model !== 'school');
+  const premiumChildrenCount = premiumDueSchools.reduce((total, school) => total + school.children_count, 0);
+  const premiumTotal = premiumDueSchools.reduce((total, school) => total + (school.children_count * premiumPrice), 0);
+  const [balanceRows] = await req.db.execute(
+    'SELECT COALESCE(SUM(prepaid_balance), 0) AS prepaid_balance FROM parent_profiles WHERE parent_account_id = ?',
+    [req.parentAccountId]
+  );
+
   res.json({
     parent: { parent_name: account?.full_name || null },
     parent_account_id: req.parentAccountId,
@@ -321,7 +333,13 @@ router.get('/account-dashboard', requireParentSession, wrap(async (req, res) => 
     children,
     children_count: children.length,
     premium_active: schoolList.length > 0 && schoolList.every(s => s.premium_active),
-    premium_any_active: schoolList.some(s => s.premium_active)
+    premium_any_active: schoolList.some(s => s.premium_active),
+    premium_price: premiumPrice,
+    premium_children_count: premiumChildrenCount,
+    premium_total: premiumTotal,
+    premium_due: premiumTotal,
+    renewal_required: premiumDueSchools.length > 0,
+    prepaid_balance: Number(balanceRows[0]?.prepaid_balance || 0)
   });
 }));
 
