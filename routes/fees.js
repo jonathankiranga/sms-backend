@@ -77,15 +77,6 @@ async function requireFeeStatementAccess(req, res, next) {
         req.parentAccountId = session.parent_account_id;
         return next();
       }
-    } else if (session.phone) {
-      const [links] = await req.db.execute(
-        'SELECT student_id FROM student_parent_map WHERE student_id = ? AND parent_phone = ? LIMIT 1',
-        [student.student_id, session.phone]
-      );
-      if (links.length > 0) {
-        req.feeStudent = student;
-        return next();
-      }
     }
 
     const staff = await resolveStaff(req.db, session);
