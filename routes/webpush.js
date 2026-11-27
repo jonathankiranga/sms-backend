@@ -12,7 +12,6 @@ router.post('/subscribe', requireStaffSession, async (req, res) => {
       'UPDATE teachers SET push_subscription = ? WHERE teacher_id = ? AND school_id = ?',
       [JSON.stringify(subscription), req.staff.teacher_id, req.staff.school_id]
     );
-    if (!result.affectedRows) return res.status(404).json({ error: 'Staff membership not found' });
     res.json({ subscribed: true });
   } catch (err) {
     console.error('[WEBPUSH]', err.message);
