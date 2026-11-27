@@ -1,55 +1,18 @@
 const express = require('express');
 const router = express.Router();
 
-async function requireStaffSession(req, res, next) {
-  try {
-    const auth = (req.headers.authorization || '').trim();
-    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
-    const sessionId = auth.slice(7).trim();
-    const [sessions] = await req.db.execute(
-      'SELECT phone, email, teacher_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
-      [sessionId]
-    );
-    const session = sessions[0];
-    if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
-      return res.status(401).json({ error: 'Session expired or not verified' });
-    }
+const { requireStaffSession: requireBoundStaffSession } = require('../lib/staffAuth');
 
-    let teachers = [];
-    if (session.teacher_id) {
-      const [rows] = await req.db.execute(
-        'SELECT teacher_id, school_id, role, active FROM teachers WHERE teacher_id = ? LIMIT 1',
-        [session.teacher_id]
-      );
-      teachers = rows;
+async function requireAttendanceStaff(req, res, next) {
+  return requireBoundStaffSession(req, res, () => {
+    if (!['teacher', 'head', 'bursar'].includes(req.staff.role)) {
+      return res.status(403).json({ error: 'An active teacher or school management membership is required' });
     }
-    if (teachers.length === 0 && session.phone) {
-      const [rows] = await req.db.execute(
-        'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? LIMIT 1',
-        [session.phone]
-      );
-      teachers = rows;
-    }
-    if (teachers.length === 0 && session.email) {
-      const [rows] = await req.db.execute(
-        'SELECT teacher_id, school_id, role, active FROM teachers WHERE email = ? LIMIT 1',
-        [session.email]
-      );
-      teachers = rows;
-    }
-
-    const teacher = teachers[0];
-    if (!teacher || !['teacher', 'head', 'bursar'].includes(teacher.role) || teacher.active === 0) {
-      return res.status(403).json({ error: 'An active school staff account is required' });
-    }
-    req.staff = teacher;
     next();
-  } catch (err) {
-    next(err);
-  }
+  });
 }
 
-router.use(requireStaffSession);
+router.use(requireAttendanceStaff);
 
 router.post('/sync', async (req, res) => {
   const { school_id, teacher_id, attendance_date, records } = req.body;
