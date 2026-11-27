@@ -167,6 +167,57 @@ async function requireParentSession(req, res, next) {
   }
 }
 
+// GET /api/parents/account-dashboard
+// Consolidated family view: all active children linked to this global parent
+// account, regardless of which school or legacy parent phone they were registered under.
+router.get('/account-dashboard', requireParentSession, wrap(async (req, res) => {
+  if (!req.parentAccountId) return res.status(403).json({ error: 'Global parent account migration is required' });
+
+  const [children] = await req.db.execute(
+    `SELECT s.student_id, s.full_name, c.class_name, s.school_id, sc.school_name,
+       r.relationship_type, r.can_view_results, r.can_view_fees,
+       (SELECT al.status FROM attendance_logs al WHERE al.student_id = s.student_id ORDER BY al.attendance_date DESC LIMIT 1) AS last_attendance,
+       (SELECT al.attendance_date FROM attendance_logs al WHERE al.student_id = s.student_id ORDER BY al.attendance_date DESC LIMIT 1) AS last_date,
+       (SELECT al.marked_at FROM attendance_logs al WHERE al.student_id = s.student_id ORDER BY al.attendance_date DESC LIMIT 1) AS arrival_time,
+       (SELECT pl.amount FROM payment_ledger pl WHERE pl.student_reference = s.student_id AND pl.reversed_at IS NULL ORDER BY pl.logged_at DESC LIMIT 1) AS last_payment_amount,
+       (SELECT pl.logged_at FROM payment_ledger pl WHERE pl.student_reference = s.student_id AND pl.reversed_at IS NULL ORDER BY pl.logged_at DESC LIMIT 1) AS last_payment_date
+     FROM parent_student_relationships r
+     JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+     JOIN classes c ON c.class_id = s.class_id
+     JOIN schools sc ON sc.school_id = r.school_id
+     WHERE r.parent_account_id = ? AND r.status = 'active' AND s.enrollment_status = 'Active'
+     ORDER BY sc.school_name, s.full_name`,
+    [req.parentAccountId]
+  );
+
+  const [accountRows] = await req.db.execute(
+    'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+    [req.parentAccountId]
+  );
+  const account = accountRows[0];
+  const schoolMap = new Map();
+  for (const child of children) {
+    if (!schoolMap.has(child.school_id)) {
+      schoolMap.set(child.school_id, {
+        school_id: child.school_id,
+        school_name: child.school_name,
+        children_count: 0
+      });
+    }
+    schoolMap.get(child.school_id).children_count += 1;
+  }
+
+  res.json({
+    parent: { parent_name: account?.full_name || null },
+    parent_account_id: req.parentAccountId,
+    phone: account?.canonical_parent_phone || req.parentPhone,
+    school_id: children[0]?.school_id || null,
+    schools: Array.from(schoolMap.values()),
+    children,
+    children_count: children.length
+  });
+}));
+
 // GET /api/parents/my-schools/:phone — returns all schools a parent has children in
 router.get('/my-schools/:phone', requireParentSession, wrap(async (req, res) => {
   const phone = normalizePhone(req.params.phone);
