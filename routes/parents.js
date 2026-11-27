@@ -590,8 +590,13 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
   const phone = normalizePhone(rawPhone);
   if (phone !== req.parentPhone) return res.status(403).json({ error: 'This session cannot pay from another parent account' });
+  // Global parent accounts must choose the school being paid for. Never
+  // combine children or allocate one payment across unrelated school terms.
+  if (req.parentAccountId && !school_id) {
+    return res.status(400).json({ error: 'Select the school for this subscription payment' });
+  }
 
-  // Scope to active children at the chosen school (or all schools when omitted)
+  // Scope to active children at the chosen school (or all schools when omitted for legacy sessions)
   const scopeSql = school_id ? ' AND s.school_id = ?' : '';
   const scopeParams = school_id ? [school_id] : [];
   let childRows;
