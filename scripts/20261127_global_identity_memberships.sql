@@ -31,8 +31,8 @@ ALTER TABLE teachers
   ADD KEY idx_teachers_school_email_role (school_id, email, role),
   ADD KEY idx_teachers_staff_account (staff_account_id);
 
--- Group existing school-specific teacher records by their normalized phone.
--- Email is the fallback where a phone is not recorded. This avoids changing
+-- Group existing school-specific teacher records by their normalized email.
+-- Phone is the fallback where an email is not recorded. This avoids changing
 -- legacy teacher IDs and preserves each school's role and employment record.
 INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
 SELECT
@@ -67,6 +67,10 @@ JOIN staff_accounts a
     ELSE CONCAT('teacher:', t.teacher_id)
   END
 SET t.staff_account_id = a.staff_account_id;
+
+ALTER TABLE teachers
+  ADD CONSTRAINT fk_teacher_staff_account FOREIGN KEY (staff_account_id)
+    REFERENCES staff_accounts(staff_account_id);
 
 CREATE TABLE staff_account_contacts (
   contact_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
