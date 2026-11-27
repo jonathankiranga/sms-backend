@@ -541,11 +541,14 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   }
 
   const childCount = childRows.length;
+  if (childCount === 0) {
+    return res.status(400).json({ error: 'No active children are linked to this parent account at the selected school.' });
+  }
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
-  const defaultTotal = pricePerChild * Math.max(childCount, 1);
-  const totalDue = clientAmount ? parseInt(clientAmount, 10) : defaultTotal;
+  const pricePerChild = parseInt(setting[0]?.setting_value || '200', 10);
+  // The server calculates the charge. Never trust an amount supplied by the browser.
+  const totalDue = pricePerChild * childCount;
 
   const txnRef = 'TXN' + Date.now().toString(36).toUpperCase();
 
