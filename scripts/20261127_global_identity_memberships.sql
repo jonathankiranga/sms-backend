@@ -248,7 +248,7 @@ BEGIN
   VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
   ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
   SET NEW.parent_account_id = LAST_INSERT_ID();
-END$
+END$$
 
 CREATE TRIGGER trg_parent_profile_after_insert
 AFTER INSERT ON parent_profiles
@@ -263,7 +263,7 @@ BEGIN
       (parent_account_id, contact_type, contact_value, is_primary)
     VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
   END IF;
-END$
+END$$
 
 -- If a school updates a parent's email, add it as an unverified contact alias.
 -- It is not merged with other parent accounts until an OTP is verified.
@@ -277,7 +277,7 @@ BEGIN
       (parent_account_id, contact_type, contact_value, is_primary)
     VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
   END IF;
-END$
+END$$
 
 -- All existing and new student-parent links feed the consolidated relationship
 -- table, so older school registration endpoints remain compatible.
@@ -296,7 +296,7 @@ BEGIN
     school_id = VALUES(school_id),
     relationship_type = VALUES(relationship_type),
     status = 'active';
-END$
+END$$
 
 
 CREATE TRIGGER trg_student_parent_after_delete
@@ -316,7 +316,7 @@ BEGIN
       WHERE remaining_map.student_id = OLD.student_id
         AND remaining_parent.parent_account_id = r.parent_account_id
     );
-END$
+END$$
 
 
 -- Future teacher registrations automatically create/reuse a global staff
@@ -356,7 +356,7 @@ BEGIN
       WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
       WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
       ELSE CONCAT('teacher:', NEW.teacher_id)
-    END$
+    END;
 
     INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
     VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
@@ -365,7 +365,7 @@ BEGIN
   END IF;
 
   SET NEW.staff_account_id = v_account_id;
-END$
+END$$
 
 CREATE TRIGGER trg_teacher_after_insert
 AFTER INSERT ON teachers
@@ -386,7 +386,7 @@ BEGIN
     NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
     CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
   );
-END$
+END$$
 
 CREATE TRIGGER trg_teacher_after_update
 AFTER UPDATE ON teachers
@@ -398,6 +398,6 @@ BEGIN
       role = NEW.role,
       status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
   WHERE teacher_id = NEW.teacher_id;
-END$
+END$$
 
 DELIMITER ;
