@@ -52,7 +52,11 @@ test('selected school must be linked to an active billable child', async () => {
 test('single-school parent resolves without an explicit school id', async () => {
   const db = parentDb(['SCH000001']);
   const resolved = await resolveParentSchool(db, '254712345678');
-  assert.deepEqual(resolved, { schoolId: 'SCH000001', accountId: 77 });
+  assert.deepEqual(resolved, {
+    accountId: 77,
+    parentPhone: '0712345678',
+    schoolId: 'SCH000001'
+  });
 });
 
 test('term price counts only children at the selected school', async () => {
