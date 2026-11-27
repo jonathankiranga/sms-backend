@@ -147,7 +147,7 @@ LIMIT 1`,
           );
           for (const p of parentRows) {
             sendConsecutiveAbsenceAlert(normalizePhone(p.parent_phone), p.student_name, absCnt[0].cnt, p.school_name)
-              .then(() => connection.execute(
+              .then(() => req.db.execute(
                 'UPDATE attendance_logs SET consecutive_alerted_at = NOW() WHERE student_id = ? AND attendance_date = ?',
                 [r.student_id, attendance_date]
               ))
