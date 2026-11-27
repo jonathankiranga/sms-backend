@@ -50,7 +50,15 @@ FROM (
       WHEN NULLIF(TRIM(email), '') IS NOT NULL
         THEN CONCAT('email:', LOWER(TRIM(email)))
       WHEN NULLIF(TRIM(phone), '') IS NOT NULL
-        THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
+        THEN CONCAT('phone:', CASE
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')) = 10
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+            THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 2))
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')) = 9
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 1) IN ('1', '7')
+            THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
+          ELSE REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')
+        END)
       ELSE CONCAT('teacher:', teacher_id)
     END AS identity_key
   FROM teachers
@@ -63,7 +71,15 @@ JOIN staff_accounts a
     WHEN NULLIF(TRIM(t.email), '') IS NOT NULL
       THEN CONCAT('email:', LOWER(TRIM(t.email)))
     WHEN NULLIF(TRIM(t.phone), '') IS NOT NULL
-      THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''))
+      THEN CONCAT('phone:', CASE
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', '')) = 10
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+            THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''), 2))
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', '')) = 9
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''), 1) IN ('1', '7')
+            THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''))
+          ELSE REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', '')
+        END)
     ELSE CONCAT('teacher:', t.teacher_id)
   END
 SET t.staff_account_id = a.staff_account_id;
@@ -87,6 +103,19 @@ CREATE TABLE staff_account_contacts (
 
 INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
 SELECT staff_account_id, 'phone', TRIM(phone)
+FROM teachers
+WHERE NULLIF(TRIM(phone), '') IS NOT NULL;
+
+INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+SELECT staff_account_id, 'phone', CASE
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')) = 10
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+            THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 2))
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')) = 9
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 1) IN ('1', '7')
+            THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
+          ELSE REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')
+        END
 FROM teachers
 WHERE NULLIF(TRIM(phone), '') IS NOT NULL;
 
@@ -329,8 +358,28 @@ BEGIN
   DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
   DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
   DECLARE v_identity_key VARCHAR(160);
+  DECLARE v_email_count INT DEFAULT 0;
+  DECLARE v_phone_count INT DEFAULT 0;
+  DECLARE v_normalized_phone VARCHAR(20);
+
+  SET v_normalized_phone = CASE
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')) = 10
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+            THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 2))
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')) = 9
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 1) IN ('1', '7')
+            THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+          ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')
+        END;
 
   IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT COUNT(DISTINCT staff_account_id) INTO v_email_count
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email));
+    IF v_email_count > 1 THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Teacher email is linked to multiple staff identities; reconcile contacts first';
+    END IF;
     SELECT staff_account_id INTO v_email_account
     FROM staff_account_contacts
     WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
@@ -338,9 +387,16 @@ BEGIN
   END IF;
 
   IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT COUNT(DISTINCT staff_account_id) INTO v_phone_count
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value IN (v_normalized_phone, TRIM(NEW.phone));
+    IF v_phone_count > 1 THEN
+      SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Teacher phone is linked to multiple staff identities; reconcile contacts first';
+    END IF;
     SELECT staff_account_id INTO v_phone_account
     FROM staff_account_contacts
-    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    WHERE contact_type = 'phone' AND contact_value IN (v_normalized_phone, TRIM(NEW.phone))
     ORDER BY staff_account_id LIMIT 1;
   END IF;
 
@@ -354,7 +410,7 @@ BEGIN
   IF v_account_id IS NULL THEN
     SET v_identity_key = CASE
       WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
-      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', v_normalized_phone)
       ELSE CONCAT('teacher:', NEW.teacher_id)
     END;
 
@@ -378,6 +434,16 @@ BEGIN
   IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
     INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
     VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', CASE
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')) = 10
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+            THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 2))
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')) = 9
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 1) IN ('1', '7')
+            THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+          ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')
+        END);
   END IF;
 
   INSERT INTO teacher_school_memberships
@@ -398,6 +464,25 @@ BEGIN
       role = NEW.role,
       status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
   WHERE teacher_id = NEW.teacher_id;
-END$$
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', CASE
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')) = 10
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+            THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 2))
+          WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')) = 9
+               AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''), 1) IN ('1', '7')
+            THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+          ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')
+        END);
+  END IF;
+END$
 
 DELIMITER ;
