@@ -3,25 +3,9 @@ const router = express.Router();
 const { requireStaffSession } = require('../lib/staffAuth');
 router.use(requireStaffSession);
 
-// ---- Staff auth: resolves teacher from Bearer session (OTP) ----
+// Authentication and school membership are enforced by the shared middleware above.
 async function requireStaff(req, res) {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
-  const sessionId = auth.split(' ')[1];
-  const [srows] = await req.db.execute('SELECT phone, email, verified, expires_at FROM otp_sessions WHERE session_id = ?', [sessionId]);
-  if (srows.length === 0) { res.status(401).json({ error: 'Invalid session' }); return null; }
-  const sess = srows[0];
-  if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
-
-  let trows;
-  if (sess.teacher_id) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
-  if ((!trows || trows.length === 0) && sess.phone) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? LIMIT 1', [sess.phone]);
-  if (!trows || trows.length === 0) {
-    if (sess.email) [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ? LIMIT 1', [sess.email]);
-  }
-  if (!trows || trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
-  const me = trows[0];
-  return { teacher_id: me.teacher_id, role: me.role, school_id: me.school_id };
+  return req.staff || null;
 }
 
 // ---- Self-heal assignments table (idempotent) ----
