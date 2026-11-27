@@ -315,3 +315,85 @@ BEGIN
         AND remaining_parent.parent_account_id = r.parent_account_id
     );
 END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
