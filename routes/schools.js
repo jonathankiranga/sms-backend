@@ -21,7 +21,7 @@ router.post('/:id/contact', async (req, res, next) => {
     if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
     const sessionId = auth.slice(7).trim();
     const [sessions] = await req.db.execute(
-      'SELECT teacher_id, school_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+      'SELECT teacher_id, school_id, login_role, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
       [sessionId]
     );
     const session = sessions[0];
@@ -33,8 +33,19 @@ router.post('/:id/contact', async (req, res, next) => {
     }
 
     const [teachers] = await req.db.execute(
-      'SELECT teacher_id, role, school_id, active FROM teachers WHERE teacher_id = ? AND school_id = ? LIMIT 1',
-      [session.teacher_id, schoolId]
+      `SELECT t.teacher_id, t.role, t.school_id, t.active
+       FROM teachers t
+       JOIN teacher_school_memberships m
+         ON m.teacher_id = t.teacher_id
+        AND m.school_id = t.school_id
+        AND m.staff_account_id = t.staff_account_id
+        AND m.role = t.role
+       WHERE t.teacher_id = ?
+         AND t.school_id = ?
+         AND t.role = ?
+         AND m.status = 'active'
+       LIMIT 1`,
+      [session.teacher_id, schoolId, session.login_role]
     );
     const teacher = teachers[0];
     if (!teacher || teacher.active === 0) return res.status(403).json({ error: 'Active school staff membership required' });
