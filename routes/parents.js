@@ -201,20 +201,55 @@ router.get('/account-dashboard', requireParentSession, wrap(async (req, res) => 
       schoolMap.set(child.school_id, {
         school_id: child.school_id,
         school_name: child.school_name,
-        children_count: 0
+        children_count: 0,
+        premium_active: false,
+        payment_model: 'parent'
       });
     }
     schoolMap.get(child.school_id).children_count += 1;
   }
 
+  // Subscription entitlement is evaluated separately for each school.
+  // A subscription paid for School A must never unlock School B.
+  for (const schoolEntry of schoolMap.values()) {
+    const [schoolRows] = await req.db.execute(
+      'SELECT premium_payment_model FROM schools WHERE school_id = ? LIMIT 1',
+      [schoolEntry.school_id]
+    );
+    const school = schoolRows[0];
+    schoolEntry.payment_model = school?.premium_payment_model || 'parent';
+    if (schoolEntry.payment_model === 'school') {
+      schoolEntry.premium_active = true;
+    } else {
+      const [subscriptionRows] = await req.db.execute(
+        `SELECT ps.subscription_id
+         FROM premium_subscriptions ps
+         JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+         WHERE pp.parent_account_id = ? AND ps.school_id = ?
+           AND ps.payment_status = 'paid'
+           AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+         LIMIT 1`,
+        [req.parentAccountId, schoolEntry.school_id]
+      );
+      schoolEntry.premium_active = subscriptionRows.length > 0;
+    }
+  }
+
+  for (const child of children) {
+    child.premium_active = Boolean(schoolMap.get(child.school_id)?.premium_active);
+  }
+
+  const schoolList = Array.from(schoolMap.values());
   res.json({
     parent: { parent_name: account?.full_name || null },
     parent_account_id: req.parentAccountId,
     phone: account?.canonical_parent_phone || req.parentPhone,
     school_id: children[0]?.school_id || null,
-    schools: Array.from(schoolMap.values()),
+    schools: schoolList,
     children,
-    children_count: children.length
+    children_count: children.length,
+    premium_active: schoolList.length > 0 && schoolList.every(s => s.premium_active),
+    premium_any_active: schoolList.some(s => s.premium_active)
   });
 }));
 
