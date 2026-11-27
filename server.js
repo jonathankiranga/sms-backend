@@ -134,6 +134,13 @@ async function runMigrationsIfNeeded() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
 
       for (const file of sqlFiles) {
+        // This migration creates MySQL triggers and must be imported manually
+        // after the base schema and a full backup. The cPanel/phpMyAdmin import
+        // path understands DELIMITER; mysql2's multi-statement runner does not.
+        if (file === '20261127_global_identity_memberships.sql') {
+          console.log('Skipping manual-only identity migration:', file);
+          continue;
+        }
         const [rows] = await conn.query('SELECT name FROM migrations_history WHERE name = ?', [file]);
         if (rows && rows.length > 0) {
           console.log('Skipping already-applied migration:', file);
