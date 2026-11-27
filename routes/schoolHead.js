@@ -533,14 +533,15 @@ router.post('/:schoolId/students/import', async (req, res) => {
   if (classRows.length === 0) return res.status(400).json({ error: 'Class not found for this school' });
 
   const normalizeParentPhone = value => {
-    const phone = String(value || '').replace(/[\\s-]/g, '').replace(/^\\+/, '');
-    if (/^0[17]\\d{8}$/.test(phone)) return '254' + phone.slice(1);
-    if (/^[17]\\d{8}$/.test(phone)) return '254' + phone;
-    if (/^254[17]\\d{8}$/.test(phone)) return phone;
+    const entered = String(value || '').trim().replace(/[ -]/g, '');
+    const phone = entered.startsWith('+') ? entered.slice(1) : entered;
+    if (phone.length === 10 && phone[0] === '0' && ['1', '7'].includes(phone[1])) return '254' + phone.slice(1);
+    if (phone.length === 9 && ['1', '7'].includes(phone[0])) return '254' + phone;
+    if (phone.length === 12 && phone.startsWith('254') && ['1', '7'].includes(phone[3])) return phone;
     return '';
   };
 
-  const lines = csv.trim().split(/\\r?\\n/);
+  const lines = csv.trim().split('\\n').map(line => line.endsWith('\\r') ? line.slice(0, -1) : line);
   let imported = 0, errors = 0, parentsLinked = 0;
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
     const line = lines[lineIndex];
