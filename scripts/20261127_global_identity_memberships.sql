@@ -1,0 +1,181 @@
+-- Global identity and school membership foundation.
+-- Apply once after taking a full database backup.
+-- Existing teachers and parent profiles remain intact; legacy IDs are preserved.
+
+ALTER TABLE otp_sessions
+  ADD COLUMN school_id CHAR(9) NULL AFTER teacher_id,
+  ADD KEY idx_otp_sessions_school (school_id);
+
+-- A person has one staff identity and may hold memberships in multiple schools.
+CREATE TABLE staff_accounts (
+  staff_account_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  identity_key VARCHAR(160) NOT NULL,
+  full_name VARCHAR(100) NOT NULL,
+  primary_email VARCHAR(120) NULL,
+  primary_phone VARCHAR(20) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (staff_account_id),
+  UNIQUE KEY uq_staff_identity_key (identity_key),
+  KEY idx_staff_accounts_email (primary_email),
+  KEY idx_staff_accounts_phone (primary_phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE teachers
+  ADD COLUMN staff_account_id BIGINT UNSIGNED NULL AFTER teacher_id,
+  DROP INDEX uq_phone_role,
+  DROP INDEX uq_email_role,
+  ADD KEY idx_teachers_school_phone_role (school_id, phone, role),
+  ADD KEY idx_teachers_school_email_role (school_id, email, role),
+  ADD KEY idx_teachers_staff_account (staff_account_id);
+
+-- Group existing school-specific teacher records by their normalized phone.
+-- Email is the fallback where a phone is not recorded. This avoids changing
+-- legacy teacher IDs and preserves each school's role and employment record.
+INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+SELECT
+  identity_key,
+  MAX(full_name),
+  MAX(NULLIF(LOWER(TRIM(email)), '')),
+  MAX(NULLIF(TRIM(phone), ''))
+FROM (
+  SELECT
+    teacher_id,
+    full_name,
+    email,
+    phone,
+    CASE
+      WHEN NULLIF(TRIM(phone), '') IS NOT NULL
+        THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
+      WHEN NULLIF(TRIM(email), '') IS NOT NULL
+        THEN CONCAT('email:', LOWER(TRIM(email)))
+      ELSE CONCAT('teacher:', teacher_id)
+    END AS identity_key
+  FROM teachers
+) existing_teacher_identities
+GROUP BY identity_key;
+
+UPDATE teachers t
+JOIN staff_accounts a
+  ON a.identity_key = CASE
+    WHEN NULLIF(TRIM(t.phone), '') IS NOT NULL
+      THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''))
+    WHEN NULLIF(TRIM(t.email), '') IS NOT NULL
+      THEN CONCAT('email:', LOWER(TRIM(t.email)))
+    ELSE CONCAT('teacher:', t.teacher_id)
+  END
+SET t.staff_account_id = a.staff_account_id;
+
+CREATE TABLE teacher_school_memberships (
+  membership_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  staff_account_id BIGINT UNSIGNED NOT NULL,
+  teacher_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  role ENUM('teacher','head','bursar','school_admin') NOT NULL DEFAULT 'teacher',
+  status ENUM('active','inactive','suspended') NOT NULL DEFAULT 'active',
+  joined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  ended_at DATETIME NULL,
+  PRIMARY KEY (membership_id),
+  UNIQUE KEY uq_teacher_membership_teacher (teacher_id),
+  UNIQUE KEY uq_teacher_membership_school_role (staff_account_id, school_id, role),
+  KEY idx_teacher_membership_school_status (school_id, status),
+  CONSTRAINT fk_teacher_membership_account FOREIGN KEY (staff_account_id)
+    REFERENCES staff_accounts(staff_account_id),
+  CONSTRAINT fk_teacher_membership_teacher FOREIGN KEY (teacher_id)
+    REFERENCES teachers(teacher_id),
+  CONSTRAINT fk_teacher_membership_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO teacher_school_memberships
+  (staff_account_id, teacher_id, school_id, role, status)
+SELECT staff_account_id, teacher_id, school_id, role,
+       CASE WHEN active = 1 THEN 'active' ELSE 'inactive' END
+FROM teachers
+WHERE staff_account_id IS NOT NULL;
+
+-- Parents retain their legacy parent_phone key for compatibility while a
+-- global parent account supports multiple verified contact methods and
+-- relationships with children in multiple schools.
+CREATE TABLE parent_accounts (
+  parent_account_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  canonical_parent_phone VARCHAR(20) NOT NULL,
+  full_name VARCHAR(100) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (parent_account_id),
+  UNIQUE KEY uq_parent_account_phone (canonical_parent_phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_accounts (canonical_parent_phone, full_name)
+SELECT parent_phone, MAX(full_name)
+FROM parent_profiles
+GROUP BY parent_phone;
+
+CREATE TABLE parent_account_contacts (
+  contact_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  contact_type ENUM('email','phone') NOT NULL,
+  contact_value VARCHAR(120) NOT NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  verified_at DATETIME NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (contact_id),
+  UNIQUE KEY uq_parent_contact_per_account (parent_account_id, contact_type, contact_value),
+  KEY idx_parent_contact_lookup (contact_type, contact_value),
+  CONSTRAINT fk_parent_contact_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'phone', p.parent_phone, 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.canonical_parent_phone = p.parent_phone;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.canonical_parent_phone = p.parent_phone
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT a.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_accounts a ON a.canonical_parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before enabling contact-based
+-- account resolution. A value may legitimately appear against multiple
+-- legacy profiles and must be manually reconciled rather than auto-merged.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
