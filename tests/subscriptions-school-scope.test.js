@@ -12,8 +12,12 @@ function parentDb(schoolIds, childCount = 2) {
     calls,
     async execute(sql, params = []) {
       calls.push({ sql, params });
-      if (sql.includes('SELECT parent_account_id FROM parent_profiles')) {
-        return [[{ parent_account_id: 77 }]];
+      if (sql.includes('FROM parent_profiles p')) {
+        return [[{
+          parent_phone: '0712345678',
+          parent_account_id: 77,
+          canonical_parent_phone: '0712345678'
+        }]];
       }
       if (sql.includes('SELECT DISTINCT s.school_id')) {
         return [schoolIds.map(school_id => ({ school_id }))];
@@ -57,6 +61,7 @@ test('term price counts only children at the selected school', async () => {
   assert.deepEqual(pricing, {
     schoolId: 'SCH000002',
     accountId: 77,
+    parentPhone: '0712345678',
     amount: 600
   });
 });
