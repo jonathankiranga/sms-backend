@@ -51,16 +51,28 @@ router.post('/sync', async (req, res) => {
 
       if (r.status === 'Absent') {
         const [parentRows] = await connection.execute(
-          `SELECT p.parent_phone, s.full_name AS student_name, sch.school_name
-           FROM attendance_logs a
-           JOIN students s ON a.student_id = s.student_id
-           JOIN schools sch ON s.school_id = sch.school_id
-           JOIN student_parent_map m ON s.student_id = m.student_id
-           JOIN parent_profiles p ON m.parent_phone = p.parent_phone
-           WHERE a.student_id = ? AND a.attendance_date = ?
-             AND a.absence_alerted_at IS NULL
-             AND p.is_premium = TRUE AND p.premium_expires_at >= NOW()
-           LIMIT 1`,
+          `SELECT pa.canonical_parent_phone AS parent_phone, s.full_name AS student_name, sch.school_name
+FROM attendance_logs a
+JOIN students s ON a.student_id = s.student_id
+JOIN schools sch ON s.school_id = sch.school_id
+JOIN parent_student_relationships r
+  ON r.student_id = s.student_id AND r.school_id = s.school_id AND r.status = 'active'
+JOIN parent_accounts pa ON pa.parent_account_id = r.parent_account_id
+WHERE a.student_id = ? AND a.attendance_date = ?
+  AND a.absence_alerted_at IS NULL
+  AND (
+    sch.premium_payment_model = 'school'
+    OR EXISTS (
+      SELECT 1
+      FROM premium_subscriptions ps
+      JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+      WHERE pp.parent_account_id = r.parent_account_id
+        AND ps.school_id = s.school_id
+        AND ps.payment_status = 'paid'
+        AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+    )
+  )
+LIMIT 1`,
           [r.student_id, attendance_date]
         );
 
@@ -108,13 +120,28 @@ router.post('/sync', async (req, res) => {
           );
           if (alerted[0]?.consecutive_alerted_at) continue;
           const [parentRows] = await connection.execute(
-            `SELECT p.parent_phone, s.full_name AS student_name, sch.school_name
-             FROM students s
-             JOIN schools sch ON s.school_id = sch.school_id
-             JOIN student_parent_map m ON s.student_id = m.student_id
-             JOIN parent_profiles p ON m.parent_phone = p.parent_phone
-             WHERE s.student_id = ? AND p.is_premium = TRUE AND (p.premium_expires_at IS NULL OR p.premium_expires_at >= NOW())
-             LIMIT 1`,
+            `SELECT pa.canonical_parent_phone AS parent_phone, s.full_name AS student_name, sch.school_name
+FROM attendance_logs a
+JOIN students s ON a.student_id = s.student_id
+JOIN schools sch ON s.school_id = sch.school_id
+JOIN parent_student_relationships r
+  ON r.student_id = s.student_id AND r.school_id = s.school_id AND r.status = 'active'
+JOIN parent_accounts pa ON pa.parent_account_id = r.parent_account_id
+WHERE a.student_id = ? AND a.attendance_date = ?
+  AND a.consecutive_alerted_at IS NULL
+  AND (
+    sch.premium_payment_model = 'school'
+    OR EXISTS (
+      SELECT 1
+      FROM premium_subscriptions ps
+      JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+      WHERE pp.parent_account_id = r.parent_account_id
+        AND ps.school_id = s.school_id
+        AND ps.payment_status = 'paid'
+        AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+    )
+  )
+LIMIT 1`,
             [r.student_id]
           );
           for (const p of parentRows) {
