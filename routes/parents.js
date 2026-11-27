@@ -193,17 +193,27 @@ router.post('/verify-otp', wrap(async (req, res) => {
           [accountId, duplicateId]
         );
         // Keep the global prepaid wallet usable through the account's canonical phone.
-        await connection.execute(
-          `UPDATE parent_profiles target
-           JOIN parent_accounts primary_account
-             ON primary_account.parent_account_id = ?
-           JOIN parent_profiles source
-             ON source.parent_account_id = ?
-           SET target.prepaid_balance = target.prepaid_balance + source.prepaid_balance,
-               source.prepaid_balance = 0
-           WHERE target.parent_phone = primary_account.canonical_parent_phone`,
-          [accountId, duplicateId]
+        const [duplicateProfiles] = await connection.execute(
+          'SELECT parent_phone, prepaid_balance FROM parent_profiles WHERE parent_account_id = ? FOR UPDATE',
+          [duplicateId]
         );
+        const transferredBalance = duplicateProfiles.reduce(
+          (total, profile) => total + Number(profile.prepaid_balance || 0), 0
+        );
+        if (transferredBalance > 0) {
+          await connection.execute(
+            `UPDATE parent_profiles
+             SET prepaid_balance = prepaid_balance + ?
+             WHERE parent_phone = (
+               SELECT canonical_parent_phone FROM parent_accounts WHERE parent_account_id = ?
+             )`,
+            [transferredBalance, accountId]
+          );
+          await connection.execute(
+            'UPDATE parent_profiles SET prepaid_balance = 0 WHERE parent_account_id = ?',
+            [duplicateId]
+          );
+        }
         await connection.execute(
           'UPDATE parent_profiles SET parent_account_id = ? WHERE parent_account_id = ?',
           [accountId, duplicateId]
