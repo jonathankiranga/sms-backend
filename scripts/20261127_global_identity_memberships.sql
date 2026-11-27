@@ -234,3 +234,64 @@ ALTER TABLE otp_sessions
 ALTER TABLE otp_sessions
   ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
     REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
