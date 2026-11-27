@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  normalizePhone,
   resolveParentSchool,
   getTermPrice,
   applyParentPayment
@@ -32,6 +33,12 @@ function parentDb(schoolIds, childCount = 2) {
     }
   };
 }
+
+test('subscription phone normalization accepts legacy Kenyan formats', () => {
+  assert.equal(normalizePhone('0712 345 678'), '254712345678');
+  assert.equal(normalizePhone('+254 712-345-678'), '254712345678');
+  assert.equal(normalizePhone('712345678'), '254712345678');
+});
 
 test('multi-school parent must select a school for subscription allocation', async () => {
   const db = parentDb(['SCH000001', 'SCH000002']);
@@ -80,4 +87,26 @@ test('underpayment cannot activate a subscription or update a parent profile', a
     db.calls.some(call => /UPDATE parent_profiles|INSERT INTO premium_subscriptions/.test(call.sql)),
     false
   );
+});
+
+test('full payment updates the canonical profile and selected school subscription', async () => {
+  const db = parentDb(['SCH000001'], 2);
+  const originalExecute = db.execute.bind(db);
+  db.execute = async (sql, params = []) => {
+    if (sql.includes('SELECT MIN(start_date) AS next_start')) {
+      db.calls.push({ sql, params });
+      return [[{ next_start: '2027-01-01' }]];
+    }
+    return originalExecute(sql, params);
+  };
+
+  const result = await applyParentPayment(db, '254712345678', 400, 'SCH000001');
+  assert.equal(result.school_id, 'SCH000001');
+  assert.equal(result.terms_activated, 1);
+  const profileUpdate = db.calls.find(call => call.sql.includes('UPDATE parent_profiles SET is_premium'));
+  assert.ok(profileUpdate.sql.includes('WHERE parent_account_id = ?'));
+  assert.equal(profileUpdate.params[1], 77);
+  const subscriptionInsert = db.calls.find(call => call.sql.includes('INSERT INTO premium_subscriptions'));
+  assert.equal(subscriptionInsert.params[0], 'SCH000001');
+  assert.equal(subscriptionInsert.params[1], '0712345678');
 });
