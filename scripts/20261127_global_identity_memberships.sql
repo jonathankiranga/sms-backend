@@ -295,3 +295,23 @@ BEGIN
     relationship_type = VALUES(relationship_type),
     status = 'active';
 END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
