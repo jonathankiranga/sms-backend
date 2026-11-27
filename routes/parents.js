@@ -824,6 +824,13 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
     [req.parentPhone, checkout_request_id || '', checkout_request_id || '']
   );
 
+  if (rows.length > 0 && rows[0].notes === 'STK_PAID_UNAPPLIED') {
+    return res.json({
+      status: 'paid_unapplied',
+      message: 'Payment was received, but subscription activation needs reconciliation. Please contact the school.'
+    });
+  }
+
   if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
     if (!phone) return res.json({ status: 'completed' });
     const [p] = await req.db.execute(
