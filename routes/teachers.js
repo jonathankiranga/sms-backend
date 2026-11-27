@@ -2,99 +2,136 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const router = express.Router();
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-// Request OTP using phone or email. Teachers and headteachers may sign in with email or phone.
-// Each portal passes its own role (one door per role): teacher, head or bursar.
 const STAFF_LOGIN_ROLES = ['teacher', 'head', 'bursar', 'school_admin'];
-router.post('/request-otp', async (req, res) => {
-  const { phone, email } = req.body;
-  const role = (req.body.role || '').toLowerCase();
+
+function normalizeEmail(value) {
+  return value ? String(value).trim().toLowerCase() : '';
+}
+
+function normalizePhone(value) {
+  return value ? String(value).replace(/[\\s-]/g, '').replace(/^\\+/, '') : '';
+}
+
+async function findSchoolMembership(db, { schoolId, role, phone, email }) {
+  const normalizedPhone = normalizePhone(phone);
+  const normalizedEmail = normalizeEmail(email);
+  const [rows] = await db.execute(
+    `SELECT t.teacher_id, t.staff_account_id, t.school_id, t.role, t.active,
+            m.membership_id, m.status AS membership_status
+     FROM teachers t
+     LEFT JOIN teacher_school_memberships m
+       ON m.teacher_id = t.teacher_id AND m.school_id = t.school_id
+     WHERE t.school_id = ? AND t.role = ?
+       AND ((? <> '' AND REPLACE(REPLACE(REPLACE(t.phone, ' ', ''), '-', ''), '+', '') = ?)
+         OR (? <> '' AND LOWER(TRIM(t.email)) = ?))
+     LIMIT 2`,
+    [schoolId, role, normalizedPhone, normalizedPhone, normalizedEmail, normalizedEmail]
+  );
+
+  if (rows.length > 1) return { ambiguous: true };
+  if (!rows.length) return { membership: null };
+  const row = rows[0];
+  if (row.active === 0 || row.membership_status === 'inactive' || row.membership_status === 'suspended') {
+    return { inactive: true };
+  }
+  return { membership: row };
+}
+
+// The school is deliberately selected before the contact is submitted.
+// School selection is not authorization: membership is checked server-side.
+router.post('/request-otp', wrap(async (req, res) => {
+  const schoolId = String(req.body.school_id || '').trim();
+  const phone = normalizePhone(req.body.phone);
+  const email = normalizeEmail(req.body.email);
+  const role = String(req.body.role || '').toLowerCase();
+
+  if (!schoolId) return res.status(400).json({ error: 'Select a school before requesting an OTP', code: 'SCHOOL_REQUIRED' });
   if (!phone && !email) return res.status(400).json({ error: 'Phone or email required' });
   if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required (teacher, head, bursar or school_admin)' });
 
-  // Find teacher by phone or email within the requested role
-  const [teacher] = await req.db.execute(
-    'SELECT teacher_id, school_id, role, active FROM teachers WHERE (phone = ? OR email = ?) AND role = ? LIMIT 1',
-    [phone || '', email || '', role]
-  );
-  if (teacher.length === 0) return res.status(404).json({ error: 'No staff account with that phone or email for this role' });
-  if (teacher[0].active === 0) return res.status(403).json({ error: 'Your account has been deactivated. Contact your school administrator.' });
+  const [schoolRows] = await req.db.execute('SELECT school_id FROM schools WHERE school_id = ? LIMIT 1', [schoolId]);
+  if (!schoolRows.length) return res.status(404).json({ error: 'School not found' });
 
-  const code = Math.floor(1000 + Math.random() * 9000).toString();
+  const found = await findSchoolMembership(req.db, { schoolId, role, phone, email });
+  if (found.ambiguous) return res.status(409).json({ error: 'More than one matching staff account exists in this school. Contact the school administrator.' });
+  if (!found.membership) return res.status(404).json({ error: 'No staff membership found for this school and role' });
+  if (found.inactive) return res.status(403).json({ error: 'Your membership is inactive. Contact your school administrator.' });
+
+  const code = crypto.randomInt(1000, 10000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');
-
-  // Store session with phone and/or email populated.
-  // otp_sessions.phone is NOT NULL, so use '' (empty string) for email-only logins.
   await req.db.execute(
-    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE)',
-    [sessionId, phone || '', email || null, code]
+    `INSERT INTO otp_sessions
+       (session_id, phone, email, code, expires_at, verified, teacher_id, school_id, login_role)
+     VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE, '', ?, ?)`,
+    [sessionId, phone, email || null, code, schoolId, role]
   );
 
   try {
     const messaging = require('../services/messaging');
     if (email) {
       if (messaging.sendEmailOtp) await messaging.sendEmailOtp(email, code);
-      else console.log('=== Email OTP for', email, ':', code, '===');
+      else throw new Error('Email OTP delivery is not configured');
     } else {
       await messaging.sendOtp(phone, code);
     }
-  } catch (e) {
-    console.error('OTP send failed (non-blocking):', e.message);
-    if (email) console.log('=== Email OTP for', email, ':', code, '===');
-    else console.log('=== OTP for', phone, ':', code, '===');
+  } catch (err) {
+    console.error('[STAFF OTP] Delivery failed:', err.message);
+    await req.db.execute('DELETE FROM otp_sessions WHERE session_id = ?', [sessionId]);
+    return res.status(503).json({ error: 'Unable to send the verification code. Please try again.' });
   }
 
-  res.json({ session_id: sessionId, message: 'OTP sent' });
-});
+  res.json({ session_id: sessionId, message: 'OTP sent', school_id: schoolId });
+}));
 
-// Verify OTP (works for phone or email-backed sessions). Returns session_id as bearer token for 4 hours.
-router.post('/verify-otp', async (req, res) => {
-  const { session_id, code } = req.body;
-  const role = (req.body.role || '').toLowerCase();
-  if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
+router.post('/verify-otp', wrap(async (req, res) => {
+  const sessionId = String(req.body.session_id || '').trim();
+  const code = String(req.body.code || '').trim();
+  const role = String(req.body.role || '').toLowerCase();
+  if (!sessionId || !code) return res.status(400).json({ error: 'Missing session_id or code' });
   if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required (teacher, head, bursar or school_admin)' });
 
-  const [rows] = await req.db.execute(
-    'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
-    [session_id, code]
+  const [sessions] = await req.db.execute(
+    `SELECT phone, email, school_id, login_role
+     FROM otp_sessions
+     WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE
+     LIMIT 1`,
+    [sessionId, code]
+  );
+  if (!sessions.length) {
+    const [expired] = await req.db.execute(
+      'SELECT session_id FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE LIMIT 1',
+      [sessionId, code]
+    );
+    return res.status(expired.length ? 410 : 401).json({
+      error: expired.length ? 'Code expired - request a new one' : 'Invalid or expired code'
+    });
+  }
+
+  const session = sessions[0];
+  if (!session.school_id || session.login_role !== role) {
+    return res.status(403).json({ error: 'The selected school or login role does not match this verification session' });
+  }
+
+  const found = await findSchoolMembership(req.db, {
+    schoolId: session.school_id,
+    role,
+    phone: session.phone,
+    email: session.email
+  });
+  if (found.ambiguous) return res.status(409).json({ error: 'Staff membership is ambiguous. Contact the school administrator.' });
+  if (!found.membership) return res.status(404).json({ error: 'Staff membership no longer exists for the selected school' });
+  if (found.inactive) return res.status(403).json({ error: 'Your membership is inactive. Contact your school administrator.' });
+
+  const teacher = found.membership;
+  await req.db.execute(
+    'UPDATE otp_sessions SET verified = TRUE, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR), teacher_id = ? WHERE session_id = ?',
+    [teacher.teacher_id, sessionId]
   );
 
-  if (rows.length === 0) {
-    // Distinguish an expired-but-correct code from a plain wrong one
-    const [expiredRows] = await req.db.execute(
-      'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE',
-      [session_id, code]
-    );
-    if (expiredRows.length > 0) {
-      return res.status(410).json({ error: 'Code expired - tap Resend to get a new one' });
-    }
-    return res.status(401).json({ error: 'Invalid or expired code' });
-  }
-
-  // Mark OTP session as verified and extend session expiry to 4 hours so session_id can be used as bearer token
-  await req.db.execute('UPDATE otp_sessions SET verified = TRUE, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?', [session_id]);
-
-  const phone = rows[0].phone;
-  // Resolve the teacher within the requested role; fall back to email mapping in otp_sessions
-  let [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE phone = ? AND role = ? LIMIT 1', [phone, role]);
-  if (!teacher || teacher.length === 0) {
-    // If no phone mapping, try to read email from otp_sessions (migration adds email column)
-    const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [session_id]);
-    const email = (sessRows[0] && sessRows[0].email) ? sessRows[0].email : null;
-    if (email) {
-      [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE email = ? AND role = ? LIMIT 1', [email, role]);
-    }
-  }
-
-  if (!teacher || teacher.length === 0) return res.status(404).json({ error: 'Staff account not found for this role' });
-
-  // Stamp the resolved teacher into the session so later calls resolve deterministically
-  await req.db.execute('UPDATE otp_sessions SET teacher_id = ? WHERE session_id = ?', [teacher[0].teacher_id, session_id]);
-
-  // For headteachers, include the Terms & Conditions acceptance status so the
-  // login flow can block access until the terms are accepted (once ever).
   let terms = null;
-  if (teacher[0].role === 'head') {
+  if (teacher.role === 'head') {
     try {
       const { TERMS } = require('../terms/headteacher');
       await req.db.execute(`CREATE TABLE IF NOT EXISTS terms_acceptance (
@@ -105,63 +142,107 @@ router.post('/verify-otp', async (req, res) => {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
       const [termsRows] = await req.db.execute(
         'SELECT accepted_at FROM terms_acceptance WHERE teacher_id = ?',
-        [teacher[0].teacher_id]
+        [teacher.teacher_id]
       );
       terms = {
         required: true,
         version: TERMS.version,
         accepted: termsRows.length > 0,
-        accepted_at: termsRows.length > 0 ? termsRows[0].accepted_at : null
+        accepted_at: termsRows.length ? termsRows[0].accepted_at : null
       };
-    } catch (e) {
-      console.error('[TERMS] Failed to read acceptance status:', e.message);
+    } catch (err) {
+      console.error('[TERMS] Failed to read acceptance status:', err.message);
     }
   }
 
-  // Return the opaque session_id (created during request-otp) as the bearer token. No server-side SECRET required.
-  res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, role: teacher[0].role, session_id, verified: true, terms });
-});
+  res.json({
+    teacher_id: teacher.teacher_id,
+    staff_account_id: teacher.staff_account_id || null,
+    membership_id: teacher.membership_id || null,
+    school_id: teacher.school_id,
+    role: teacher.role,
+    session_id: sessionId,
+    verified: true,
+    terms
+  });
+}));
 
-// Google sign-in for teachers. When GOOGLE_CLIENT_ID is configured, verify id_token with Google.
-// For development (no GOOGLE_CLIENT_ID), a dev endpoint is available at /auth/google/dev to create a verified session for an existing teacher email.
-router.post('/auth/google', async (req, res) => {
+// Google sign-in is also school-scoped; an email alone never selects a school.
+router.post('/auth/google', wrap(async (req, res) => {
   const { id_token } = req.body;
-  const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+  const schoolId = String(req.body.school_id || '').trim();
+  const role = String(req.body.role || '').toLowerCase();
+  const googleClientId = process.env.GOOGLE_CLIENT_ID || '';
+  if (!schoolId) return res.status(400).json({ error: 'Select a school before signing in', code: 'SCHOOL_REQUIRED' });
+  if (!STAFF_LOGIN_ROLES.includes(role)) return res.status(400).json({ error: 'Valid role required' });
   if (!id_token) return res.status(400).json({ error: 'Missing id_token' });
-  if (!GOOGLE_CLIENT_ID) return res.status(503).json({ error: 'Google OAuth not configured on server' });
+  if (!googleClientId) return res.status(503).json({ error: 'Google OAuth not configured on server' });
 
   try {
-    const r = await axios.get('https://oauth2.googleapis.com/tokeninfo', { params: { id_token } });
-    const email = r.data.email;
-    const emailVerified = r.data.email_verified === 'true' || r.data.email_verified === true;
+    const response = await axios.get('https://oauth2.googleapis.com/tokeninfo', { params: { id_token } });
+    const email = normalizeEmail(response.data.email);
+    const emailVerified = response.data.email_verified === 'true' || response.data.email_verified === true;
     if (!emailVerified) return res.status(401).json({ error: 'Google account not verified' });
 
-    // Only allow sign-in for existing teachers
-    const [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE email = ?', [email]);
-    if (teacher.length === 0) return res.status(404).json({ error: 'No teacher account for this Google email' });
+    const found = await findSchoolMembership(req.db, { schoolId, role, email });
+    if (found.ambiguous) return res.status(409).json({ error: 'Staff membership is ambiguous for this school' });
+    if (!found.membership) return res.status(404).json({ error: 'No staff membership for this school and Google account' });
+    if (found.inactive) return res.status(403).json({ error: 'Your membership is inactive' });
 
-    // Create a verified otp_session to reuse the session flow
+    const teacher = found.membership;
     const sessionId = crypto.randomBytes(32).toString('hex');
-    await req.db.execute('INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)', [sessionId, '', email, '0000']);
-
-    res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, role: teacher[0].role, session_id, verified: true });
+    await req.db.execute(
+      `INSERT INTO otp_sessions
+        (session_id, phone, email, code, expires_at, verified, teacher_id, school_id, login_role)
+       VALUES (?, '', ?, 'GOOGLE-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE, ?, ?, ?)`,
+      [sessionId, email, teacher.teacher_id, schoolId, role]
+    );
+    res.json({
+      teacher_id: teacher.teacher_id,
+      staff_account_id: teacher.staff_account_id || null,
+      membership_id: teacher.membership_id || null,
+      school_id: teacher.school_id,
+      role: teacher.role,
+      session_id: sessionId,
+      verified: true
+    });
   } catch (err) {
     console.error('Google token verification failed:', err.message);
     return res.status(401).json({ error: 'Invalid Google token' });
   }
-});
+}));
 
-// Development-only Google sign-in (no secrets required). Use only in non-production environments.
-router.post('/auth/google/dev', async (req, res) => {
+router.post('/auth/google/dev', wrap(async (req, res) => {
   if (process.env.NODE_ENV === 'production') return res.status(403).json({ error: 'Dev endpoint disabled in production' });
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ error: 'Missing email for dev sign-in' });
-  // Ensure teacher exists
-  const [teacher] = await req.db.execute('SELECT teacher_id, school_id, role FROM teachers WHERE email = ?', [email]);
-  if (teacher.length === 0) return res.status(404).json({ error: 'Teacher not found' });
+  const email = normalizeEmail(req.body.email);
+  const schoolId = String(req.body.school_id || '').trim();
+  const role = String(req.body.role || '').toLowerCase();
+  if (!email || !schoolId || !STAFF_LOGIN_ROLES.includes(role)) {
+    return res.status(400).json({ error: 'Email, school_id and valid role are required' });
+  }
+
+  const found = await findSchoolMembership(req.db, { schoolId, role, email });
+  if (found.ambiguous) return res.status(409).json({ error: 'Staff membership is ambiguous for this school' });
+  if (!found.membership) return res.status(404).json({ error: 'Teacher not found in selected school' });
+  if (found.inactive) return res.status(403).json({ error: 'Your membership is inactive' });
+
+  const teacher = found.membership;
   const sessionId = crypto.randomBytes(32).toString('hex');
-  await req.db.execute('INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)', [sessionId, '', email, '0000']);
-  res.json({ teacher_id: teacher[0].teacher_id, school_id: teacher[0].school_id, role: teacher[0].role, session_id, verified: true });
-});
+  await req.db.execute(
+    `INSERT INTO otp_sessions
+      (session_id, phone, email, code, expires_at, verified, teacher_id, school_id, login_role)
+     VALUES (?, '', ?, 'DEV-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE, ?, ?, ?)`,
+    [sessionId, email, teacher.teacher_id, schoolId, role]
+  );
+  res.json({
+    teacher_id: teacher.teacher_id,
+    staff_account_id: teacher.staff_account_id || null,
+    membership_id: teacher.membership_id || null,
+    school_id: teacher.school_id,
+    role: teacher.role,
+    session_id: sessionId,
+    verified: true
+  });
+}));
 
 module.exports = router;
