@@ -110,3 +110,25 @@ test('full payment updates the canonical profile and selected school subscriptio
   assert.equal(subscriptionInsert.params[0], 'SCH000001');
   assert.equal(subscriptionInsert.params[1], '0712345678');
 });
+
+test('early renewal extends from the existing school expiry date', async () => {
+  const db = parentDb(['SCH000001'], 2);
+  const originalExecute = db.execute.bind(db);
+  let renewalPivot = null;
+  db.execute = async (sql, params = []) => {
+    if (sql.includes('SELECT MAX(expires_at) AS current_expiry')) {
+      db.calls.push({ sql, params });
+      return [[{ current_expiry: '2027-05-01T00:00:00.000Z' }]];
+    }
+    if (sql.includes('SELECT MIN(start_date) AS next_start')) {
+      db.calls.push({ sql, params });
+      renewalPivot = params[1];
+      return [[{ next_start: '2027-09-01' }]];
+    }
+    return originalExecute(sql, params);
+  };
+
+  const result = await applyParentPayment(db, '254712345678', 400, 'SCH000001');
+  assert.equal(renewalPivot, '2027-05-01');
+  assert.equal(new Date(result.expires_at).toISOString().slice(0, 10), '2027-09-01');
+});
