@@ -179,3 +179,30 @@ test('parent report access is allowed when the school pays the subscription', as
   assert.equal(nextCalled, true);
   assert.equal(req.parentSession, true);
 });
+
+test('legacy phone-only parent sessions cannot access reports after identity migration', async () => {
+  const req = {
+    headers: { authorization: 'Bearer old-parent-session' },
+    method: 'GET',
+    path: '/report/STU000001/Term%201',
+    params: { student_id: 'STU000001' },
+    db: {
+      async execute(sql) {
+        if (sql.includes('FROM otp_sessions')) {
+          return [[{
+            phone: '0712345678', verified: 1,
+            expires_at: new Date(Date.now() + 60 * 60 * 1000)
+          }]];
+        }
+        throw new Error('Legacy phone-only parent must not trigger relationship lookup');
+      }
+    }
+  };
+  const res = responseRecorder();
+  let nextCalled = false;
+
+  await requireAssessmentAccess(req, res, () => { nextCalled = true; });
+
+  assert.equal(nextCalled, false);
+  assert.equal(res.statusCode, 403);
+});
