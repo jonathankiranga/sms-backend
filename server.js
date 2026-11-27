@@ -266,6 +266,7 @@ async function runMigrationsIfNeeded() {
     await ensureColumn('schools', 'sales_rep_id', 'VARCHAR(20) NULL AFTER region');
     await ensureColumn('students', 'nemis_number', 'VARCHAR(20) NULL AFTER admission_number');
     await ensureColumn('teachers', 'push_subscription', 'JSON NULL AFTER subjects_taught');
+    await ensureColumn('premium_bulk_payments', 'checkout_request_id', 'VARCHAR(100) NULL AFTER transaction_reference');
 
     // The current terms workflow is versionless: a headteacher accepts once.
     await conn.query("CREATE TABLE IF NOT EXISTS terms_acceptance (teacher_id VARCHAR(40) NOT NULL, accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, ip_address VARCHAR(45) NULL, PRIMARY KEY (teacher_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
@@ -291,6 +292,7 @@ async function runMigrationsIfNeeded() {
       '20260724_add_email_to_teachers_and_otp_sessions.sql',
       '20260724_add_password_auth.sql',
       '20260801_add_marked_at_to_attendance.sql',
+      '20260904_add_checkout_request_id_to_bulk_payments.sql',
       '20260906_otp_session_teacher.sql',
       '2026_add_campaign_contact.sql',
       '2026_add_class_rank.sql',
