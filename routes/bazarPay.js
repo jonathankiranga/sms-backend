@@ -1,43 +1,39 @@
 const express = require('express');
 const { ensureSchoolCallbackKey } = require('./payments');
+const { readSession, resolveStaff } = require('../lib/staffAuth');
 const router = express.Router();
 
-// Require a bursar session (OTP bearer token) for all Bazar Pay routes.
+// Require the authenticated bursar's selected, active school membership.
+// Do not fall back to phone/email because those contacts can exist in several schools.
 async function requireBursar(req, res) {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
-  const sessionId = auth.split(' ')[1];
-  const [srows] = await req.db.execute('SELECT phone, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ?', [sessionId]);
-  if (srows.length === 0) { res.status(401).json({ error: 'Invalid session' }); return null; }
-  const sess = srows[0];
-  if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
-
-  let trows;
-  if (sess.teacher_id) {
-    [trows] = await req.db.execute("SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE teacher_id = ? AND role = 'bursar' LIMIT 1", [sess.teacher_id]);
+  const session = await readSession(req);
+  if (!session) {
+    res.status(401).json({ error: 'Session not verified or expired' });
+    return null;
   }
-  if ((!trows || trows.length === 0) && sess.phone) {
-    [trows] = await req.db.execute("SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE phone = ? AND role = 'bursar' LIMIT 1", [sess.phone]);
-  }
-  if (!trows || trows.length === 0) {
-    const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [sessionId]);
-    const email = (sessRows[0] && sessRows[0].email) || null;
-    if (email) {
-      [trows] = await req.db.execute("SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE email = ? AND role = 'bursar' LIMIT 1", [email]);
-    }
-  }
-  if (!trows || trows.length === 0) { res.status(404).json({ error: 'Bursar account not found' }); return null; }
 
-  const teacher = trows[0];
-  if (teacher.role !== 'bursar') { res.status(403).json({ error: 'Only a bursar may use Bazar Pay' }); return null; }
+  const staff = await resolveStaff(req.db, session);
+  if (!staff || staff.role !== 'bursar') {
+    res.status(403).json({ error: 'An active bursar membership is required' });
+    return null;
+  }
 
-  // Enforce school scoping when the request specifies a school
-  const requestedSchool = req.params.school_id || req.query.school_id;
-  if (requestedSchool && String(requestedSchool) !== String(teacher.school_id)) {
+  const requestedSchool = req.params.school_id || req.params.schoolId ||
+    (req.body && req.body.school_id) || req.query.school_id;
+  if (requestedSchool && String(requestedSchool) !== String(staff.school_id)) {
     res.status(403).json({ error: 'Access denied for this school' });
     return null;
   }
-  return teacher;
+
+  const [teachers] = await req.db.execute(
+    "SELECT teacher_id, full_name, phone, email, role, school_id FROM teachers WHERE teacher_id = ? AND school_id = ? AND role = 'bursar' AND active = 1 LIMIT 1",
+    [staff.teacher_id, staff.school_id]
+  );
+  if (!teachers.length) {
+    res.status(403).json({ error: 'Active bursar profile not found for this school' });
+    return null;
+  }
+  return teachers[0];
 }
 
 router.use(async (req, res, next) => {
@@ -136,6 +132,12 @@ router.post('/cash-payment', async (req, res) => {
   if (!school_id || !student_id || !amount || !term || !year) {
     return res.status(400).json({ error: 'school_id, student_id, amount, term, year required' });
   }
+  const [students] = await req.db.execute(
+    'SELECT student_id FROM students WHERE student_id = ? AND school_id = ? LIMIT 1',
+    [student_id, req.bursar.school_id]
+  );
+  if (!students.length) return res.status(403).json({ error: 'Learner does not belong to your school' });
+
   const validMethods = ['Cash', 'Bank Transfer', 'Cheque', 'M-Pesa'];
   const method = validMethods.includes(payment_method) ? payment_method : 'Cash';
 
@@ -161,6 +163,9 @@ router.post('/reverse-payment', async (req, res) => {
     [transaction_reference]
   );
   if (existing.length === 0) return res.status(404).json({ error: 'Payment not found' });
+  if (String(existing[0].school_id) !== String(req.bursar.school_id)) {
+    return res.status(403).json({ error: 'You cannot reverse a payment from another school' });
+  }
   if (existing[0].reversed_at) return res.status(400).json({ error: 'Payment already reversed' });
 
   await req.db.execute(
@@ -296,8 +301,8 @@ router.get('/statement/:student_id', async (req, res) => {
   if (!term || !year) return res.status(400).json({ error: 'term and year required' });
 
   const [student] = await req.db.execute(
-    'SELECT s.*, c.class_name, c.school_id FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.student_id = ?',
-    [student_id]
+    'SELECT s.*, c.class_name, c.school_id FROM students s JOIN classes c ON s.class_id = c.class_id WHERE s.student_id = ? AND s.school_id = ? AND c.school_id = ?',
+    [student_id, req.bursar.school_id, req.bursar.school_id]
   );
   if (student.length === 0) return res.status(404).json({ error: 'Student not found' });
 
@@ -316,9 +321,9 @@ router.get('/statement/:student_id', async (req, res) => {
   // Transactions
   const [transactions] = await req.db.execute(
     `SELECT * FROM payment_ledger
-     WHERE student_reference = ? AND term = ? AND academic_year = ?
+     WHERE student_reference = ? AND school_id = ? AND term = ? AND academic_year = ?
      ORDER BY logged_at DESC`,
-    [student_id, term, year]
+    [student_id, req.bursar.school_id, term, year]
   );
 
   const totalDue = feeItems.filter(f => !f.waived).reduce((sum, f) => sum + parseFloat(f.effective_amount), 0);
@@ -417,12 +422,13 @@ router.get('/parent-subscriptions', async (req, res) => {
 
   // Get app_settings for price
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
+  const pricePerChild = parseInt(setting[0]?.setting_value || '200');
 
   const result = parents.map(p => {
     const activeFromSubscriptions = activeParentPhones.has(p.parent_phone);
-    const activeFromProfile = p.is_premium && (!p.premium_expires_at || new Date(p.premium_expires_at) > new Date());
-    const isActive = activeFromSubscriptions || activeFromProfile;
+    // is_premium is a legacy profile-wide flag. It must never unlock
+    // subscriptions in a different school; only the school-scoped ledger counts.
+    const isActive = activeFromSubscriptions;
     const feesPaid = feePaidPhones.has(p.parent_phone);
     return {
       parent_phone: p.parent_phone,
