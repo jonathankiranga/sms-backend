@@ -192,6 +192,18 @@ router.post('/verify-otp', wrap(async (req, res) => {
              verified_at = COALESCE(parent_account_contacts.verified_at, VALUES(verified_at))`,
           [accountId, duplicateId]
         );
+        // Keep the global prepaid wallet usable through the account's canonical phone.
+        await connection.execute(
+          `UPDATE parent_profiles target
+           JOIN parent_accounts primary_account
+             ON primary_account.parent_account_id = ?
+           JOIN parent_profiles source
+             ON source.parent_account_id = ?
+           SET target.prepaid_balance = target.prepaid_balance + source.prepaid_balance,
+               source.prepaid_balance = 0
+           WHERE target.parent_phone = primary_account.canonical_parent_phone`,
+          [accountId, duplicateId]
+        );
         await connection.execute(
           'UPDATE parent_profiles SET parent_account_id = ? WHERE parent_account_id = ?',
           [accountId, duplicateId]
