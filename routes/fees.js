@@ -1,41 +1,6 @@
 const express = require('express');
 const router = express.Router();
-
-async function readSession(req) {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth.startsWith('Bearer ')) return null;
-  const sessionId = auth.slice(7).trim();
-  const [rows] = await req.db.execute(
-    'SELECT phone, email, teacher_id, parent_account_id, school_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
-    [sessionId]
-  );
-  const session = rows[0];
-  if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) return null;
-  return session;
-}
-
-async function resolveStaff(db, session) {
-  let rows = [];
-  if (session.teacher_id) {
-    [rows] = await db.execute(
-      'SELECT teacher_id, school_id, role, active FROM teachers WHERE teacher_id = ? LIMIT 1',
-      [session.teacher_id]
-    );
-  }
-  if (rows.length === 0 && session.phone) {
-    [rows] = await db.execute(
-      'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? LIMIT 1',
-      [session.phone]
-    );
-  }
-  if (rows.length === 0 && session.email) {
-    [rows] = await db.execute(
-      'SELECT teacher_id, school_id, role, active FROM teachers WHERE email = ? LIMIT 1',
-      [session.email]
-    );
-  }
-  return rows[0] || null;
-}
+const { readSession, resolveStaff } = require('../lib/staffAuth');
 
 async function requireFeeStaff(req, res, next) {
   try {
