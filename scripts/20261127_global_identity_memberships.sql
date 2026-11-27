@@ -47,10 +47,10 @@ FROM (
     email,
     phone,
     CASE
-      WHEN NULLIF(TRIM(phone), '') IS NOT NULL
-        THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
       WHEN NULLIF(TRIM(email), '') IS NOT NULL
         THEN CONCAT('email:', LOWER(TRIM(email)))
+      WHEN NULLIF(TRIM(phone), '') IS NOT NULL
+        THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
       ELSE CONCAT('teacher:', teacher_id)
     END AS identity_key
   FROM teachers
@@ -60,13 +60,36 @@ GROUP BY identity_key;
 UPDATE teachers t
 JOIN staff_accounts a
   ON a.identity_key = CASE
-    WHEN NULLIF(TRIM(t.phone), '') IS NOT NULL
-      THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''))
     WHEN NULLIF(TRIM(t.email), '') IS NOT NULL
       THEN CONCAT('email:', LOWER(TRIM(t.email)))
+    WHEN NULLIF(TRIM(t.phone), '') IS NOT NULL
+      THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(t.phone), ' ', ''), '-', ''), '+', ''))
     ELSE CONCAT('teacher:', t.teacher_id)
   END
 SET t.staff_account_id = a.staff_account_id;
+
+CREATE TABLE staff_account_contacts (
+  contact_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  staff_account_id BIGINT UNSIGNED NOT NULL,
+  contact_type ENUM('email','phone') NOT NULL,
+  contact_value VARCHAR(120) NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (contact_id),
+  UNIQUE KEY uq_staff_contact_per_account (staff_account_id, contact_type, contact_value),
+  KEY idx_staff_contact_lookup (contact_type, contact_value),
+  CONSTRAINT fk_staff_contact_account FOREIGN KEY (staff_account_id)
+    REFERENCES staff_accounts(staff_account_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+SELECT staff_account_id, 'phone', TRIM(phone)
+FROM teachers
+WHERE NULLIF(TRIM(phone), '') IS NOT NULL;
+
+INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+SELECT staff_account_id, 'email', LOWER(TRIM(email))
+FROM teachers
+WHERE NULLIF(TRIM(email), '') IS NOT NULL;
 
 CREATE TABLE teacher_school_memberships (
   membership_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
