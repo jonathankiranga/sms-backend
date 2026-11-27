@@ -69,3 +69,26 @@ test('inactive school memberships cannot authenticate', async () => {
   });
   assert.equal(result.inactive, true);
 });
+
+test('phone and email supplied together must match the same staff record', async () => {
+  let captured;
+  const db = {
+    async execute(sql, params) {
+      captured = { sql, params };
+      return [[]];
+    }
+  };
+
+  const result = await findSchoolMembership(db, {
+    schoolId: 'SCH000001',
+    role: 'teacher',
+    phone: '0712345678',
+    email: 'attacker@example.com'
+  });
+
+  assert.equal(result.membership, null);
+  assert.match(captured.sql, / = \\? AND LOWER\\(TRIM\\(t\\.email\\)\\) = \\?/);
+  assert.equal(captured.params[2], '254712345678');
+  assert.equal(captured.params[3], 'attacker@example.com');
+  assert.doesNotMatch(captured.sql, /\\sOR\\s/);
+});
