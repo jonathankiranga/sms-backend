@@ -253,8 +253,22 @@ async function runMigrationsIfNeeded() {
     const salesRepColumnSet = new Set(salesRepColumns.map(row => row.COLUMN_NAME));
     if (!salesRepColumnSet.has('commission_type')) await conn.query("ALTER TABLE sales_reps ADD COLUMN commission_type ENUM('percent','flat') NOT NULL DEFAULT 'percent'");
     if (!salesRepColumnSet.has('commission_value')) await conn.query('ALTER TABLE sales_reps ADD COLUMN commission_value DECIMAL(10,2) NOT NULL DEFAULT 0');
-    const [salesRepSchoolColumn] = await conn.query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='schools' AND COLUMN_NAME='sales_rep_id'");
-    if (!salesRepSchoolColumn.length) await conn.query('ALTER TABLE schools ADD COLUMN sales_rep_id VARCHAR(20) NULL AFTER region');
+    async function ensureColumn(tableName, columnName, definition) {
+      const [found] = await conn.query(
+        'SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?',
+        [tableName, columnName]
+      );
+      if (!found.length) {
+        await conn.query('ALTER TABLE `' + tableName + '` ADD COLUMN `' + columnName + '` ' + definition);
+        console.log('[MIGRATION] Added column:', tableName + '.' + columnName);
+      }
+    }
+    await ensureColumn('schools', 'sales_rep_id', 'VARCHAR(20) NULL AFTER region');
+    await ensureColumn('students', 'nemis_number', 'VARCHAR(20) NULL AFTER admission_number');
+    await ensureColumn('teachers', 'push_subscription', 'JSON NULL AFTER subjects_taught');
+
+    // The current terms workflow is versionless: a headteacher accepts once.
+    await conn.query("CREATE TABLE IF NOT EXISTS terms_acceptance (teacher_id VARCHAR(40) NOT NULL, accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, ip_address VARCHAR(45) NULL, PRIMARY KEY (teacher_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
     // Preserve the existing dated and migration_*.sql upgrade files. On first
     // adoption, the full schema is the canonical baseline; optional commission
@@ -273,7 +287,8 @@ async function runMigrationsIfNeeded() {
         continue;
       }
       const commissionMigration = file === '2026_add_commission_payment_system.sql' || file === '2026_add_commission_wallet.sql';
-      if (baselineWasEstablishedNow && !commissionMigration) {
+      const competencySeed = file === '20260726_create_cbc_competencies.sql';
+      if (baselineWasEstablishedNow && !commissionMigration && !competencySeed) {
         await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Superseded by the canonical full-schema baseline']);
         console.log('[MIGRATION] Historical migration covered by base schema:', file);
         continue;
