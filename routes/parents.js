@@ -316,7 +316,9 @@ async function requireParentSession(req, res, next) {
 
     const sessionPhone = normalizePhone(session.phone);
     const accountId = session.parent_account_id || null;
-    if (!accountId && !sessionPhone) return res.status(403).json({ error: 'Verified parent identity is not linked to this session' });
+    if (!accountId) {
+      return res.status(403).json({ error: 'Global parent account migration is required. Please request a new verification code.' });
+    }
 
     const suppliedPhone = req.params.phone || (req.body && req.body.phone) || req.query.phone;
     if (suppliedPhone) {
@@ -329,8 +331,6 @@ async function requireParentSession(req, res, next) {
         if (!contact.length && supplied !== sessionPhone) {
           return res.status(403).json({ error: 'This session cannot access another parent account' });
         }
-      } else if (supplied !== sessionPhone) {
-        return res.status(403).json({ error: 'This session cannot access another parent account' });
       }
     }
 
