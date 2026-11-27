@@ -138,18 +138,13 @@ CREATE TABLE parent_accounts (
   UNIQUE KEY uq_parent_account_phone (canonical_parent_phone)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Do not merge parent records merely because an unverified email matches.
+-- Each existing phone profile starts as a separate account. The accounts are
+-- consolidated only after the parent proves control of the shared email by OTP.
 INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
-SELECT identity_key, MIN(parent_phone), MAX(full_name)
-FROM (
-  SELECT parent_phone, full_name,
-    CASE
-      WHEN NULLIF(TRIM(email), '') IS NOT NULL
-        THEN CONCAT('email:', LOWER(TRIM(email)))
-      ELSE CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(parent_phone), ' ', ''), '-', ''), '+', ''))
-    END AS identity_key
-  FROM parent_profiles
-) existing_parent_identities
-GROUP BY identity_key;
+SELECT CONCAT('phone:', parent_phone), parent_phone, MAX(full_name)
+FROM parent_profiles
+GROUP BY parent_phone;
 
 ALTER TABLE parent_profiles
   ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER parent_phone,
@@ -157,11 +152,7 @@ ALTER TABLE parent_profiles
 
 UPDATE parent_profiles p
 JOIN parent_accounts a
-  ON a.identity_key = CASE
-    WHEN NULLIF(TRIM(p.email), '') IS NOT NULL
-      THEN CONCAT('email:', LOWER(TRIM(p.email)))
-    ELSE CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
-  END
+  ON a.identity_key = CONCAT('phone:', p.parent_phone)
 SET p.parent_account_id = a.parent_account_id;
 
 ALTER TABLE parent_profiles
