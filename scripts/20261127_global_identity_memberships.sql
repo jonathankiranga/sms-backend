@@ -483,6 +483,6 @@ BEGIN
           ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', '')
         END);
   END IF;
-END$
+END$$
 
 DELIMITER ;
