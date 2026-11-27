@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 
 const { requireStaffSession: requireBoundStaffSession } = require('../lib/staffAuth');
+const { normalizePhone } = require('../lib/identity');
 
 async function requireAttendanceStaff(req, res, next) {
   return requireBoundStaffSession(req, res, () => {
@@ -80,7 +81,7 @@ LIMIT 1`,
           const parent = parentRows[0];
           try {
             const { sendAbsenceAlert } = require('../services/messaging');
-            await sendAbsenceAlert(parent.parent_phone, parent.student_name, parent.school_name, attendance_date);
+            await sendAbsenceAlert(normalizePhone(parent.parent_phone), parent.student_name, parent.school_name, attendance_date);
             await connection.execute(
               'UPDATE attendance_logs SET absence_alerted_at = NOW() WHERE student_id = ? AND attendance_date = ?',
               [r.student_id, attendance_date]
