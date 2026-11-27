@@ -675,6 +675,20 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   // The server calculates the charge. Never trust an amount supplied by the browser.
   const totalDue = pricePerChild * childCount;
 
+  // Apply prepaid credit only after the parent has explicitly selected this
+  // school. The wallet debit, subscription and ledger entry are transactional.
+  const { autoActivateFromPrepaid } = require('../lib/subscriptions');
+  const prepaidActivated = await autoActivateFromPrepaid(req.db, billingPhone, school_id);
+  if (prepaidActivated) {
+    return res.json({
+      transaction_ref: null,
+      status: 'prepaid_activated',
+      message: `Prepaid balance applied to this school's subscription for KSh ${totalDue}.`,
+      premium_due: totalDue,
+      premium_children_count: childCount
+    });
+  }
+
   const txnRef = 'TXN' + Date.now().toString(36).toUpperCase();
 
   // Ensure parent profile exists (payment_ledger FK requires it)
