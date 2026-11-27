@@ -541,7 +541,7 @@ router.post('/:schoolId/students/import', async (req, res) => {
     return '';
   };
 
-  const lines = csv.trim().split('\\n').map(line => line.endsWith('\\r') ? line.slice(0, -1) : line);
+  const lines = csv.trim().split(String.fromCharCode(10)).map(line => line.endsWith(String.fromCharCode(13)) ? line.slice(0, -1) : line);
   let imported = 0, errors = 0, parentsLinked = 0;
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
     const line = lines[lineIndex];
