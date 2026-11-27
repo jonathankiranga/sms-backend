@@ -645,7 +645,7 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
        JOIN student_parent_map m ON s.student_id = m.student_id
        JOIN schools sc ON s.school_id = sc.school_id
        WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'${scopeSql}`,
-      [phone, ...scopeParams]
+      [billingPhone, ...scopeParams]
     );
   }
 
@@ -844,11 +844,15 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
 
   // 1. Check payment_ledger — matches individual parent upgrade STK
   //    (student_reference is set to CheckoutRequestID after the STK push)
+  const parentPaymentScope = req.parentAccountId
+    ? 'parent_phone IN (SELECT parent_phone FROM parent_profiles WHERE parent_account_id = ?)'
+    : 'parent_phone = ?';
+  const parentPaymentScopeValue = req.parentAccountId || req.parentPhone;
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
-     WHERE parent_phone = ? AND (student_reference = ? OR transaction_reference = ?)
+     WHERE ${parentPaymentScope} AND (student_reference = ? OR transaction_reference = ?)
      ORDER BY logged_at DESC LIMIT 1`,
-    [req.parentPhone, checkout_request_id || '', checkout_request_id || '']
+    [parentPaymentScopeValue, checkout_request_id || '', checkout_request_id || '']
   );
 
   if (rows.length > 0 && rows[0].notes === 'STK_PAID_UNAPPLIED') {
