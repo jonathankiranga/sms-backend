@@ -29,8 +29,22 @@ router.post('/request-otp', wrap(async (req, res) => {
     `SELECT DISTINCT a.parent_account_id, a.canonical_parent_phone
      FROM parent_account_contacts c
      JOIN parent_accounts a ON a.parent_account_id = c.parent_account_id
-     WHERE ${conditions.join(' OR ')}`,
-    params
+     WHERE ${conditions.join(' OR ')}
+     UNION
+     SELECT DISTINCT a.parent_account_id, a.canonical_parent_phone
+     FROM parent_profiles p
+     JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+     WHERE ? <> '' AND
+       CASE
+         WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 10
+              AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 9
+              AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) IN ('7', '1')
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END = ?`,
+    [...params, normPhone, normPhone]
   );
 
   if (!matches.length) {
@@ -110,14 +124,36 @@ router.post('/verify-otp', wrap(async (req, res) => {
     const contactValue1 = verifiedEmail || verifiedPhone;
     const contactValue2 = verifiedEmail || rawPhone || verifiedPhone;
 
-    const [matchingAccounts] = await connection.execute(
-      `SELECT parent_account_id
-       FROM parent_account_contacts
-       WHERE contact_type = ? AND contact_value IN (?, ?)
-       ORDER BY parent_account_id
-       FOR UPDATE`,
-      [verifiedContactType, contactValue1, contactValue2]
-    );
+    let matchingAccounts;
+    if (verifiedEmail) {
+      [matchingAccounts] = await connection.execute(
+        `SELECT parent_account_id
+         FROM parent_account_contacts
+         WHERE contact_type = 'email' AND contact_value = ?
+         ORDER BY parent_account_id
+         FOR UPDATE`,
+        [verifiedEmail]
+      );
+    } else {
+      [matchingAccounts] = await connection.execute(
+        `SELECT DISTINCT a.parent_account_id
+         FROM parent_profiles p
+         JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+         WHERE
+           CASE
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 10
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+               THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 9
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) IN ('7', '1')
+               THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+             ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+           END = ?
+         ORDER BY a.parent_account_id
+         FOR UPDATE`,
+        [verifiedPhone]
+      );
+    }
     const accountIds = [...new Set(matchingAccounts.map(row => Number(row.parent_account_id)))];
     if (accountIds.length) {
       accountId = Math.min(...accountIds);
@@ -154,12 +190,34 @@ router.post('/verify-otp', wrap(async (req, res) => {
       }
     }
 
-    await connection.execute(
-      `UPDATE parent_account_contacts
-       SET verified_at = COALESCE(verified_at, NOW())
-       WHERE parent_account_id = ? AND contact_type = ? AND contact_value IN (?, ?)`,
-      [accountId, verifiedContactType, contactValue1, contactValue2]
-    );
+    if (verifiedEmail) {
+      await connection.execute(
+        `UPDATE parent_account_contacts
+         SET verified_at = COALESCE(verified_at, NOW())
+         WHERE parent_account_id = ? AND contact_type = 'email' AND contact_value = ?`,
+        [accountId, verifiedEmail]
+      );
+    } else {
+      await connection.execute(
+        `UPDATE parent_account_contacts c
+         JOIN parent_profiles p
+           ON p.parent_account_id = c.parent_account_id
+          AND p.parent_phone = c.contact_value
+         SET c.verified_at = COALESCE(c.verified_at, NOW())
+         WHERE c.parent_account_id = ?
+           AND c.contact_type = 'phone'
+           AND CASE
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 10
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+               THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 9
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) IN ('7', '1')
+               THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+             ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+           END = ?`,
+        [accountId, verifiedPhone]
+      );
+    }
 
     const [accounts] = await connection.execute(
       'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
