@@ -36,10 +36,14 @@ router.post('/request-otp', wrap(async (req, res) => {
   if (!matches.length) {
     return res.status(404).json({ error: 'This contact is not registered with a parent account. Ask the school to register or link your contact details.' });
   }
-  if (matches.length > 1) {
-    return res.status(409).json({ error: 'Your email and telephone number are associated with different parent accounts. Contact the school to reconcile the records before signing in.' });
+  if (matches.length > 1 && (normPhone || !email)) {
+    return res.status(409).json({ error: 'Your email and telephone number are associated with different parent accounts. Sign in using the email alone to verify and consolidate the matching parent records.' });
   }
 
+  // Email-only sign-in may match legacy parent profiles from several schools.
+  // Select a stable account for the OTP session; the verified-email step below
+  // consolidates the matching accounts after proof of email ownership.
+  matches.sort((a, b) => Number(a.parent_account_id) - Number(b.parent_account_id));
   const account = matches[0];
   const code = crypto.randomInt(1000, 10000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');
@@ -88,20 +92,88 @@ router.post('/verify-otp', wrap(async (req, res) => {
     });
   }
 
-  const accountId = rows[0].parent_account_id;
+  let accountId = rows[0].parent_account_id;
   if (!accountId) return res.status(403).json({ error: 'This OTP session is not linked to a parent account. Request a new code.' });
 
-  const [accounts] = await req.db.execute(
-    'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
-    [accountId]
-  );
-  if (!accounts.length) return res.status(404).json({ error: 'Parent account not found' });
+  const connection = await req.db.getConnection();
+  let account;
+  try {
+    await connection.beginTransaction();
 
-  const account = accounts[0];
-  await req.db.execute(
-    'UPDATE otp_sessions SET verified = TRUE, phone = ?, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?',
-    [account.canonical_parent_phone, session_id]
-  );
+    // An email can be present on multiple legacy parent profiles. Only after
+    // successful email OTP verification do we consolidate those identities.
+    const verifiedEmail = rows[0].email ? String(rows[0].email).trim().toLowerCase() : '';
+    if (verifiedEmail) {
+      const [emailAccounts] = await connection.execute(
+        `SELECT DISTINCT parent_account_id
+         FROM parent_account_contacts
+         WHERE contact_type = 'email' AND contact_value = ?
+         ORDER BY parent_account_id
+         FOR UPDATE`,
+        [verifiedEmail]
+      );
+      const accountIds = emailAccounts.map(row => Number(row.parent_account_id));
+      if (accountIds.length) {
+        accountId = Math.min(...accountIds);
+        for (const duplicateId of accountIds.filter(id => id !== accountId)) {
+          await connection.execute(
+            `INSERT IGNORE INTO parent_student_relationships
+               (parent_account_id, student_id, school_id, relationship_type, is_primary,
+                can_view_results, can_view_fees, status)
+             SELECT ?, student_id, school_id, relationship_type, is_primary,
+                    can_view_results, can_view_fees, status
+             FROM parent_student_relationships
+             WHERE parent_account_id = ?`,
+            [accountId, duplicateId]
+          );
+          await connection.execute(
+            `INSERT IGNORE INTO parent_account_contacts
+               (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+             SELECT ?, contact_type, contact_value, is_primary, verified_at
+             FROM parent_account_contacts
+             WHERE parent_account_id = ?`,
+            [accountId, duplicateId]
+          );
+          await connection.execute(
+            'UPDATE parent_profiles SET parent_account_id = ? WHERE parent_account_id = ?',
+            [accountId, duplicateId]
+          );
+          await connection.execute(
+            'UPDATE otp_sessions SET parent_account_id = ? WHERE parent_account_id = ?',
+            [accountId, duplicateId]
+          );
+          await connection.execute('DELETE FROM parent_student_relationships WHERE parent_account_id = ?', [duplicateId]);
+          await connection.execute('DELETE FROM parent_account_contacts WHERE parent_account_id = ?', [duplicateId]);
+          await connection.execute('DELETE FROM parent_accounts WHERE parent_account_id = ?', [duplicateId]);
+        }
+      }
+      await connection.execute(
+        `UPDATE parent_account_contacts
+         SET verified_at = COALESCE(verified_at, NOW())
+         WHERE parent_account_id = ? AND contact_type = 'email' AND contact_value = ?`,
+        [accountId, verifiedEmail]
+      );
+    }
+
+    const [accounts] = await connection.execute(
+      'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+      [accountId]
+    );
+    if (!accounts.length) throw new Error('Parent account not found');
+    account = accounts[0];
+
+    await connection.execute(
+      'UPDATE otp_sessions SET parent_account_id = ?, verified = TRUE, phone = ?, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?',
+      [accountId, account.canonical_parent_phone, session_id]
+    );
+
+    await connection.commit();
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
+  }
 
   const [countRows] = await req.db.execute(
     `SELECT COUNT(DISTINCT r.student_id) AS cnt
