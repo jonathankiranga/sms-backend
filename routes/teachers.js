@@ -163,7 +163,7 @@ router.post('/auth/google', wrap(async (req, res) => {
     await req.db.execute(
       `INSERT INTO otp_sessions
         (session_id, phone, email, code, expires_at, verified, teacher_id, school_id, login_role)
-       VALUES (?, '', ?, 'GOOGLE-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE, ?, ?, ?)`,
+       VALUES (?, '', ?, '0000', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE, ?, ?, ?)`,
       [sessionId, email, teacher.teacher_id, schoolId, role]
     );
     res.json({
@@ -200,7 +200,7 @@ router.post('/auth/google/dev', wrap(async (req, res) => {
   await req.db.execute(
     `INSERT INTO otp_sessions
       (session_id, phone, email, code, expires_at, verified, teacher_id, school_id, login_role)
-     VALUES (?, '', ?, 'DEV-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE, ?, ?, ?)`,
+     VALUES (?, '', ?, '0000', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE, ?, ?, ?)`,
     [sessionId, email, teacher.teacher_id, schoolId, role]
   );
   res.json({
