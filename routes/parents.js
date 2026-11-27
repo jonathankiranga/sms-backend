@@ -473,14 +473,27 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   // Scope to active children at the chosen school (or all schools when omitted)
   const scopeSql = school_id ? ' AND s.school_id = ?' : '';
   const scopeParams = school_id ? [school_id] : [];
-  const [childRows] = await req.db.execute(
-    `SELECT s.student_id, s.school_id, sc.premium_payment_model
-     FROM students s
-     JOIN student_parent_map m ON s.student_id = m.student_id
-     JOIN schools sc ON s.school_id = sc.school_id
-     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'${scopeSql}`,
-    [phone, ...scopeParams]
-  );
+  let childRows;
+  if (req.parentAccountId) {
+    [childRows] = await req.db.execute(
+      `SELECT s.student_id, s.school_id, sc.premium_payment_model
+       FROM parent_student_relationships r
+       JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+       JOIN schools sc ON sc.school_id = r.school_id
+       WHERE r.parent_account_id = ? AND r.status = 'active'
+         AND s.enrollment_status = 'Active'${school_id ? ' AND s.school_id = ?' : ''}`,
+      school_id ? [req.parentAccountId, school_id] : [req.parentAccountId]
+    );
+  } else {
+    [childRows] = await req.db.execute(
+      `SELECT s.student_id, s.school_id, sc.premium_payment_model
+       FROM students s
+       JOIN student_parent_map m ON s.student_id = m.student_id
+       JOIN schools sc ON s.school_id = sc.school_id
+       WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'${scopeSql}`,
+      [phone, ...scopeParams]
+    );
+  }
 
   // Prevent parent payment if a covered school pays for premium (within scope)
   for (const row of childRows) {
