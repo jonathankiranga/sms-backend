@@ -395,12 +395,12 @@ router.get('/report/:student_id/:term', async (req, res) => {
   let link;
   if (parentAccountId) {
     [link] = await req.db.execute(
-      `SELECT s.school_id, p.is_premium, p.premium_expires_at, sc.premium_payment_model
+      `SELECT s.school_id, sc.premium_payment_model
        FROM parent_student_relationships r
        JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
        JOIN schools sc ON sc.school_id = r.school_id
-       LEFT JOIN parent_profiles p ON p.parent_account_id = r.parent_account_id
-       WHERE r.parent_account_id = ? AND r.student_id = ? AND r.status = 'active'
+       WHERE r.parent_account_id = ? AND r.student_id = ?
+         AND r.status = 'active' AND r.can_view_results = 1
        LIMIT 1`,
       [parentAccountId, student_id]
     );
@@ -419,11 +419,28 @@ router.get('/report/:student_id/:term', async (req, res) => {
   if (!isTeacher && link.length === 0) {
     return res.status(403).json({ error: 'This student is not linked to your verified parent account.' });
   }
+
   const schoolPays = link.length > 0 && link[0].premium_payment_model === 'school';
-  const subActive = link.length > 0 && Boolean(link[0].is_premium) &&
-    (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+  let subActive = false;
+  if (parentAccountId && link.length > 0) {
+    const [subscriptions] = await req.db.execute(
+      `SELECT ps.subscription_id
+       FROM premium_subscriptions ps
+       JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+       WHERE pp.parent_account_id = ? AND ps.school_id = ?
+         AND ps.payment_status = 'paid'
+         AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+       LIMIT 1`,
+      [parentAccountId, link[0].school_id]
+    );
+    subActive = subscriptions.length > 0;
+  } else if (link.length > 0) {
+    subActive = Boolean(link[0].is_premium) &&
+      (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+  }
+
   if (!isTeacher && !schoolPays && !subActive) {
-    return res.status(402).json({ error: 'An active subscription is required to download report cards.' });
+    return res.status(402).json({ error: 'An active subscription is required for this school to download report cards.' });
   }
 
   // Extended student profile for KNEC report card
