@@ -87,8 +87,8 @@ test('phone and email supplied together must match the same staff record', async
   });
 
   assert.equal(result.membership, null);
-  assert.match(captured.sql, / = \\? AND LOWER\\(TRIM\\(t\\.email\\)\\) = \\?/);
+  assert.ok(captured.sql.includes('AND LOWER(TRIM(t.email)) = ?'));
   assert.equal(captured.params[2], '254712345678');
   assert.equal(captured.params[3], 'attacker@example.com');
-  assert.doesNotMatch(captured.sql, /\\sOR\\s/);
+  assert.ok(!captured.sql.includes(' OR '));
 });
