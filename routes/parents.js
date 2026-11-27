@@ -592,13 +592,14 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   if (phone !== req.parentPhone) return res.status(403).json({ error: 'This session cannot pay from another parent account' });
   // Global parent accounts must choose the school being paid for. Never
   // combine children or allocate one payment across unrelated school terms.
-  if (req.parentAccountId && !school_id) {
+  if (!school_id) {
     return res.status(400).json({ error: 'Select the school for this subscription payment' });
   }
 
-  // Scope to active children at the chosen school (or all schools when omitted for legacy sessions)
-  const scopeSql = school_id ? ' AND s.school_id = ?' : '';
-  const scopeParams = school_id ? [school_id] : [];
+  // Every subscription payment is scoped to one school, including legacy
+  // sessions. A global parent must never be charged for children elsewhere.
+  const scopeSql = ' AND s.school_id = ?';
+  const scopeParams = [school_id];
   let childRows;
   if (req.parentAccountId) {
     [childRows] = await req.db.execute(
@@ -608,7 +609,7 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
        JOIN schools sc ON sc.school_id = r.school_id
        WHERE r.parent_account_id = ? AND r.status = 'active'
          AND s.enrollment_status = 'Active'${school_id ? ' AND s.school_id = ?' : ''}`,
-      school_id ? [req.parentAccountId, school_id] : [req.parentAccountId]
+      [req.parentAccountId, school_id]
     );
   } else {
     [childRows] = await req.db.execute(
@@ -691,12 +692,10 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
 
   // Simulated upgrade — dev only — mark premium immediately (used when M-Pesa not configured in dev)
   const { getNextTermStart } = require('../lib/config');
-  const [schoolRows] = await req.db.execute(
-    'SELECT DISTINCT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
-    [phone]
-  );
-  const schoolIdForExpiry = schoolRows[0]?.school_id;
-  const expiresAt = schoolIdForExpiry ? await getNextTermStart(req.db, schoolIdForExpiry) : new Date(Date.now() + 120 * 86400000);
+  const { getCurrentTermLabel } = require('../lib/subscriptions');
+  const expiresAt = await getNextTermStart(req.db, school_id);
+  const currentTerm = getCurrentTermLabel();
+  const currentYear = new Date().getFullYear();
 
   const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
   if (existing.length > 0) {
@@ -711,7 +710,20 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
     );
   }
 
-  console.log(`[PREMIUM] ${phone} upgraded (simulated) — expires ${expiresAt.toISOString()}`);
+  await req.db.execute(
+    `INSERT INTO premium_subscriptions
+     (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
+     VALUES (?, ?, ?, ?, 'parent', 'paid', ?, NOW(), ?)
+     ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(),
+       expires_at = VALUES(expires_at), amount = VALUES(amount)`,
+    [school_id, phone, currentTerm, currentYear, totalDue, expiresAt]
+  );
+  await req.db.execute(
+    "UPDATE payment_ledger SET notes = 'STK_COMPLETED' WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
+    [txnRef]
+  );
+
+  console.log(`[PREMIUM] ${phone} upgraded (simulated) for school ${school_id} — expires ${expiresAt.toISOString()}`);
   res.json({
     transaction_ref: txnRef,
     status: 'confirmed',
