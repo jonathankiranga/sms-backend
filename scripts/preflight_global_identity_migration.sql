@@ -80,3 +80,23 @@ FROM student_parent_map m
 JOIN students s ON s.student_id = m.student_id
 LEFT JOIN schools sc ON sc.school_id = s.school_id
 WHERE sc.school_id IS NULL;
+
+-- 8. Shared teacher phone numbers associated with multiple email addresses.
+--    These may be one teacher with changing work email, or a shared household
+--    number. Review before relying on phone as a global identity key.
+SELECT
+  CASE
+    WHEN REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '') REGEXP '^0[17][0-9]{8}$'
+      THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''), 2))
+    WHEN REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}$'
+      THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', ''))
+    ELSE REPLACE(REPLACE(REPLACE(TRIM(phone), ' ', ''), '-', ''), '+', '')
+  END AS normalized_phone,
+  COUNT(DISTINCT teacher_id) AS teacher_count,
+  COUNT(DISTINCT LOWER(TRIM(email))) AS email_count,
+  GROUP_CONCAT(DISTINCT school_id ORDER BY school_id) AS school_ids,
+  GROUP_CONCAT(teacher_id ORDER BY teacher_id) AS teacher_ids
+FROM teachers
+WHERE NULLIF(TRIM(phone), '') IS NOT NULL
+GROUP BY normalized_phone
+HAVING COUNT(DISTINCT LOWER(TRIM(email))) > 1;
