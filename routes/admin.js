@@ -67,7 +67,7 @@ router.get('/auth/google/dev', async (req, res) => {
   // Local development only: issue a short-lived server-side admin session.
   const sessionId = crypto.randomBytes(32).toString('hex');
   await req.db.execute(
-    "INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, '', ?, 'DEV-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)",
+    "INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, '', ?, '0000', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)",
     [sessionId, ADMIN_EMAIL]
   );
   return res.redirect(`/admin?admin_token=${encodeURIComponent(sessionId)}&admin_email=${encodeURIComponent(ADMIN_EMAIL)}&dev=1`);
@@ -97,7 +97,7 @@ router.get('/auth/google/callback', async (req, res) => {
       // Issue an opaque, short-lived server-side session after Google verifies the identity.
       const sessionId = crypto.randomBytes(32).toString('hex');
       await req.db.execute(
-        "INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, '', ?, 'GOOGLE-OAUTH', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)",
+        "INSERT INTO otp_sessions (session_id, phone, email, code, expires_at, verified) VALUES (?, '', ?, '0000', DATE_ADD(NOW(), INTERVAL 4 HOUR), TRUE)",
         [sessionId, email]
       );
       return res.redirect(`/admin?admin_token=${encodeURIComponent(sessionId)}&admin_email=${encodeURIComponent(email)}`);
