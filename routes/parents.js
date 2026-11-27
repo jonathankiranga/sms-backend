@@ -119,10 +119,6 @@ router.post('/verify-otp', wrap(async (req, res) => {
     // can identify the same parent across school registrations.
     const verifiedEmail = rows[0].email ? String(rows[0].email).trim().toLowerCase() : '';
     const verifiedPhone = normalizePhone(rows[0].phone);
-    const verifiedContactType = verifiedEmail ? 'email' : 'phone';
-    const rawPhone = String(rows[0].phone || '').trim();
-    const contactValue1 = verifiedEmail || verifiedPhone;
-    const contactValue2 = verifiedEmail || rawPhone || verifiedPhone;
 
     let matchingAccounts;
     if (verifiedEmail) {
