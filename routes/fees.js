@@ -6,7 +6,7 @@ async function readSession(req) {
   if (!auth.startsWith('Bearer ')) return null;
   const sessionId = auth.slice(7).trim();
   const [rows] = await req.db.execute(
-    'SELECT phone, email, teacher_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+    'SELECT phone, email, teacher_id, parent_account_id, school_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
     [sessionId]
   );
   const session = rows[0];
@@ -102,7 +102,17 @@ async function requireFeeStatementAccess(req, res, next) {
     const student = students[0];
     if (!student) return res.status(404).json({ error: 'Learner not found' });
 
-    if (session.phone) {
+    if (session.parent_account_id) {
+      const [links] = await req.db.execute(
+        "SELECT student_id FROM parent_student_relationships WHERE student_id = ? AND parent_account_id = ? AND school_id = ? AND status = 'active' AND can_view_fees = 1 LIMIT 1",
+        [student.student_id, session.parent_account_id, student.school_id]
+      );
+      if (links.length > 0) {
+        req.feeStudent = student;
+        req.parentAccountId = session.parent_account_id;
+        return next();
+      }
+    } else if (session.phone) {
       const [links] = await req.db.execute(
         'SELECT student_id FROM student_parent_map WHERE student_id = ? AND parent_phone = ? LIMIT 1',
         [student.student_id, session.phone]
