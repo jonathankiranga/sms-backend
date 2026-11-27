@@ -28,8 +28,18 @@ async function findSchoolMembership(db, { schoolId, role, phone, email }) {
      LEFT JOIN teacher_school_memberships m
        ON m.teacher_id = t.teacher_id AND m.school_id = t.school_id
      WHERE t.school_id = ? AND t.role = ?
-       AND ((? <> '' AND (CASE WHEN REPLACE(REPLACE(t.phone, ' ', ''), '-', '') REGEXP '^0[17][0-9]{8}
-         OR (? <> '' AND LOWER(TRIM(t.email)) = ?))
+       AND (
+         (? <> '' AND (
+           CASE
+             WHEN REPLACE(REPLACE(t.phone, ' ', ''), '-', '') REGEXP '^0[17][0-9]{8}$'
+               THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(t.phone, ' ', ''), '-', ''), 2))
+             WHEN REPLACE(REPLACE(t.phone, ' ', ''), '-', '') REGEXP '^[17][0-9]{8}$'
+               THEN CONCAT('254', REPLACE(REPLACE(t.phone, ' ', ''), '-', ''))
+             ELSE REPLACE(REPLACE(REPLACE(t.phone, ' ', ''), '-', ''), '+', '')
+           END
+         ) = ?)
+         OR (? <> '' AND LOWER(TRIM(t.email)) = ?)
+       )
      LIMIT 2`,
     [schoolId, role, normalizedPhone, normalizedPhone, normalizedEmail, normalizedEmail]
   );
