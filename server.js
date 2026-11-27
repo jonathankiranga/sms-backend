@@ -221,7 +221,8 @@ async function runMigrationsIfNeeded() {
     const baseFile = 'tidb_full_schema.sql';
     const basePath = path.join(dir, baseFile);
     const baseSql = await fs.readFile(basePath, 'utf8');
-    const expectedTables = [...baseSql.matchAll(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\x60]?([a-zA-Z0-9_]+)/gi)].map(m => m[1]);
+    const expectedTables = [...baseSql.matchAll(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\x60]?([a-zA-Z0-9_]+)/gi)]
+      .map(m => m[1]).filter(name => name !== 'migrations_history');
     if (!expectedTables.length) throw new Error('No CREATE TABLE definitions found in ' + baseFile);
     const [baseDone] = await conn.query('SELECT name FROM migrations_history WHERE name=?', [baseFile]);
     const [actualRows] = await conn.query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' AND TABLE_NAME<>'migrations_history'");
@@ -244,9 +245,16 @@ async function runMigrationsIfNeeded() {
       if (missing.length) throw new Error('Base schema history exists but tables are missing: ' + missing.join(', '));
     }
 
+    // The full schema intentionally excludes the optional sales-representative
+    // commission subsystem. Provision its parent table and columns safely here,
+    // then apply the two CREATE TABLE IF NOT EXISTS commission migrations below.
+    await conn.query("CREATE TABLE IF NOT EXISTS sales_reps (rep_id VARCHAR(20) PRIMARY KEY, full_name VARCHAR(120) NOT NULL, phone VARCHAR(20) NULL, email VARCHAR(120) NULL, commission_type ENUM('percent','flat') NOT NULL DEFAULT 'percent', commission_value DECIMAL(10,2) NOT NULL DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    const [salesRepColumn] = await conn.query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='schools' AND COLUMN_NAME='sales_rep_id'");
+    if (!salesRepColumn.length) await conn.query('ALTER TABLE schools ADD COLUMN sales_rep_id VARCHAR(20) NULL AFTER region');
+
     // Preserve the existing dated and migration_*.sql upgrade files. On first
-    // adoption, the full schema is the canonical baseline, so historical
-    // incremental scripts are recorded as superseded rather than replayed.
+    // adoption, the full schema is the canonical baseline; optional commission
+    // tables are the exception and are installed explicitly.
     const legacyFiles = (await fs.readdir(dir))
       .filter(name => name.endsWith('.sql') &&
         (/^\\d{4}/.test(name) || /^migration_/i.test(name) || /^zz_\\d{8}_/.test(name)) &&
@@ -256,7 +264,12 @@ async function runMigrationsIfNeeded() {
     for (const file of legacyFiles) {
       const [alreadyApplied] = await conn.query('SELECT name FROM migrations_history WHERE name=?', [file]);
       if (alreadyApplied.length) continue;
-      if (baselineWasEstablishedNow) {
+      if (file === '2026_add_sales_rep.sql' || file === '2026_add_sales_rep_commission.sql') {
+        await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Sales representative schema provisioned by the startup schema bootstrap']);
+        continue;
+      }
+      const commissionMigration = file === '2026_add_commission_payment_system.sql' || file === '2026_add_commission_wallet.sql';
+      if (baselineWasEstablishedNow && !commissionMigration) {
         await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Superseded by the canonical full-schema baseline']);
         console.log('[MIGRATION] Historical migration covered by base schema:', file);
         continue;
