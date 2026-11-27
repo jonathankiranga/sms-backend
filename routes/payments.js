@@ -202,31 +202,41 @@ async function handleStkCallback(req, res, school_id) {
     }
 
     if (pending.length > 0) {
-      // Parent subscription upgrade — matched by transaction ref or checkout ID.
-      // Allocate to the school tagged on the pending ledger row (per-school upgrade),
-      // then the callback route's school, then the parent's first linked student's school.
-      const ledgerSchoolId = pending.length > 0 ? pending[0].ledger_school_id : null;
-      const [link] = await req.db.execute(
-        'SELECT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? ORDER BY s.school_id LIMIT 1',
-        [phone]
-      );
-      const activeSchoolId = ledgerSchoolId || school_id || (link.length > 0 ? link[0].school_id : null);
-
-      // Always mark ledger completed first so payment-status polling unblocks the
-      // parent UI even if subscription activation has a transient error.
-      await req.db.execute(
-        "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
-        [receipt, checkoutId || ref]
-      );
-
+      // Allocate the payment and complete its ledger row in one transaction.
+      // Repeated Safaricom callbacks cannot activate the same subscription twice.
+      const connection = await req.db.getConnection();
       try {
-        const { applyParentPayment } = require('../lib/subscriptions');
-        await applyParentPayment(req.db, phone, amount, activeSchoolId);
+        await connection.beginTransaction();
+        const [lockedPending] = await connection.execute(
+          "SELECT parent_phone, school_id FROM payment_ledger WHERE (transaction_reference = ? OR student_reference = ?) AND notes = 'STK_PENDING' LIMIT 1 FOR UPDATE",
+          [ref, checkoutId]
+        );
+
+        if (lockedPending.length > 0) {
+          const ledgerSchoolId = lockedPending[0].school_id || null;
+          if (ledgerSchoolId && school_id && ledgerSchoolId !== school_id) {
+            throw new Error('M-Pesa callback school does not match the school selected for this subscription');
+          }
+          const activeSchoolId = ledgerSchoolId || school_id || null;
+          const { applyParentPayment } = require('../lib/subscriptions');
+          await applyParentPayment(connection, phone, amount, activeSchoolId);
+          await connection.execute(
+            "UPDATE payment_ledger SET notes = 'STK_COMPLETED', transaction_reference = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
+            [receipt, checkoutId || ref]
+          );
+        }
+        await connection.commit();
       } catch (subErr) {
-        // Subscription activation failed (e.g. missing school terms config) — log and
-        // continue so the callback still returns 200 to Safaricom. The ledger is already
-        // marked STK_COMPLETED so polling unblocks. A retry/admin fix can re-apply.
-        console.error(`[STK][SUBSCRIPTION] applyParentPayment failed for ${phone}:`, subErr.message);
+        await connection.rollback();
+        // Money was received, but the school subscription was not activated.
+        // Keep this distinct from completion so it can be reconciled safely.
+        await req.db.execute(
+          "UPDATE payment_ledger SET notes = 'STK_PAID_UNAPPLIED', transaction_reference = ? WHERE student_reference = ? AND notes = 'STK_PENDING'",
+          [receipt, checkoutId || ref]
+        );
+        console.error(`[STK][SUBSCRIPTION] Payment received but activation failed for ${phone}:`, subErr.message);
+      } finally {
+        connection.release();
       }
     }
 

@@ -938,10 +938,10 @@ router.post('/teachers', async (req, res) => {
     if (!school_id || !full_name || !phone) return res.status(400).json({ error: 'school_id, full_name, phone required' });
     if (role && !['teacher', 'head', 'bursar', 'school_admin'].includes(role)) return res.status(400).json({ error: 'Invalid staff role.' });
     const requestedRole = role || 'teacher';
-    const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ? AND role = ?', [phone, requestedRole]);
+    const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE school_id = ? AND phone = ? AND role = ? LIMIT 1', [school_id, phone, requestedRole]);
     if (existing.length > 0) return res.status(409).json({ error: `Phone ${phone} is already registered as ${requestedRole}` });
     if (email) {
-      const [emailOwner] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ? AND role = ? LIMIT 1', [email, requestedRole]);
+      const [emailOwner] = await req.db.execute('SELECT teacher_id FROM teachers WHERE school_id = ? AND email = ? AND role = ? LIMIT 1', [school_id, email, requestedRole]);
       if (emailOwner.length > 0) return res.status(409).json({ error: `Email ${email} is already registered as ${requestedRole}` });
     }
     // Teacher ID — global TCH + 6-digit sequence (fits CHAR(9))
@@ -955,6 +955,13 @@ router.put('/teachers/:id', async (req, res) => {
   try {
     const { full_name, phone, email, role, active, school_id } = req.body;
     if (role && !['teacher', 'head', 'bursar', 'school_admin'].includes(role)) return res.status(400).json({ error: 'Invalid staff role.' });
+    if (school_id) {
+      const [current] = await req.db.execute('SELECT school_id FROM teachers WHERE teacher_id = ? LIMIT 1', [req.params.id]);
+      if (!current.length) return res.status(404).json({ error: 'Teacher membership not found' });
+      if (current[0].school_id !== school_id) {
+        return res.status(400).json({ error: 'Do not move a teacher between schools. Create a separate membership in the destination school using POST /teachers with the same verified contact details.' });
+      }
+    }
     const fields = [];
     const params = [];
     if (full_name) { fields.push('full_name = ?'); params.push(full_name); }
@@ -962,7 +969,6 @@ router.put('/teachers/:id', async (req, res) => {
     if (email !== undefined) { fields.push('email = ?'); params.push(email); }
     if (role) { fields.push('role = ?'); params.push(role); }
     if (active !== undefined) { fields.push('active = ?'); params.push(active ? 1 : 0); }
-    if (school_id) { fields.push('school_id = ?'); params.push(school_id); }
     if (fields.length === 0) return res.status(400).json({ error: 'No fields to update' });
     params.push(req.params.id);
     await req.db.execute(`UPDATE teachers SET ${fields.join(', ')} WHERE teacher_id = ?`, params);

@@ -1,15 +1,16 @@
 const express = require('express');
 const router = express.Router();
+const { requireStaffSession } = require('../lib/staffAuth');
 
-// POST /api/webpush/subscribe — save push subscription
-router.post('/subscribe', async (req, res) => {
-  const { teacher_id, subscription } = req.body;
-  if (!teacher_id || !subscription) return res.status(400).json({ error: 'teacher_id and subscription required' });
+// Push subscriptions belong to the authenticated school membership, not a
+// caller-supplied teacher_id.
+router.post('/subscribe', requireStaffSession, async (req, res) => {
+  const { subscription } = req.body;
+  if (!subscription) return res.status(400).json({ error: 'subscription required' });
   try {
-    // Store as JSON in a push_subscriptions table or teachers column
-    await req.db.execute(
-      'UPDATE teachers SET push_subscription = ? WHERE teacher_id = ?',
-      [JSON.stringify(subscription), teacher_id]
+    const [result] = await req.db.execute(
+      'UPDATE teachers SET push_subscription = ? WHERE teacher_id = ? AND school_id = ?',
+      [JSON.stringify(subscription), req.staff.teacher_id, req.staff.school_id]
     );
     res.json({ subscribed: true });
   } catch (err) {
@@ -19,11 +20,13 @@ router.post('/subscribe', async (req, res) => {
 });
 
 // POST /api/webpush/unsubscribe
-router.post('/unsubscribe', async (req, res) => {
-  const { teacher_id } = req.body;
-  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+router.post('/unsubscribe', requireStaffSession, async (req, res) => {
   try {
-    await req.db.execute('UPDATE teachers SET push_subscription = NULL WHERE teacher_id = ?', [teacher_id]);
+    const [result] = await req.db.execute(
+      'UPDATE teachers SET push_subscription = NULL WHERE teacher_id = ? AND school_id = ?',
+      [req.staff.teacher_id, req.staff.school_id]
+    );
+    if (!result.affectedRows) return res.status(404).json({ error: 'Staff membership not found' });
     res.json({ unsubscribed: true });
   } catch (err) {
     console.error('[WEBPUSH]', err.message);

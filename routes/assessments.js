@@ -363,45 +363,102 @@ router.get('/report/:student_id/:term', async (req, res) => {
   // base info without a phone, e.g. to render a blank/empty template for new students.
   const auth = (req.headers.authorization || '').trim();
   let isTeacher = false;
+  let parentAccountId = null;
   if (auth && auth.startsWith('Bearer ')) {
     try {
-      const [srows] = await req.db.execute('SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ?', [auth.split(' ')[1]]);
+      const [srows] = await req.db.execute(
+        'SELECT teacher_id, parent_account_id, school_id, login_role, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+        [auth.slice(7).trim()]
+      );
       const sess = srows[0];
       if (sess && sess.verified && sess.expires_at && new Date(sess.expires_at) > new Date()) {
-        let trows;
-        if (sess.phone) [trows] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ?', [sess.phone]);
-        if (!trows || trows.length === 0) {
-          const [sr] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [auth.split(' ')[1]]);
-          if (sr[0] && sr[0].email) [trows] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ?', [sr[0].email]);
+        if (sess.teacher_id) {
+          const [trows] = await req.db.execute(
+            `SELECT t.teacher_id
+             FROM teachers t
+             JOIN teacher_school_memberships m
+               ON m.teacher_id = t.teacher_id
+              AND m.school_id = t.school_id
+              AND m.staff_account_id = t.staff_account_id
+              AND m.role = t.role
+             WHERE t.teacher_id = ?
+               AND t.school_id = ?
+               AND t.role = ?
+               AND t.active = 1
+               AND m.status = 'active'
+             LIMIT 1`,
+            [sess.teacher_id, sess.school_id, sess.login_role]
+          );
+          isTeacher = trows.length > 0;
         }
-        isTeacher = Boolean(trows && trows.length > 0);
+        if (sess.parent_account_id) parentAccountId = sess.parent_account_id;
       }
-    } catch (_) { isTeacher = false; }
+    } catch (_) {
+      isTeacher = false;
+      parentAccountId = null;
+    }
   }
 
-  const normPhone = String(phone || '').replace(/[\s-]/g, '').replace(/^\+/, '').replace(/^0([17]\d{8})$/, '254$1');
-  if (!isTeacher && !normPhone) {
-    return res.status(400).json({ error: 'Parent phone is required to view report cards' });
+  const compactPhone = String(phone || '').trim().replace(/[ -]/g, '');
+  const phoneDigits = compactPhone.startsWith('+') ? compactPhone.slice(1) : compactPhone;
+  const normPhone = phoneDigits.length === 10 && phoneDigits[0] === '0'
+    ? '254' + phoneDigits.slice(1)
+    : phoneDigits.length === 9 && ['1', '7'].includes(phoneDigits[0])
+      ? '254' + phoneDigits
+      : phoneDigits;
+  if (!isTeacher && !parentAccountId && !normPhone) {
+    return res.status(400).json({ error: 'A verified parent session is required to view report cards' });
   }
-  const [link] = await req.db.execute(
-    `SELECT s.school_id,
-            p.is_premium, p.premium_expires_at,
-            sc.premium_payment_model
-     FROM student_parent_map m
-     JOIN students s ON m.student_id = s.student_id
-     JOIN schools sc ON s.school_id = sc.school_id
-     LEFT JOIN parent_profiles p ON p.parent_phone = m.parent_phone
-     WHERE m.student_id = ? AND m.parent_phone = ?
-     LIMIT 1`,
-    [student_id, normPhone]
-  );
+
+  let link;
+  if (parentAccountId) {
+    [link] = await req.db.execute(
+      `SELECT s.school_id, sc.premium_payment_model
+       FROM parent_student_relationships r
+       JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+       JOIN schools sc ON sc.school_id = r.school_id
+       WHERE r.parent_account_id = ? AND r.student_id = ?
+         AND r.status = 'active' AND r.can_view_results = 1
+       LIMIT 1`,
+      [parentAccountId, student_id]
+    );
+  } else {
+    [link] = await req.db.execute(
+      `SELECT s.school_id, p.is_premium, p.premium_expires_at, sc.premium_payment_model
+       FROM student_parent_map m
+       JOIN students s ON m.student_id = s.student_id
+       JOIN schools sc ON s.school_id = sc.school_id
+       LEFT JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+       WHERE m.student_id = ? AND m.parent_phone = ?
+       LIMIT 1`,
+      [student_id, normPhone]
+    );
+  }
   if (!isTeacher && link.length === 0) {
-    return res.status(403).json({ error: 'This student is not linked to your phone. Ask the school to link you as a parent.' });
+    return res.status(403).json({ error: 'This student is not linked to your verified parent account.' });
   }
-  const schoolPays = link.length === 0 ? false : link[0].premium_payment_model === 'school';
-  const subActive = link.length !== 0 && Boolean(link[0].is_premium) && (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+
+  const schoolPays = link.length > 0 && link[0].premium_payment_model === 'school';
+  let subActive = false;
+  if (parentAccountId && link.length > 0) {
+    const [subscriptions] = await req.db.execute(
+      `SELECT ps.subscription_id
+       FROM premium_subscriptions ps
+       JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+       WHERE pp.parent_account_id = ? AND ps.school_id = ?
+         AND ps.payment_status = 'paid'
+         AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+       LIMIT 1`,
+      [parentAccountId, link[0].school_id]
+    );
+    subActive = subscriptions.length > 0;
+  } else if (link.length > 0) {
+    subActive = Boolean(link[0].is_premium) &&
+      (!link[0].premium_expires_at || new Date(link[0].premium_expires_at) > new Date());
+  }
+
   if (!isTeacher && !schoolPays && !subActive) {
-    return res.status(402).json({ error: 'An active subscription is required to download report cards.' });
+    return res.status(402).json({ error: 'An active subscription is required for this school to download report cards.' });
   }
 
   // Extended student profile for KNEC report card

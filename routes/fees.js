@@ -1,41 +1,6 @@
 const express = require('express');
 const router = express.Router();
-
-async function readSession(req) {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth.startsWith('Bearer ')) return null;
-  const sessionId = auth.slice(7).trim();
-  const [rows] = await req.db.execute(
-    'SELECT phone, email, teacher_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
-    [sessionId]
-  );
-  const session = rows[0];
-  if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) return null;
-  return session;
-}
-
-async function resolveStaff(db, session) {
-  let rows = [];
-  if (session.teacher_id) {
-    [rows] = await db.execute(
-      'SELECT teacher_id, school_id, role, active FROM teachers WHERE teacher_id = ? LIMIT 1',
-      [session.teacher_id]
-    );
-  }
-  if (rows.length === 0 && session.phone) {
-    [rows] = await db.execute(
-      'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? LIMIT 1',
-      [session.phone]
-    );
-  }
-  if (rows.length === 0 && session.email) {
-    [rows] = await db.execute(
-      'SELECT teacher_id, school_id, role, active FROM teachers WHERE email = ? LIMIT 1',
-      [session.email]
-    );
-  }
-  return rows[0] || null;
-}
+const { readSession, resolveStaff } = require('../lib/staffAuth');
 
 async function requireFeeStaff(req, res, next) {
   try {
@@ -102,13 +67,14 @@ async function requireFeeStatementAccess(req, res, next) {
     const student = students[0];
     if (!student) return res.status(404).json({ error: 'Learner not found' });
 
-    if (session.phone) {
+    if (session.parent_account_id) {
       const [links] = await req.db.execute(
-        'SELECT student_id FROM student_parent_map WHERE student_id = ? AND parent_phone = ? LIMIT 1',
-        [student.student_id, session.phone]
+        "SELECT student_id FROM parent_student_relationships WHERE student_id = ? AND parent_account_id = ? AND school_id = ? AND status = 'active' AND can_view_fees = 1 LIMIT 1",
+        [student.student_id, session.parent_account_id, student.school_id]
       );
       if (links.length > 0) {
         req.feeStudent = student;
+        req.parentAccountId = session.parent_account_id;
         return next();
       }
     }

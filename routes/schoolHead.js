@@ -2,86 +2,32 @@ const express = require('express');
 const router = express.Router();
 const { verifyToken } = require('../lib/auth');
 const { genId, nextTeacherId } = require('../lib/ids');
+const { readSession, resolveStaff } = require('../lib/staffAuth');
 
 async function requireHead(req, res) {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth || !auth.startsWith('Bearer ')) { res.status(401).json({ error: 'Missing or invalid Authorization header' }); return null; }
-  const sessionId = auth.split(' ')[1];
-  // Look up otp_sessions to validate the session token
-  const [srows] = await req.db.execute('SELECT phone, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ?', [sessionId]);
-  if (srows.length === 0) { res.status(401).json({ error: 'Invalid session' }); return null; }
-  const sess = srows[0];
-  if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) { res.status(401).json({ error: 'Session not verified or expired' }); return null; }
-  // Resolve teacher: prefer the teacher stamped at login; fall back to the
-  // head row for this contact (older sessions predate the stamp)
-  let trows;
-  if (sess.teacher_id) {
-    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
+  const session = await readSession(req);
+  if (!session) {
+    res.status(401).json({ error: 'Session not verified or expired' });
+    return null;
   }
-  if ((!trows || trows.length === 0) && sess.phone) {
-    [trows] = await req.db.execute("SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? AND role = 'head' LIMIT 1", [sess.phone]);
+  const staff = await resolveStaff(req.db, session);
+  if (!staff || staff.role !== 'head' || staff.school_id !== req.params.schoolId) {
+    res.status(403).json({ error: 'An active headteacher membership in this school is required' });
+    return null;
   }
-  if (!trows || trows.length === 0) {
-    const [sessRows] = await req.db.execute('SELECT email FROM otp_sessions WHERE session_id = ?', [sessionId]);
-    const email = (sessRows[0] && sessRows[0].email) || null;
-    if (email) {
-      [trows] = await req.db.execute("SELECT teacher_id, role, school_id FROM teachers WHERE email = ? AND role = 'head' LIMIT 1", [email]);
-    }
-  }
-  if (!trows || trows.length === 0) { res.status(404).json({ error: 'Teacher not found' }); return null; }
-  const teacher = trows[0];
-  if (teacher.role !== 'head' || teacher.school_id !== req.params.schoolId) { res.status(403).json({ error: 'Only the school head may perform this action' }); return null; }
-  return { teacher_id: teacher.teacher_id, role: teacher.role, school_id: teacher.school_id };
+  return { teacher_id: staff.teacher_id, role: staff.role, school_id: staff.school_id };
 }
 
 // School administrator and headteacher access for school operations.
 async function requireSchoolManager(req, res) {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Missing or invalid Authorization header' });
-    return null;
-  }
-  const sessionId = auth.slice(7).trim();
-  const [sessions] = await req.db.execute(
-    'SELECT phone, email, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ? LIMIT 1',
-    [sessionId]
-  );
-  const session = sessions[0];
-  if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
+  const session = await readSession(req);
+  if (!session) {
     res.status(401).json({ error: 'Session not verified or expired' });
     return null;
   }
-
-  let teachers = [];
-  if (session.teacher_id) {
-    const [rows] = await req.db.execute(
-      'SELECT teacher_id, role, school_id, active FROM teachers WHERE teacher_id = ? LIMIT 1',
-      [session.teacher_id]
-    );
-    teachers = rows;
-  }
-  if (teachers.length === 0 && session.phone) {
-    const [rows] = await req.db.execute(
-      "SELECT teacher_id, role, school_id, active FROM teachers WHERE phone = ? AND role IN ('head','school_admin') LIMIT 1",
-      [session.phone]
-    );
-    teachers = rows;
-  }
-  if (teachers.length === 0 && session.email) {
-    const [rows] = await req.db.execute(
-      "SELECT teacher_id, role, school_id, active FROM teachers WHERE email = ? AND role IN ('head','school_admin') LIMIT 1",
-      [session.email]
-    );
-    teachers = rows;
-  }
-
-  const staff = teachers[0];
-  if (!staff || !['head', 'school_admin'].includes(staff.role) || staff.active === 0) {
-    res.status(403).json({ error: 'Headteacher or school administrator access is required' });
-    return null;
-  }
-  if (staff.school_id !== req.params.schoolId) {
-    res.status(403).json({ error: 'This account cannot manage another school' });
+  const staff = await resolveStaff(req.db, session);
+  if (!staff || !['head', 'school_admin'].includes(staff.role) || staff.school_id !== req.params.schoolId) {
+    res.status(403).json({ error: 'An active school manager membership in this school is required' });
     return null;
   }
   return { teacher_id: staff.teacher_id, role: staff.role, school_id: staff.school_id };
@@ -149,10 +95,10 @@ router.post('/:schoolId/teachers', async (req, res) => {
   if (!full_name || !phone) return res.status(400).json({ error: 'Name and phone required' });
 
   const teacherId = await nextTeacherId(req.db);
-  const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE phone = ? AND role = ?', [phone, cleanRole]);
+  const [existing] = await req.db.execute('SELECT teacher_id FROM teachers WHERE school_id = ? AND phone = ? AND role = ? LIMIT 1', [req.params.schoolId, phone, cleanRole]);
   if (existing.length > 0) return res.status(409).json({ error: 'Phone already registered for this role' });
   if (email) {
-    const [emailExisting] = await req.db.execute('SELECT teacher_id FROM teachers WHERE email = ? AND role = ?', [email, cleanRole]);
+    const [emailExisting] = await req.db.execute('SELECT teacher_id FROM teachers WHERE school_id = ? AND email = ? AND role = ? LIMIT 1', [req.params.schoolId, email, cleanRole]);
     if (emailExisting.length > 0) return res.status(409).json({ error: 'Email already registered for this role' });
   }
 
@@ -173,8 +119,13 @@ router.delete('/:schoolId/teachers/:teacherId', async (req, res) => {
   if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
   if (t[0].role === 'head') return res.status(403).json({ error: 'Cannot remove school head' });
 
-  await req.db.execute('DELETE FROM teachers WHERE teacher_id = ?', [req.params.teacherId]);
-  res.json({ deleted: true });
+  // Preserve the global staff identity and historical records. Removing a
+  // school membership deactivates it rather than deleting the identity row.
+  await req.db.execute(
+    "UPDATE teachers SET active = 0 WHERE teacher_id = ? AND school_id = ?",
+    [req.params.teacherId, req.params.schoolId]
+  );
+  res.json({ deleted: true, archived: true, membership_status: 'inactive' });
 });
 
 // Update a teacher (only headteacher of that school). Headteachers may toggle
@@ -528,14 +479,15 @@ router.post('/:schoolId/students/import', async (req, res) => {
   if (classRows.length === 0) return res.status(400).json({ error: 'Class not found for this school' });
 
   const normalizeParentPhone = value => {
-    const phone = String(value || '').replace(/[\\s-]/g, '').replace(/^\\+/, '');
-    if (/^0[17]\\d{8}$/.test(phone)) return '254' + phone.slice(1);
-    if (/^[17]\\d{8}$/.test(phone)) return '254' + phone;
-    if (/^254[17]\\d{8}$/.test(phone)) return phone;
+    const entered = String(value || '').trim().replace(/[ -]/g, '');
+    const phone = entered.startsWith('+') ? entered.slice(1) : entered;
+    if (phone.length === 10 && phone[0] === '0' && ['1', '7'].includes(phone[1])) return '254' + phone.slice(1);
+    if (phone.length === 9 && ['1', '7'].includes(phone[0])) return '254' + phone;
+    if (phone.length === 12 && phone.startsWith('254') && ['1', '7'].includes(phone[3])) return phone;
     return '';
   };
 
-  const lines = csv.trim().split(/\\r?\\n/);
+  const lines = csv.trim().split(String.fromCharCode(10)).map(line => line.endsWith(String.fromCharCode(13)) ? line.slice(0, -1) : line);
   let imported = 0, errors = 0, parentsLinked = 0;
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
     const line = lines[lineIndex];
@@ -729,47 +681,38 @@ router.put('/:schoolId/assignments/:teacherId', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// The signed-in staff member's own assigned classes (teacher or head)
+// The signed-in staff member's own assigned classes (teacher or head).
+// Resolve the session through its explicit school membership; never fall back
+// to an unscoped phone/email match.
 router.get('/:schoolId/my-classes', async (req, res) => {
-  const auth = (req.headers.authorization || '').trim();
-  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Missing or invalid Authorization header' });
-  const sessionId = auth.split(' ')[1];
-  const [srows] = await req.db.execute('SELECT phone, email, verified, expires_at, teacher_id FROM otp_sessions WHERE session_id = ?', [sessionId]);
-  if (srows.length === 0) return res.status(401).json({ error: 'Invalid session' });
-  const sess = srows[0];
-  if (!sess.verified || !sess.expires_at || new Date(sess.expires_at) <= new Date()) return res.status(401).json({ error: 'Session not verified or expired' });
-  let trows;
-  if (sess.teacher_id) {
-    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE teacher_id = ?', [sess.teacher_id]);
-  }
-  if ((!trows || trows.length === 0) && sess.phone) {
-    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE phone = ? LIMIT 1', [sess.phone]);
-  }
-  if ((!trows || trows.length === 0) && sess.email) {
-    [trows] = await req.db.execute('SELECT teacher_id, role, school_id FROM teachers WHERE email = ? LIMIT 1', [sess.email]);
-  }
-  if (!trows || trows.length === 0) return res.status(404).json({ error: 'Teacher not found' });
-  const me = trows[0];
-  if (me.school_id !== req.params.schoolId) return res.status(403).json({ error: 'Wrong school for this session' });
-
   try {
+    const session = await readSession(req);
+    if (!session) return res.status(401).json({ error: 'Session not verified or expired' });
+    const me = await resolveStaff(req.db, session);
+    if (!me || me.school_id !== req.params.schoolId) {
+      return res.status(403).json({ error: 'An active membership in this school is required' });
+    }
+
     await ensureAssignmentsTable(req.db);
     let rows;
-    if (me.role === 'head') {
+    if (me.role === 'head' || me.role === 'school_admin') {
       [rows] = await req.db.execute(
         'SELECT class_id, class_name, stream, level_name, academic_year, class_rank FROM classes WHERE school_id = ? ORDER BY class_rank, class_name',
         [req.params.schoolId]
       );
-      return res.json({ role: 'head', classes: rows });
+      return res.json({ role: me.role, classes: rows });
     }
     [rows] = await req.db.execute(
       `SELECT c.class_id, c.class_name, c.stream, c.level_name, c.academic_year, c.class_rank
-       FROM teacher_class_assignments a JOIN classes c ON a.class_id = c.class_id
+       FROM teacher_class_assignments a
+       JOIN classes c ON c.class_id = a.class_id AND c.school_id = ?
        WHERE a.teacher_id = ? ORDER BY c.class_rank, c.class_name`,
-      [me.teacher_id]
+      [req.params.schoolId, me.teacher_id]
     );
     res.json({ role: me.role, classes: rows });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

@@ -14,28 +14,61 @@ router.get('/search', async (req, res) => {
 
 // POST /api/schools/:id/contact
 // Allows only the headteacher of the school to set contact details.
-router.post('/:id/contact', async (req, res) => {
-  const schoolId = req.params.id;
-  const { teacher_id, contact_name, contact_phone, contact_email, contact_address, contact_website } = req.body;
-  if (!teacher_id) return res.status(400).json({ error: 'teacher_id required' });
+router.post('/:id/contact', async (req, res, next) => {
+  try {
+    const schoolId = req.params.id;
+    const auth = (req.headers.authorization || '').trim();
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+    const sessionId = auth.slice(7).trim();
+    const [sessions] = await req.db.execute(
+      'SELECT teacher_id, school_id, login_role, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+      [sessionId]
+    );
+    const session = sessions[0];
+    if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
+      return res.status(401).json({ error: 'Session expired or not verified' });
+    }
+    if (!session.teacher_id || session.school_id !== schoolId) {
+      return res.status(403).json({ error: 'This session cannot manage another school' });
+    }
 
-  // Verify teacher exists, is head, and belongs to this school
-  const [t] = await req.db.execute('SELECT teacher_id, full_name, role, school_id FROM teachers WHERE teacher_id = ?', [teacher_id]);
-  if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
-  const teacher = t[0];
-  if (teacher.role !== 'head') return res.status(403).json({ error: 'Only headteacher can set contact details' });
-  if (teacher.school_id !== schoolId) return res.status(403).json({ error: 'Teacher does not belong to this school' });
+    const [teachers] = await req.db.execute(
+      `SELECT t.teacher_id, t.role, t.school_id, t.active
+       FROM teachers t
+       JOIN teacher_school_memberships m
+         ON m.teacher_id = t.teacher_id
+        AND m.school_id = t.school_id
+        AND m.staff_account_id = t.staff_account_id
+        AND m.role = t.role
+       WHERE t.teacher_id = ?
+         AND t.school_id = ?
+         AND t.role = ?
+         AND m.status = 'active'
+       LIMIT 1`,
+      [session.teacher_id, schoolId, session.login_role]
+    );
+    const teacher = teachers[0];
+    if (!teacher || teacher.active === 0) return res.status(403).json({ error: 'Active school staff membership required' });
+    if (!['head', 'school_admin'].includes(teacher.role)) {
+      return res.status(403).json({ error: 'Only the headteacher or school administrator can set school contact details' });
+    }
 
-  if (!contact_name && !contact_phone && !contact_email && !contact_address && !contact_website) {
-    return res.status(400).json({ error: 'At least one contact field required' });
+    const { contact_name, contact_phone, contact_email, contact_address, contact_website } = req.body;
+    if (!contact_name && !contact_phone && !contact_email && !contact_address && !contact_website) {
+      return res.status(400).json({ error: 'At least one contact field required' });
+    }
+
+    await req.db.execute(
+      `UPDATE schools
+       SET contact_name = ?, contact_phone = ?, contact_email = ?, contact_address = ?, contact_website = ?
+       WHERE school_id = ?`,
+      [contact_name || null, contact_phone || null, contact_email || null, contact_address || null, contact_website || null, schoolId]
+    );
+
+    res.json({ saved: true, school_id: schoolId });
+  } catch (err) {
+    next(err);
   }
-
-  await req.db.execute(
-    `UPDATE schools SET contact_name = ?, contact_phone = ?, contact_email = ?, contact_address = ?, contact_website = ? WHERE school_id = ?`,
-    [contact_name || null, contact_phone || null, contact_email || null, contact_address || null, contact_website || null, schoolId]
-  );
-
-  res.json({ saved: true, school_id: schoolId });
 });
 
 module.exports = router;

@@ -45,6 +45,21 @@ router.post('/run', async (req, res) => {
   const results = [];
 
   for (const file of files) {
+    // These scripts are diagnostics or contain MySQL triggers with DELIMITER
+    // directives. The endpoint's semicolon splitter cannot execute them safely.
+    if ([
+      '20261127_global_identity_memberships.sql',
+      'preflight_global_identity_migration.sql',
+      'validate_global_identity_migration.sql'
+    ].includes(file)) {
+      results.push({
+        file,
+        skipped: true,
+        reason: 'Run this script manually through a MySQL client that supports DELIMITER.'
+      });
+      continue;
+    }
+
     const sqlPath = path.join(scriptsDir, file);
     const sql = fs.readFileSync(sqlPath, 'utf8');
     const clean = sql.replace(/^--.*$/gm, '').trim();

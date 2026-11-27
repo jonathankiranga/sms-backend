@@ -15,39 +15,71 @@ function normalizePhone(raw) {
 }
 
 router.post('/request-otp', wrap(async (req, res) => {
-  const { phone, email } = req.body;
-  if (!phone && !email) return res.status(400).json({ error: 'Phone number or email required' });
-  const normPhone = phone ? normalizePhone(phone) : null;
+  const normPhone = req.body.phone ? normalizePhone(req.body.phone) : '';
+  const email = req.body.email ? String(req.body.email).trim().toLowerCase() : '';
+  if (!normPhone && !email) return res.status(400).json({ error: 'Phone number or email required' });
 
-  // Email login: resolve to the registered parent profile's phone up-front,
-  // so every downstream phone-keyed flow keeps working after verification.
-  let resolvedPhone = '';
-  if (!normPhone && email) {
-    const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
-    resolvedPhone = pp[0]?.parent_phone || '';
+  // Resolve both identifiers to one global parent account. Never silently
+  // combine two accounts when the supplied phone and email disagree.
+  const conditions = [];
+  const params = [];
+  if (normPhone) { conditions.push("(contact_type = 'phone' AND contact_value = ?)"); params.push(normPhone); }
+  if (email) { conditions.push("(contact_type = 'email' AND contact_value = ?)"); params.push(email); }
+  const [matches] = await req.db.execute(
+    `SELECT DISTINCT a.parent_account_id, a.canonical_parent_phone
+     FROM parent_account_contacts c
+     JOIN parent_accounts a ON a.parent_account_id = c.parent_account_id
+     WHERE ${conditions.join(' OR ')}
+     UNION
+     SELECT DISTINCT a.parent_account_id, a.canonical_parent_phone
+     FROM parent_profiles p
+     JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+     WHERE ? <> '' AND
+       CASE
+         WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 10
+              AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 9
+              AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) IN ('7', '1')
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END = ?`,
+    [...params, normPhone, normPhone]
+  );
+
+  if (!matches.length) {
+    return res.status(404).json({ error: 'This contact is not registered with a parent account. Ask the school to register or link your contact details.' });
+  }
+  if (matches.length > 1 && normPhone && email) {
+    return res.status(409).json({ error: 'Your email and telephone number are associated with different parent accounts. Sign in using the email alone to verify and consolidate the matching parent records.' });
   }
 
-  const code = Math.floor(1000 + Math.random() * 9000).toString();
+  // Email-only sign-in may match legacy parent profiles from several schools.
+  // Select a stable account for the OTP session; the verified-email step below
+  // consolidates the matching accounts after proof of email ownership.
+  matches.sort((a, b) => Number(a.parent_account_id) - Number(b.parent_account_id));
+  const account = matches[0];
+  const code = crypto.randomInt(1000, 10000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');
-
   await req.db.execute(
-    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))',
-    [sessionId, normPhone || resolvedPhone || '', email || null, code]
+    `INSERT INTO otp_sessions
+      (session_id, phone, email, code, expires_at, verified, parent_account_id)
+     VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE, ?)`,
+    [sessionId, account.canonical_parent_phone, email || null, code, account.parent_account_id]
   );
 
   try {
-    if (email && !normPhone) {
-      const messaging = require('../services/messaging');
-      if (messaging.sendEmailOtp) await messaging.sendEmailOtp(email, code);
-      else console.log('=== Email OTP for', email, ':', code, '===');
+    const messaging = require('../services/messaging');
+    if (email) {
+      if (!messaging.sendEmailOtp) throw new Error('Email OTP delivery is not configured');
+      await messaging.sendEmailOtp(email, code);
     } else {
-      const { sendOtp } = require('../services/messaging');
-      await sendOtp(normPhone, code);
+      await messaging.sendOtp(normPhone, code);
     }
-  } catch (e) {
-    console.error('OTP send failed (non-blocking):', e.message);
-    if (email && !normPhone) console.log('=== Email OTP for', email, ':', code, '===');
-    else if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', normPhone, ':', code, '===');
+  } catch (err) {
+    console.error('[PARENT OTP] Delivery failed:', err.message);
+    await req.db.execute('DELETE FROM otp_sessions WHERE session_id = ?', [sessionId]);
+    return res.status(503).json({ error: 'Unable to send the verification code. Please try again.' });
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
@@ -58,59 +90,211 @@ router.post('/verify-otp', wrap(async (req, res) => {
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
 
   const [rows] = await req.db.execute(
-    'SELECT phone, email FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
+    `SELECT phone, email, parent_account_id
+     FROM otp_sessions
+     WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE
+     LIMIT 1`,
     [session_id, code]
   );
-
-  if (rows.length === 0) {
-    const [expiredRows] = await req.db.execute(
-      'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE',
+  if (!rows.length) {
+    const [expired] = await req.db.execute(
+      'SELECT session_id FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE LIMIT 1',
       [session_id, code]
     );
-    if (expiredRows.length > 0) {
-      return res.status(410).json({ error: 'Code expired - tap Resend to get a new one' });
+    return res.status(expired.length ? 410 : 401).json({
+      error: expired.length ? 'Code expired - tap Resend to get a new one' : 'Invalid or expired code'
+    });
+  }
+
+  let accountId = rows[0].parent_account_id;
+  if (!accountId) return res.status(403).json({ error: 'This OTP session is not linked to a parent account. Request a new code.' });
+
+  const connection = await req.db.getConnection();
+  let account;
+  try {
+    await connection.beginTransaction();
+
+    // Consolidate legacy accounts only after the parent proves control of
+    // the contact used for this OTP. Both verified email and verified phone
+    // can identify the same parent across school registrations.
+    const verifiedEmail = rows[0].email ? String(rows[0].email).trim().toLowerCase() : '';
+    const verifiedPhone = normalizePhone(rows[0].phone);
+
+    let matchingAccounts;
+    if (verifiedEmail) {
+      [matchingAccounts] = await connection.execute(
+        `SELECT parent_account_id
+         FROM parent_account_contacts
+         WHERE contact_type = 'email' AND contact_value = ?
+         ORDER BY parent_account_id
+         FOR UPDATE`,
+        [verifiedEmail]
+      );
+    } else {
+      [matchingAccounts] = await connection.execute(
+        `SELECT DISTINCT a.parent_account_id
+         FROM parent_profiles p
+         JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+         WHERE
+           CASE
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 10
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+               THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 9
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) IN ('7', '1')
+               THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+             ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+           END = ?
+         ORDER BY a.parent_account_id
+         FOR UPDATE`,
+        [verifiedPhone]
+      );
     }
-    return res.status(401).json({ error: 'Invalid or expired code' });
-  }
+    const accountIds = [...new Set(matchingAccounts.map(row => Number(row.parent_account_id)))];
+    if (accountIds.length) {
+      accountId = Math.min(...accountIds);
+      for (const duplicateId of accountIds.filter(id => id !== accountId)) {
+        await connection.execute(
+          `UPDATE parent_accounts target
+           JOIN parent_accounts source ON source.parent_account_id = ?
+           SET target.full_name = COALESCE(NULLIF(target.full_name, ''), source.full_name)
+           WHERE target.parent_account_id = ?`,
+          [duplicateId, accountId]
+        );
+        await connection.execute(
+          `INSERT INTO parent_student_relationships
+             (parent_account_id, student_id, school_id, relationship_type, is_primary,
+              can_view_results, can_view_fees, status)
+           SELECT ?, student_id, school_id, relationship_type, is_primary,
+                  can_view_results, can_view_fees, status
+           FROM parent_student_relationships
+           WHERE parent_account_id = ?
+           ON DUPLICATE KEY UPDATE
+             relationship_type = COALESCE(parent_student_relationships.relationship_type, VALUES(relationship_type)),
+             is_primary = GREATEST(parent_student_relationships.is_primary, VALUES(is_primary)),
+             can_view_results = LEAST(parent_student_relationships.can_view_results, VALUES(can_view_results)),
+             can_view_fees = LEAST(parent_student_relationships.can_view_fees, VALUES(can_view_fees)),
+             status = IF(parent_student_relationships.status = 'active' OR VALUES(status) = 'active', 'active', 'inactive')`,
+          [accountId, duplicateId]
+        );
+        await connection.execute(
+          `INSERT INTO parent_account_contacts
+             (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+           SELECT ?, contact_type, contact_value, is_primary, verified_at
+           FROM parent_account_contacts
+           WHERE parent_account_id = ?
+           ON DUPLICATE KEY UPDATE
+             is_primary = GREATEST(parent_account_contacts.is_primary, VALUES(is_primary)),
+             verified_at = COALESCE(parent_account_contacts.verified_at, VALUES(verified_at))`,
+          [accountId, duplicateId]
+        );
+        // Keep the global prepaid wallet usable through the account's canonical phone.
+        const [duplicateProfiles] = await connection.execute(
+          'SELECT parent_phone, prepaid_balance FROM parent_profiles WHERE parent_account_id = ? FOR UPDATE',
+          [duplicateId]
+        );
+        const transferredBalance = duplicateProfiles.reduce(
+          (total, profile) => total + Number(profile.prepaid_balance || 0), 0
+        );
+        if (transferredBalance > 0) {
+          const [walletUpdate] = await connection.execute(
+            `UPDATE parent_profiles
+             SET prepaid_balance = prepaid_balance + ?
+             WHERE parent_phone = (
+               SELECT canonical_parent_phone FROM parent_accounts WHERE parent_account_id = ?
+             )`,
+            [transferredBalance, accountId]
+          );
+          if (!walletUpdate.affectedRows) {
+            throw new Error('Unable to transfer prepaid balance to the canonical parent profile');
+          }
+          await connection.execute(
+            'UPDATE parent_profiles SET prepaid_balance = 0 WHERE parent_account_id = ?',
+            [duplicateId]
+          );
+        }
+        await connection.execute(
+          'UPDATE parent_profiles SET parent_account_id = ? WHERE parent_account_id = ?',
+          [accountId, duplicateId]
+        );
+        await connection.execute(
+          'UPDATE otp_sessions SET parent_account_id = ? WHERE parent_account_id = ?',
+          [accountId, duplicateId]
+        );
+        await connection.execute('DELETE FROM parent_student_relationships WHERE parent_account_id = ?', [duplicateId]);
+        await connection.execute('DELETE FROM parent_account_contacts WHERE parent_account_id = ?', [duplicateId]);
+        await connection.execute('DELETE FROM parent_accounts WHERE parent_account_id = ?', [duplicateId]);
+      }
+    }
 
-  await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
+    if (verifiedEmail) {
+      await connection.execute(
+        `UPDATE parent_account_contacts
+         SET verified_at = COALESCE(verified_at, NOW())
+         WHERE parent_account_id = ? AND contact_type = 'email' AND contact_value = ?`,
+        [accountId, verifiedEmail]
+      );
+    } else {
+      await connection.execute(
+        `UPDATE parent_account_contacts c
+         JOIN parent_profiles p
+           ON p.parent_account_id = c.parent_account_id
+          AND p.parent_phone = c.contact_value
+         SET c.verified_at = COALESCE(c.verified_at, NOW())
+         WHERE c.parent_account_id = ?
+           AND c.contact_type = 'phone'
+           AND CASE
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 10
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) = '0'
+               THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+             WHEN CHAR_LENGTH(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')) = 9
+                  AND LEFT(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 1) IN ('7', '1')
+               THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+             ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+           END = ?`,
+        [accountId, verifiedPhone]
+      );
+    }
 
-  const phone = rows[0].phone || '';
-  const email = rows[0].email || null;
-
-  // Resolve the canonical parent phone (email-only sessions map through parent_profiles.email)
-  let effectivePhone = phone;
-  if (!effectivePhone && email) {
-    const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
-    effectivePhone = pp[0]?.parent_phone || '';
-  }
-
-  // Bind email-based OTP sessions to the canonical registered parent phone.
-  if (effectivePhone) {
-    await req.db.execute('UPDATE otp_sessions SET phone = ? WHERE session_id = ?', [effectivePhone, session_id]);
-  }
-
-  // Compare against registered parent profiles (by phone or email) so the client can inform the user
-  let registered = false;
-  if (effectivePhone || email) {
-    const [parentRows] = await req.db.execute(
-      'SELECT parent_phone FROM parent_profiles WHERE parent_phone = ? OR (email IS NOT NULL AND email = ?)',
-      [effectivePhone || '__none__', email || '__none__']
+    const [accounts] = await connection.execute(
+      `SELECT a.parent_account_id, a.canonical_parent_phone,
+            COALESCE(NULLIF(a.full_name, ''), (SELECT MAX(p.full_name) FROM parent_profiles p WHERE p.parent_account_id = a.parent_account_id)) AS full_name
+     FROM parent_accounts a WHERE a.parent_account_id = ? LIMIT 1`,
+      [accountId]
     );
-    registered = parentRows.length > 0;
-  }
+    if (!accounts.length) throw new Error('Parent account not found');
+    account = accounts[0];
 
-  // Report how many active children are linked to this parent's phone
-  let linkedChildren = 0;
-  if (effectivePhone) {
-    const [childrenCountRows] = await req.db.execute(
-      'SELECT COUNT(*) AS cnt FROM student_parent_map m JOIN students s ON m.student_id = s.student_id WHERE m.parent_phone = ? AND s.enrollment_status = ?',
-      [effectivePhone, 'Active']
+    await connection.execute(
+      'UPDATE otp_sessions SET parent_account_id = ?, verified = TRUE, phone = ?, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?',
+      [accountId, account.canonical_parent_phone, session_id]
     );
-    linkedChildren = childrenCountRows[0]?.cnt || 0;
+
+    await connection.commit();
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
   }
 
-  res.json({ session_id, phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
+  const [countRows] = await req.db.execute(
+    `SELECT COUNT(DISTINCT r.student_id) AS cnt
+     FROM parent_student_relationships r
+     JOIN students s ON s.student_id = r.student_id
+     WHERE r.parent_account_id = ? AND r.status = 'active' AND s.enrollment_status = 'Active'`,
+    [accountId]
+  );
+
+  res.json({
+    session_id,
+    parent_account_id: accountId,
+    phone: account.canonical_parent_phone,
+    parent_name: account.full_name,
+    verified: true,
+    registered: true,
+    linked_children: Number(countRows[0]?.cnt || 0)
+  });
 }));
 
 // Protect parent records with the verified OTP session, not a caller-supplied phone.
@@ -122,7 +306,7 @@ async function requireParentSession(req, res, next) {
     if (!sessionId) return res.status(401).json({ error: 'Invalid session' });
 
     const [sessions] = await req.db.execute(
-      'SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+      'SELECT phone, parent_account_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
       [sessionId]
     );
     const session = sessions[0];
@@ -131,19 +315,136 @@ async function requireParentSession(req, res, next) {
     }
 
     const sessionPhone = normalizePhone(session.phone);
-    if (!sessionPhone) return res.status(403).json({ error: 'Verified parent phone is not linked to this session' });
+    const accountId = session.parent_account_id || null;
+    if (!accountId) {
+      return res.status(403).json({ error: 'Global parent account migration is required. Please request a new verification code.' });
+    }
 
     const suppliedPhone = req.params.phone || (req.body && req.body.phone) || req.query.phone;
-    if (suppliedPhone && normalizePhone(suppliedPhone) !== sessionPhone) {
-      return res.status(403).json({ error: 'This session cannot access another parent account' });
+    if (suppliedPhone) {
+      const supplied = normalizePhone(suppliedPhone);
+      if (accountId) {
+        const [contact] = await req.db.execute(
+          "SELECT contact_id FROM parent_account_contacts WHERE parent_account_id = ? AND contact_type = 'phone' AND contact_value = ? LIMIT 1",
+          [accountId, supplied]
+        );
+        if (!contact.length && supplied !== sessionPhone) {
+          return res.status(403).json({ error: 'This session cannot access another parent account' });
+        }
+      }
     }
 
     req.parentPhone = sessionPhone;
+    req.parentAccountId = accountId;
     next();
   } catch (err) {
     next(err);
   }
 }
+
+// GET /api/parents/account-dashboard
+// Consolidated family view: all active children linked to this global parent
+// account, regardless of which school or legacy parent phone they were registered under.
+router.get('/account-dashboard', requireParentSession, wrap(async (req, res) => {
+  if (!req.parentAccountId) return res.status(403).json({ error: 'Global parent account migration is required' });
+
+  const [children] = await req.db.execute(
+    `SELECT s.student_id, s.full_name, c.class_name, s.school_id, sc.school_name,
+       r.relationship_type, r.can_view_results, r.can_view_fees,
+       (SELECT al.status FROM attendance_logs al WHERE al.student_id = s.student_id ORDER BY al.attendance_date DESC LIMIT 1) AS last_attendance,
+       (SELECT al.attendance_date FROM attendance_logs al WHERE al.student_id = s.student_id ORDER BY al.attendance_date DESC LIMIT 1) AS last_date,
+       (SELECT al.marked_at FROM attendance_logs al WHERE al.student_id = s.student_id ORDER BY al.attendance_date DESC LIMIT 1) AS arrival_time,
+       (SELECT pl.amount FROM payment_ledger pl WHERE pl.student_reference = s.student_id AND pl.reversed_at IS NULL ORDER BY pl.logged_at DESC LIMIT 1) AS last_payment_amount,
+       (SELECT pl.logged_at FROM payment_ledger pl WHERE pl.student_reference = s.student_id AND pl.reversed_at IS NULL ORDER BY pl.logged_at DESC LIMIT 1) AS last_payment_date
+     FROM parent_student_relationships r
+     JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+     JOIN classes c ON c.class_id = s.class_id
+     JOIN schools sc ON sc.school_id = r.school_id
+     WHERE r.parent_account_id = ? AND r.status = 'active' AND s.enrollment_status = 'Active'
+     ORDER BY sc.school_name, s.full_name`,
+    [req.parentAccountId]
+  );
+
+  const [accountRows] = await req.db.execute(
+    'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+    [req.parentAccountId]
+  );
+  const account = accountRows[0];
+  const schoolMap = new Map();
+  for (const child of children) {
+    if (!schoolMap.has(child.school_id)) {
+      schoolMap.set(child.school_id, {
+        school_id: child.school_id,
+        school_name: child.school_name,
+        children_count: 0,
+        premium_active: false,
+        payment_model: 'parent'
+      });
+    }
+    schoolMap.get(child.school_id).children_count += 1;
+  }
+
+  // Subscription entitlement is evaluated separately for each school.
+  // A subscription paid for School A must never unlock School B.
+  for (const schoolEntry of schoolMap.values()) {
+    const [schoolRows] = await req.db.execute(
+      'SELECT premium_payment_model FROM schools WHERE school_id = ? LIMIT 1',
+      [schoolEntry.school_id]
+    );
+    const school = schoolRows[0];
+    schoolEntry.payment_model = school?.premium_payment_model || 'parent';
+    if (schoolEntry.payment_model === 'school') {
+      schoolEntry.premium_active = true;
+    } else {
+      const [subscriptionRows] = await req.db.execute(
+        `SELECT ps.subscription_id
+         FROM premium_subscriptions ps
+         JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+         WHERE pp.parent_account_id = ? AND ps.school_id = ?
+           AND ps.payment_status = 'paid'
+           AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+         LIMIT 1`,
+        [req.parentAccountId, schoolEntry.school_id]
+      );
+      schoolEntry.premium_active = subscriptionRows.length > 0;
+    }
+  }
+
+  for (const child of children) {
+    child.premium_active = Boolean(schoolMap.get(child.school_id)?.premium_active);
+  }
+
+  const schoolList = Array.from(schoolMap.values());
+  const [priceRows] = await req.db.execute(
+    "SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price' LIMIT 1"
+  );
+  const premiumPrice = parseFloat(priceRows[0]?.setting_value || '200');
+  const premiumDueSchools = schoolList.filter(s => !s.premium_active && s.payment_model !== 'school');
+  const premiumChildrenCount = premiumDueSchools.reduce((total, school) => total + school.children_count, 0);
+  const premiumTotal = premiumDueSchools.reduce((total, school) => total + (school.children_count * premiumPrice), 0);
+  const [balanceRows] = await req.db.execute(
+    'SELECT COALESCE(SUM(prepaid_balance), 0) AS prepaid_balance FROM parent_profiles WHERE parent_account_id = ?',
+    [req.parentAccountId]
+  );
+
+  res.json({
+    parent: { parent_name: account?.full_name || null },
+    parent_account_id: req.parentAccountId,
+    phone: account?.canonical_parent_phone || req.parentPhone,
+    school_id: children[0]?.school_id || null,
+    schools: schoolList,
+    children,
+    children_count: children.length,
+    premium_active: schoolList.length > 0 && schoolList.every(s => s.premium_active),
+    premium_any_active: schoolList.some(s => s.premium_active),
+    premium_price: premiumPrice,
+    premium_children_count: premiumChildrenCount,
+    premium_total: premiumTotal,
+    premium_due: premiumTotal,
+    renewal_required: premiumDueSchools.length > 0,
+    prepaid_balance: Number(balanceRows[0]?.prepaid_balance || 0)
+  });
+}));
 
 // GET /api/parents/my-schools/:phone — returns all schools a parent has children in
 router.get('/my-schools/:phone', requireParentSession, wrap(async (req, res) => {
@@ -184,7 +485,12 @@ router.get('/dashboard/:phone', requireParentSession, wrap(async (req, res) => {
     filterSchoolId ? [phone, filterSchoolId] : [phone]
   );
 
-  const schoolId = children.length > 0 ? children[0].school_id : null;
+  const childSchoolIds = [...new Set(children.map(child => String(child.school_id)))];
+  // A legacy all-schools dashboard has no single billing context. Only auto-use
+  // prepaid credit when the parent filtered to one school or has one school total.
+  const schoolId = children.length > 0
+    ? (filterSchoolId || (childSchoolIds.length === 1 ? childSchoolIds[0] : null))
+    : null;
 
   const [parent] = await req.db.execute(
     'SELECT full_name AS parent_name, is_premium, premium_expires_at, prepaid_balance FROM parent_profiles WHERE parent_phone = ?',
@@ -193,14 +499,14 @@ router.get('/dashboard/:phone', requireParentSession, wrap(async (req, res) => {
 
   // Auto-activate from prepaid balance when it covers a term and the parent is
   // otherwise not active.
-  if ((!parent[0]?.is_premium || (parent[0]?.premium_expires_at && new Date(parent[0].premium_expires_at) <= new Date()))
+  if (schoolId && (!parent[0]?.is_premium || (parent[0]?.premium_expires_at && new Date(parent[0].premium_expires_at) <= new Date()))
       && parseFloat(parent[0]?.prepaid_balance || 0) > 0) {
     const { autoActivateFromPrepaid } = require('../lib/subscriptions');
     await autoActivateFromPrepaid(req.db, phone, schoolId);
   }
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const premiumPrice = parseInt(setting[0]?.setting_value || '100');
+  const premiumPrice = parseInt(setting[0]?.setting_value || '200');
 
   // Multi-school support: summarize every school the parent has children in
   const schoolMap = new Map();
@@ -289,18 +595,64 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   if (!rawPhone) return res.status(400).json({ error: 'Phone required' });
   const phone = normalizePhone(rawPhone);
   if (phone !== req.parentPhone) return res.status(403).json({ error: 'This session cannot pay from another parent account' });
+  // Global parent accounts must choose the school being paid for. Never
+  // combine children or allocate one payment across unrelated school terms.
+  if (!school_id) {
+    return res.status(400).json({ error: 'Select the school for this subscription payment' });
+  }
 
-  // Scope to active children at the chosen school (or all schools when omitted)
-  const scopeSql = school_id ? ' AND s.school_id = ?' : '';
-  const scopeParams = school_id ? [school_id] : [];
-  const [childRows] = await req.db.execute(
-    `SELECT s.student_id, s.school_id, sc.premium_payment_model
-     FROM students s
-     JOIN student_parent_map m ON s.student_id = m.student_id
-     JOIN schools sc ON s.school_id = sc.school_id
-     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'${scopeSql}`,
-    [phone, ...scopeParams]
-  );
+  // The session phone is normalized for authentication, but legacy parent
+  // profiles may retain their original 07... / 01... value. Use the stored
+  // canonical profile phone for all foreign-keyed payment records.
+  let billingPhone = phone;
+  if (req.parentAccountId) {
+    const [accountRows] = await req.db.execute(
+      'SELECT canonical_parent_phone FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+      [req.parentAccountId]
+    );
+    if (!accountRows.length) return res.status(403).json({ error: 'Parent account could not be resolved' });
+    billingPhone = accountRows[0].canonical_parent_phone;
+  } else {
+    const rawStoredPhone = "REPLACE(REPLACE(REPLACE(TRIM(parent_phone), ' ', ''), '-', ''), '+', '')";
+    const normalizedStoredPhone = `CASE
+      WHEN CHAR_LENGTH(${rawStoredPhone}) = 10 AND LEFT(${rawStoredPhone}, 1) = '0'
+        THEN CONCAT('254', SUBSTRING(${rawStoredPhone}, 2))
+      WHEN CHAR_LENGTH(${rawStoredPhone}) = 9 AND LEFT(${rawStoredPhone}, 1) IN ('1', '7')
+        THEN CONCAT('254', ${rawStoredPhone})
+      ELSE ${rawStoredPhone}
+    END`;
+    const [profileRows] = await req.db.execute(
+      `SELECT parent_phone FROM parent_profiles WHERE ${normalizedStoredPhone} = ? LIMIT 1`,
+      [phone]
+    );
+    if (profileRows.length) billingPhone = profileRows[0].parent_phone;
+  }
+
+  // Every subscription payment is scoped to one school, including legacy
+  // sessions. A global parent must never be charged for children elsewhere.
+  const scopeSql = ' AND s.school_id = ?';
+  const scopeParams = [school_id];
+  let childRows;
+  if (req.parentAccountId) {
+    [childRows] = await req.db.execute(
+      `SELECT s.student_id, s.school_id, sc.premium_payment_model
+       FROM parent_student_relationships r
+       JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+       JOIN schools sc ON sc.school_id = r.school_id
+       WHERE r.parent_account_id = ? AND r.status = 'active'
+         AND s.enrollment_status = 'Active'${school_id ? ' AND s.school_id = ?' : ''}`,
+      [req.parentAccountId, school_id]
+    );
+  } else {
+    [childRows] = await req.db.execute(
+      `SELECT s.student_id, s.school_id, sc.premium_payment_model
+       FROM students s
+       JOIN student_parent_map m ON s.student_id = m.student_id
+       JOIN schools sc ON s.school_id = sc.school_id
+       WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'${scopeSql}`,
+      [billingPhone, ...scopeParams]
+    );
+  }
 
   // Prevent parent payment if a covered school pays for premium (within scope)
   for (const row of childRows) {
@@ -314,23 +666,40 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   }
 
   const childCount = childRows.length;
+  if (childCount === 0) {
+    return res.status(400).json({ error: 'No active children are linked to this parent account at the selected school.' });
+  }
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const pricePerChild = parseInt(setting[0]?.setting_value || '100');
-  const defaultTotal = pricePerChild * Math.max(childCount, 1);
-  const totalDue = clientAmount ? parseInt(clientAmount, 10) : defaultTotal;
+  const pricePerChild = parseInt(setting[0]?.setting_value || '200', 10);
+  // The server calculates the charge. Never trust an amount supplied by the browser.
+  const totalDue = pricePerChild * childCount;
+
+  // Apply prepaid credit only after the parent has explicitly selected this
+  // school. The wallet debit, subscription and ledger entry are transactional.
+  const { autoActivateFromPrepaid } = require('../lib/subscriptions');
+  const prepaidActivated = await autoActivateFromPrepaid(req.db, billingPhone, school_id);
+  if (prepaidActivated) {
+    return res.json({
+      transaction_ref: null,
+      status: 'prepaid_activated',
+      message: `Prepaid balance applied to this school's subscription for KSh ${totalDue}.`,
+      premium_due: totalDue,
+      premium_children_count: childCount
+    });
+  }
 
   const txnRef = 'TXN' + Date.now().toString(36).toUpperCase();
 
   // Ensure parent profile exists (payment_ledger FK requires it)
-  await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [phone]);
+  await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [billingPhone]);
 
   // Store the pending upgrade tagged with the target school so the STK callback
   // allocates the subscription to the correct school
   const [insertResult] = await req.db.execute(
     `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes, school_id)
      VALUES (?, ?, ?, ?, 'M-Pesa-Pending', NOW(), 'STK_PENDING', ?)`,
-    [txnRef, totalDue, phone, txnRef, school_id || null]
+    [txnRef, totalDue, billingPhone, txnRef, school_id]
   );
   const accountRef = String(insertResult.insertId).padStart(10, '0');
 
@@ -368,28 +737,38 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   }
 
   // Simulated upgrade — dev only — mark premium immediately (used when M-Pesa not configured in dev)
-  const { getNextTermStart } = require('../lib/config');
-  const [schoolRows] = await req.db.execute(
-    'SELECT DISTINCT s.school_id FROM students s JOIN student_parent_map m ON s.student_id = m.student_id WHERE m.parent_phone = ? LIMIT 1',
-    [phone]
-  );
-  const schoolIdForExpiry = schoolRows[0]?.school_id;
-  const expiresAt = schoolIdForExpiry ? await getNextTermStart(req.db, schoolIdForExpiry) : new Date(Date.now() + 120 * 86400000);
+  const { getNextTermStart, getCurrentTerm } = require('../lib/config');
+  const expiresAt = await getNextTermStart(req.db, school_id);
+  const currentTerm = await getCurrentTerm(req.db, school_id);
+  const currentYear = new Date().getFullYear();
 
-  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
+  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [billingPhone]);
   if (existing.length > 0) {
     await req.db.execute(
       'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
-      [expiresAt, phone]
+      [expiresAt, billingPhone]
     );
   } else {
     await req.db.execute(
       'INSERT INTO parent_profiles (parent_phone, full_name, is_premium, premium_expires_at) VALUES (?, ?, TRUE, ?)',
-      [phone, null, expiresAt]
+      [billingPhone, null, expiresAt]
     );
   }
 
-  console.log(`[PREMIUM] ${phone} upgraded (simulated) — expires ${expiresAt.toISOString()}`);
+  await req.db.execute(
+    `INSERT INTO premium_subscriptions
+     (school_id, parent_phone, term, year, payment_model, payment_status, amount, activated_at, expires_at)
+     VALUES (?, ?, ?, ?, 'parent', 'paid', ?, NOW(), ?)
+     ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(),
+       expires_at = VALUES(expires_at), amount = VALUES(amount)`,
+    [school_id, billingPhone, currentTerm, currentYear, totalDue, expiresAt]
+  );
+  await req.db.execute(
+    "UPDATE payment_ledger SET notes = 'STK_COMPLETED' WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
+    [txnRef]
+  );
+
+  console.log(`[PREMIUM] ${phone} upgraded (simulated) for school ${school_id} — expires ${expiresAt.toISOString()}`);
   res.json({
     transaction_ref: txnRef,
     status: 'confirmed',
@@ -415,7 +794,7 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
   const childCount = childCountRows[0]?.child_count || 0;
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const premiumPrice = parseInt(setting[0]?.setting_value || '100');
+  const premiumPrice = parseInt(setting[0]?.setting_value || '200');
 
   // Check if any linked school pays for premium
   let schoolPays = false;
@@ -436,10 +815,9 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
   // If the parent has a prepaid balance that covers the term price, auto-activate
   // the current term (consuming one term from the credit) so they don't have to pay again.
   const prepaid = rows.length > 0 ? parseFloat(rows[0].prepaid_balance || 0) : 0;
-  if (rows.length > 0 && !schoolPays && prepaid > 0) {
+  if (rows.length > 0 && !schoolPays && prepaid > 0 && childSchools.length === 1) {
     const { autoActivateFromPrepaid } = require('../lib/subscriptions');
-    const l = childSchools.length > 0 ? childSchools[0].school_id : null;
-    await autoActivateFromPrepaid(req.db, phone, l);
+    await autoActivateFromPrepaid(req.db, phone, childSchools[0].school_id);
   }
 
   const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
@@ -483,18 +861,31 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
 
   // 1. Check payment_ledger — matches individual parent upgrade STK
   //    (student_reference is set to CheckoutRequestID after the STK push)
+  const parentPaymentScope = req.parentAccountId
+    ? 'parent_phone IN (SELECT parent_phone FROM parent_profiles WHERE parent_account_id = ?)'
+    : 'parent_phone = ?';
+  const parentPaymentScopeValue = req.parentAccountId || req.parentPhone;
+  const parentProfileScope = req.parentAccountId ? 'parent_account_id = ?' : 'parent_phone = ?';
+  const parentProfileScopeValue = req.parentAccountId || phone || req.parentPhone;
   const [rows] = await req.db.execute(
     `SELECT notes, transaction_reference, amount FROM payment_ledger
-     WHERE parent_phone = ? AND (student_reference = ? OR transaction_reference = ?)
+     WHERE ${parentPaymentScope} AND (student_reference = ? OR transaction_reference = ?)
      ORDER BY logged_at DESC LIMIT 1`,
-    [req.parentPhone, checkout_request_id || '', checkout_request_id || '']
+    [parentPaymentScopeValue, checkout_request_id || '', checkout_request_id || '']
   );
+
+  if (rows.length > 0 && rows[0].notes === 'STK_PAID_UNAPPLIED') {
+    return res.json({
+      status: 'paid_unapplied',
+      message: 'Payment was received, but subscription activation needs reconciliation. Please contact the school.'
+    });
+  }
 
   if (rows.length > 0 && rows[0].notes === 'STK_COMPLETED') {
     if (!phone) return res.json({ status: 'completed' });
     const [p] = await req.db.execute(
-      'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-      [phone]
+       `SELECT is_premium, premium_expires_at FROM parent_profiles WHERE ${parentProfileScope} LIMIT 1`,
+      [parentProfileScopeValue]
     );
     return res.json({
       status: 'completed',
@@ -523,8 +914,8 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
     if (bulk.length > 0 && bulk[0].payment_status === 'completed') {
       if (phone) {
         const [p] = await req.db.execute(
-          'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-          [phone]
+          `SELECT is_premium, premium_expires_at FROM parent_profiles WHERE ${parentProfileScope} LIMIT 1`,
+          [parentProfileScopeValue]
         );
         return res.json({
           status: 'completed',
@@ -561,8 +952,8 @@ router.get('/payment-status', requireParentSession, wrap(async (req, res) => {
   // 3. No pending record found — check if already premium (paid via another path)
   if (!phone) return res.json({ status: 'pending' });
   const [p] = await req.db.execute(
-    'SELECT is_premium, premium_expires_at FROM parent_profiles WHERE parent_phone = ?',
-    [phone]
+    `SELECT is_premium, premium_expires_at FROM parent_profiles WHERE ${parentProfileScope} LIMIT 1`,
+    [parentProfileScopeValue]
   );
   const active = p[0]?.is_premium && (!p[0]?.premium_expires_at || new Date(p[0].premium_expires_at) > new Date());
   return res.json({ status: active ? 'completed' : 'pending' });
@@ -575,14 +966,27 @@ router.get('/academic-records/:phone', requireParentSession, wrap(async (req, re
 
   const { getCurrentTerm, getRubricConfig, getLevel } = require('../lib/config');
 
-  const [children] = await req.db.execute(
-    `SELECT s.student_id, s.full_name, c.class_name, s.school_id
-     FROM students s
-     JOIN classes c ON s.class_id = c.class_id
-     JOIN student_parent_map m ON s.student_id = m.student_id
-     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
-    [phone]
-  );
+  let children;
+  if (req.parentAccountId) {
+    [children] = await req.db.execute(
+      `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+       FROM parent_student_relationships r
+       JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+       JOIN classes c ON s.class_id = c.class_id
+       WHERE r.parent_account_id = ? AND r.status = 'active'
+         AND r.can_view_results = 1 AND s.enrollment_status = 'Active'`,
+      [req.parentAccountId]
+    );
+  } else {
+    [children] = await req.db.execute(
+      `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+       FROM students s
+       JOIN classes c ON s.class_id = c.class_id
+       JOIN student_parent_map m ON s.student_id = m.student_id
+       WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
+      [phone]
+    );
+  }
 
   const result = [];
   for (const child of children) {

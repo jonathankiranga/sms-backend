@@ -1,55 +1,19 @@
 const express = require('express');
 const router = express.Router();
 
-async function requireStaffSession(req, res, next) {
-  try {
-    const auth = (req.headers.authorization || '').trim();
-    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
-    const sessionId = auth.slice(7).trim();
-    const [sessions] = await req.db.execute(
-      'SELECT phone, email, teacher_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
-      [sessionId]
-    );
-    const session = sessions[0];
-    if (!session || !session.verified || !session.expires_at || new Date(session.expires_at) <= new Date()) {
-      return res.status(401).json({ error: 'Session expired or not verified' });
-    }
+const { requireStaffSession: requireBoundStaffSession } = require('../lib/staffAuth');
+const { normalizePhone } = require('../lib/identity');
 
-    let teachers = [];
-    if (session.teacher_id) {
-      const [rows] = await req.db.execute(
-        'SELECT teacher_id, school_id, role, active FROM teachers WHERE teacher_id = ? LIMIT 1',
-        [session.teacher_id]
-      );
-      teachers = rows;
+async function requireAttendanceStaff(req, res, next) {
+  return requireBoundStaffSession(req, res, () => {
+    if (!['teacher', 'head', 'bursar'].includes(req.staff.role)) {
+      return res.status(403).json({ error: 'An active teacher or school management membership is required' });
     }
-    if (teachers.length === 0 && session.phone) {
-      const [rows] = await req.db.execute(
-        'SELECT teacher_id, school_id, role, active FROM teachers WHERE phone = ? LIMIT 1',
-        [session.phone]
-      );
-      teachers = rows;
-    }
-    if (teachers.length === 0 && session.email) {
-      const [rows] = await req.db.execute(
-        'SELECT teacher_id, school_id, role, active FROM teachers WHERE email = ? LIMIT 1',
-        [session.email]
-      );
-      teachers = rows;
-    }
-
-    const teacher = teachers[0];
-    if (!teacher || !['teacher', 'head', 'bursar'].includes(teacher.role) || teacher.active === 0) {
-      return res.status(403).json({ error: 'An active school staff account is required' });
-    }
-    req.staff = teacher;
     next();
-  } catch (err) {
-    next(err);
-  }
+  });
 }
 
-router.use(requireStaffSession);
+router.use(requireAttendanceStaff);
 
 router.post('/sync', async (req, res) => {
   const { school_id, teacher_id, attendance_date, records } = req.body;
@@ -88,16 +52,28 @@ router.post('/sync', async (req, res) => {
 
       if (r.status === 'Absent') {
         const [parentRows] = await connection.execute(
-          `SELECT p.parent_phone, s.full_name AS student_name, sch.school_name
-           FROM attendance_logs a
-           JOIN students s ON a.student_id = s.student_id
-           JOIN schools sch ON s.school_id = sch.school_id
-           JOIN student_parent_map m ON s.student_id = m.student_id
-           JOIN parent_profiles p ON m.parent_phone = p.parent_phone
-           WHERE a.student_id = ? AND a.attendance_date = ?
-             AND a.absence_alerted_at IS NULL
-             AND p.is_premium = TRUE AND p.premium_expires_at >= NOW()
-           LIMIT 1`,
+          `SELECT pa.canonical_parent_phone AS parent_phone, s.full_name AS student_name, sch.school_name
+FROM attendance_logs a
+JOIN students s ON a.student_id = s.student_id
+JOIN schools sch ON s.school_id = sch.school_id
+JOIN parent_student_relationships r
+  ON r.student_id = s.student_id AND r.school_id = s.school_id AND r.status = 'active'
+JOIN parent_accounts pa ON pa.parent_account_id = r.parent_account_id
+WHERE a.student_id = ? AND a.attendance_date = ?
+  AND a.absence_alerted_at IS NULL
+  AND (
+    sch.premium_payment_model = 'school'
+    OR EXISTS (
+      SELECT 1
+      FROM premium_subscriptions ps
+      JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+      WHERE pp.parent_account_id = r.parent_account_id
+        AND ps.school_id = s.school_id
+        AND ps.payment_status = 'paid'
+        AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+    )
+  )
+LIMIT 1`,
           [r.student_id, attendance_date]
         );
 
@@ -105,7 +81,7 @@ router.post('/sync', async (req, res) => {
           const parent = parentRows[0];
           try {
             const { sendAbsenceAlert } = require('../services/messaging');
-            await sendAbsenceAlert(parent.parent_phone, parent.student_name, parent.school_name, attendance_date);
+            await sendAbsenceAlert(normalizePhone(parent.parent_phone), parent.student_name, parent.school_name, attendance_date);
             await connection.execute(
               'UPDATE attendance_logs SET absence_alerted_at = NOW() WHERE student_id = ? AND attendance_date = ?',
               [r.student_id, attendance_date]
@@ -145,18 +121,33 @@ router.post('/sync', async (req, res) => {
           );
           if (alerted[0]?.consecutive_alerted_at) continue;
           const [parentRows] = await connection.execute(
-            `SELECT p.parent_phone, s.full_name AS student_name, sch.school_name
-             FROM students s
-             JOIN schools sch ON s.school_id = sch.school_id
-             JOIN student_parent_map m ON s.student_id = m.student_id
-             JOIN parent_profiles p ON m.parent_phone = p.parent_phone
-             WHERE s.student_id = ? AND p.is_premium = TRUE AND (p.premium_expires_at IS NULL OR p.premium_expires_at >= NOW())
-             LIMIT 1`,
-            [r.student_id]
+            `SELECT pa.canonical_parent_phone AS parent_phone, s.full_name AS student_name, sch.school_name
+FROM attendance_logs a
+JOIN students s ON a.student_id = s.student_id
+JOIN schools sch ON s.school_id = sch.school_id
+JOIN parent_student_relationships r
+  ON r.student_id = s.student_id AND r.school_id = s.school_id AND r.status = 'active'
+JOIN parent_accounts pa ON pa.parent_account_id = r.parent_account_id
+WHERE a.student_id = ? AND a.attendance_date = ?
+  AND a.consecutive_alerted_at IS NULL
+  AND (
+    sch.premium_payment_model = 'school'
+    OR EXISTS (
+      SELECT 1
+      FROM premium_subscriptions ps
+      JOIN parent_profiles pp ON pp.parent_phone = ps.parent_phone
+      WHERE pp.parent_account_id = r.parent_account_id
+        AND ps.school_id = s.school_id
+        AND ps.payment_status = 'paid'
+        AND (ps.expires_at IS NULL OR ps.expires_at > NOW())
+    )
+  )
+LIMIT 1`,
+            [r.student_id, attendance_date]
           );
           for (const p of parentRows) {
-            sendConsecutiveAbsenceAlert(p.parent_phone, p.student_name, absCnt[0].cnt, p.school_name)
-              .then(() => connection.execute(
+            sendConsecutiveAbsenceAlert(normalizePhone(p.parent_phone), p.student_name, absCnt[0].cnt, p.school_name)
+              .then(() => req.db.execute(
                 'UPDATE attendance_logs SET consecutive_alerted_at = NOW() WHERE student_id = ? AND attendance_date = ?',
                 [r.student_id, attendance_date]
               ))
