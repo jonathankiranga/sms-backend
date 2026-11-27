@@ -159,21 +159,37 @@ router.post('/verify-otp', wrap(async (req, res) => {
       accountId = Math.min(...accountIds);
       for (const duplicateId of accountIds.filter(id => id !== accountId)) {
         await connection.execute(
-          `INSERT IGNORE INTO parent_student_relationships
+          `UPDATE parent_accounts target
+           JOIN parent_accounts source ON source.parent_account_id = ?
+           SET target.full_name = COALESCE(NULLIF(target.full_name, ''), source.full_name)
+           WHERE target.parent_account_id = ?`,
+          [duplicateId, accountId]
+        );
+        await connection.execute(
+          `INSERT INTO parent_student_relationships
              (parent_account_id, student_id, school_id, relationship_type, is_primary,
               can_view_results, can_view_fees, status)
            SELECT ?, student_id, school_id, relationship_type, is_primary,
                   can_view_results, can_view_fees, status
            FROM parent_student_relationships
-           WHERE parent_account_id = ?`,
+           WHERE parent_account_id = ?
+           ON DUPLICATE KEY UPDATE
+             relationship_type = COALESCE(parent_student_relationships.relationship_type, VALUES(relationship_type)),
+             is_primary = GREATEST(parent_student_relationships.is_primary, VALUES(is_primary)),
+             can_view_results = GREATEST(parent_student_relationships.can_view_results, VALUES(can_view_results)),
+             can_view_fees = GREATEST(parent_student_relationships.can_view_fees, VALUES(can_view_fees)),
+             status = IF(parent_student_relationships.status = 'active' OR VALUES(status) = 'active', 'active', 'inactive')`,
           [accountId, duplicateId]
         );
         await connection.execute(
-          `INSERT IGNORE INTO parent_account_contacts
+          `INSERT INTO parent_account_contacts
              (parent_account_id, contact_type, contact_value, is_primary, verified_at)
            SELECT ?, contact_type, contact_value, is_primary, verified_at
            FROM parent_account_contacts
-           WHERE parent_account_id = ?`,
+           WHERE parent_account_id = ?
+           ON DUPLICATE KEY UPDATE
+             is_primary = GREATEST(parent_account_contacts.is_primary, VALUES(is_primary)),
+             verified_at = COALESCE(parent_account_contacts.verified_at, VALUES(verified_at))`,
           [accountId, duplicateId]
         );
         await connection.execute(
@@ -220,7 +236,9 @@ router.post('/verify-otp', wrap(async (req, res) => {
     }
 
     const [accounts] = await connection.execute(
-      'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+      `SELECT a.parent_account_id, a.canonical_parent_phone,
+            COALESCE(NULLIF(a.full_name, ''), (SELECT MAX(p.full_name) FROM parent_profiles p WHERE p.parent_account_id = a.parent_account_id)) AS full_name
+     FROM parent_accounts a WHERE a.parent_account_id = ? LIMIT 1`,
       [accountId]
     );
     if (!accounts.length) throw new Error('Parent account not found');
