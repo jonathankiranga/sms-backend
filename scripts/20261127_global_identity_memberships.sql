@@ -96,23 +96,50 @@ SELECT staff_account_id, teacher_id, school_id, role,
 FROM teachers
 WHERE staff_account_id IS NOT NULL;
 
--- Parents retain their legacy parent_phone key for compatibility while a
--- global parent account supports multiple verified contact methods and
--- relationships with children in multiple schools.
+-- Parents have one global account. Existing profiles with the same normalized
+-- email are grouped together; profiles without email remain phone-keyed.
+-- This lets a parent registered in multiple schools see all linked children.
 CREATE TABLE parent_accounts (
   parent_account_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  identity_key VARCHAR(160) NOT NULL,
   canonical_parent_phone VARCHAR(20) NOT NULL,
   full_name VARCHAR(100) NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (parent_account_id),
+  UNIQUE KEY uq_parent_account_identity (identity_key),
   UNIQUE KEY uq_parent_account_phone (canonical_parent_phone)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-INSERT INTO parent_accounts (canonical_parent_phone, full_name)
-SELECT parent_phone, MAX(full_name)
-FROM parent_profiles
-GROUP BY parent_phone;
+INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+SELECT identity_key, MIN(parent_phone), MAX(full_name)
+FROM (
+  SELECT parent_phone, full_name,
+    CASE
+      WHEN NULLIF(TRIM(email), '') IS NOT NULL
+        THEN CONCAT('email:', LOWER(TRIM(email)))
+      ELSE CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(parent_phone), ' ', ''), '-', ''), '+', ''))
+    END AS identity_key
+  FROM parent_profiles
+) existing_parent_identities
+GROUP BY identity_key;
+
+ALTER TABLE parent_profiles
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER parent_phone,
+  ADD KEY idx_parent_profiles_account (parent_account_id);
+
+UPDATE parent_profiles p
+JOIN parent_accounts a
+  ON a.identity_key = CASE
+    WHEN NULLIF(TRIM(p.email), '') IS NOT NULL
+      THEN CONCAT('email:', LOWER(TRIM(p.email)))
+    ELSE CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+  END
+SET p.parent_account_id = a.parent_account_id;
+
+ALTER TABLE parent_profiles
+  ADD CONSTRAINT fk_parent_profile_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
 
 CREATE TABLE parent_account_contacts (
   contact_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -133,13 +160,13 @@ INSERT IGNORE INTO parent_account_contacts
   (parent_account_id, contact_type, contact_value, is_primary, verified_at)
 SELECT a.parent_account_id, 'phone', p.parent_phone, 1, NULL
 FROM parent_profiles p
-JOIN parent_accounts a ON a.canonical_parent_phone = p.parent_phone;
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
 
 INSERT IGNORE INTO parent_account_contacts
   (parent_account_id, contact_type, contact_value, is_primary, verified_at)
 SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
 FROM parent_profiles p
-JOIN parent_accounts a ON a.canonical_parent_phone = p.parent_phone
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
 WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
 
 CREATE TABLE parent_student_relationships (
@@ -166,17 +193,17 @@ CREATE TABLE parent_student_relationships (
 
 INSERT INTO parent_student_relationships
   (parent_account_id, student_id, school_id, relationship_type)
-SELECT a.parent_account_id, m.student_id, s.school_id, m.relationship
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
 FROM student_parent_map m
-JOIN parent_accounts a ON a.canonical_parent_phone = m.parent_phone
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
 JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
 ON DUPLICATE KEY UPDATE
   school_id = VALUES(school_id),
   relationship_type = VALUES(relationship_type);
 
--- Review duplicate parent contact values before enabling contact-based
--- account resolution. A value may legitimately appear against multiple
--- legacy profiles and must be manually reconciled rather than auto-merged.
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
 -- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
 -- FROM parent_account_contacts
 -- GROUP BY contact_type, contact_value
