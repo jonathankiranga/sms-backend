@@ -227,7 +227,8 @@ async function runMigrationsIfNeeded() {
     const [actualRows] = await conn.query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' AND TABLE_NAME<>'migrations_history'");
     const actualTables = new Set(actualRows.map(r => r.TABLE_NAME));
 
-    if (!baseDone.length) {
+    const baselineWasEstablishedNow = !baseDone.length;
+    if (baselineWasEstablishedNow) {
       if (actualTables.size === 0) {
         console.log('[MIGRATION] Empty database: installing base schema.');
         const count = await executeSqlFile(conn, basePath);
@@ -241,6 +242,28 @@ async function runMigrationsIfNeeded() {
     } else {
       const missing = expectedTables.filter(x => !actualTables.has(x));
       if (missing.length) throw new Error('Base schema history exists but tables are missing: ' + missing.join(', '));
+    }
+
+    // Preserve the existing dated and migration_*.sql upgrade files. On first
+    // adoption, the full schema is the canonical baseline, so historical
+    // incremental scripts are recorded as superseded rather than replayed.
+    const legacyFiles = (await fs.readdir(dir))
+      .filter(name => name.endsWith('.sql') &&
+        (/^\\d{4}/.test(name) || /^migration_/i.test(name) || /^zz_\\d{8}_/.test(name)) &&
+        name !== baseFile && name !== '20261127_global_identity_memberships.sql')
+      .sort();
+
+    for (const file of legacyFiles) {
+      const [alreadyApplied] = await conn.query('SELECT name FROM migrations_history WHERE name=?', [file]);
+      if (alreadyApplied.length) continue;
+      if (baselineWasEstablishedNow) {
+        await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Superseded by the canonical full-schema baseline']);
+        console.log('[MIGRATION] Historical migration covered by base schema:', file);
+        continue;
+      }
+      console.log('[MIGRATION] Applying pending migration:', file);
+      const count = await executeSqlFile(conn, path.join(dir, file));
+      await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, count + ' SQL statements executed']);
     }
 
     const identityFile = '20261127_global_identity_memberships.sql';
