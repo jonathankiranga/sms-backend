@@ -4,7 +4,8 @@ const {
   normalizePhone,
   resolveParentSchool,
   getTermPrice,
-  applyParentPayment
+  applyParentPayment,
+  autoActivateFromPrepaid
 } = require('../lib/subscriptions');
 
 function parentDb(schoolIds, childCount = 2) {
@@ -131,4 +132,59 @@ test('early renewal extends from the existing school expiry date', async () => {
   const result = await applyParentPayment(db, '254712345678', 400, 'SCH000001');
   assert.equal(renewalPivot, '2027-05-01');
   assert.equal(new Date(result.expires_at).toISOString().slice(0, 10), '2027-09-01');
+});
+
+function transactionalParentDb(balance) {
+  const calls = [];
+  const events = [];
+  const connection = {
+    async beginTransaction() { events.push('begin'); },
+    async commit() { events.push('commit'); },
+    async rollback() { events.push('rollback'); },
+    release() { events.push('release'); },
+    async execute(sql, params = []) {
+      calls.push({ sql, params });
+      if (sql.includes('FROM parent_profiles p')) {
+        return [[{
+          parent_phone: '0712345678',
+          parent_account_id: 77,
+          canonical_parent_phone: '0712345678'
+        }]];
+      }
+      if (sql.includes('SELECT DISTINCT s.school_id')) {
+        return [[{ school_id: 'SCH000001' }]];
+      }
+      if (sql.includes("setting_key = 'premium_price'")) return [[{ setting_value: '200' }]];
+      if (sql.includes('COUNT(DISTINCT s.student_id)')) return [[{ child_count: 2 }]];
+      if (sql.includes('SELECT 1 FROM premium_subscriptions')) return [[]];
+      if (sql.includes('SELECT prepaid_balance FROM parent_profiles')) return [[{ prepaid_balance: balance }]];
+      if (sql.includes('SELECT MIN(start_date) AS next_start')) return [[{ next_start: '2027-01-01' }]];
+      return [{ affectedRows: 1 }];
+    }
+  };
+  return {
+    calls,
+    events,
+    async getConnection() { return connection; }
+  };
+}
+
+test('prepaid balance activation is atomic and writes a school-scoped payment ledger entry', async () => {
+  const db = transactionalParentDb(500);
+  const activated = await autoActivateFromPrepaid(db, '254712345678', 'SCH000001');
+  assert.equal(activated, true);
+  assert.deepEqual(db.events, ['begin', 'commit', 'release']);
+  assert.ok(db.calls.some(call => call.sql.includes('prepaid_balance = prepaid_balance - ?')));
+  const ledger = db.calls.find(call => call.sql.includes('INSERT INTO payment_ledger'));
+  assert.equal(ledger.params[1], 400);
+  assert.equal(ledger.params[2], '0712345678');
+  assert.equal(ledger.params[4], 'SCH000001');
+});
+
+test('insufficient prepaid balance does not debit or activate a subscription', async () => {
+  const db = transactionalParentDb(399);
+  const activated = await autoActivateFromPrepaid(db, '254712345678', 'SCH000001');
+  assert.equal(activated, false);
+  assert.deepEqual(db.events, ['begin', 'commit', 'release']);
+  assert.equal(db.calls.some(call => /UPDATE parent_profiles|INSERT INTO premium_subscriptions|INSERT INTO payment_ledger/.test(call.sql)), false);
 });
