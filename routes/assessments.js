@@ -387,7 +387,13 @@ router.get('/report/:student_id/:term', async (req, res) => {
     }
   }
 
-  const normPhone = String(phone || '').replace(/[\\s-]/g, '').replace(/^\\+/, '').replace(/^0([17]\\d{8})$/, '254$1');
+  const compactPhone = String(phone || '').trim().replace(/[ -]/g, '');
+  const phoneDigits = compactPhone.startsWith('+') ? compactPhone.slice(1) : compactPhone;
+  const normPhone = phoneDigits.length === 10 && phoneDigits[0] === '0'
+    ? '254' + phoneDigits.slice(1)
+    : phoneDigits.length === 9 && ['1', '7'].includes(phoneDigits[0])
+      ? '254' + phoneDigits
+      : phoneDigits;
   if (!isTeacher && !parentAccountId && !normPhone) {
     return res.status(400).json({ error: 'A verified parent session is required to view report cards' });
   }
