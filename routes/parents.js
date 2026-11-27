@@ -648,14 +648,27 @@ router.get('/academic-records/:phone', requireParentSession, wrap(async (req, re
 
   const { getCurrentTerm, getRubricConfig, getLevel } = require('../lib/config');
 
-  const [children] = await req.db.execute(
-    `SELECT s.student_id, s.full_name, c.class_name, s.school_id
-     FROM students s
-     JOIN classes c ON s.class_id = c.class_id
-     JOIN student_parent_map m ON s.student_id = m.student_id
-     WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
-    [phone]
-  );
+  let children;
+  if (req.parentAccountId) {
+    [children] = await req.db.execute(
+      `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+       FROM parent_student_relationships r
+       JOIN students s ON s.student_id = r.student_id AND s.school_id = r.school_id
+       JOIN classes c ON s.class_id = c.class_id
+       WHERE r.parent_account_id = ? AND r.status = 'active'
+         AND r.can_view_results = 1 AND s.enrollment_status = 'Active'`,
+      [req.parentAccountId]
+    );
+  } else {
+    [children] = await req.db.execute(
+      `SELECT s.student_id, s.full_name, c.class_name, s.school_id
+       FROM students s
+       JOIN classes c ON s.class_id = c.class_id
+       JOIN student_parent_map m ON s.student_id = m.student_id
+       WHERE m.parent_phone = ? AND s.enrollment_status = 'Active'`,
+      [phone]
+    );
+  }
 
   const result = [];
   for (const child of children) {
