@@ -212,7 +212,11 @@ async function runMigrationsIfNeeded() {
   try {
     conn = await migrationPool.getConnection();
     await conn.query('SELECT 1');
-    await conn.query("CREATE TABLE IF NOT EXISTS migrations_history (name VARCHAR(255) NOT NULL PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, details VARCHAR(500) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    await conn.query("CREATE TABLE IF NOT EXISTS migrations_history (name VARCHAR(255) NOT NULL PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    const [historyColumns] = await conn.query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='migrations_history'");
+    if (!historyColumns.some(column => column.COLUMN_NAME === 'details')) {
+      await conn.query('ALTER TABLE migrations_history ADD COLUMN details VARCHAR(500) NULL');
+    }
 
     const baseFile = 'tidb_full_schema.sql';
     const basePath = path.join(dir, baseFile);
