@@ -176,8 +176,8 @@ router.post('/verify-otp', wrap(async (req, res) => {
            ON DUPLICATE KEY UPDATE
              relationship_type = COALESCE(parent_student_relationships.relationship_type, VALUES(relationship_type)),
              is_primary = GREATEST(parent_student_relationships.is_primary, VALUES(is_primary)),
-             can_view_results = GREATEST(parent_student_relationships.can_view_results, VALUES(can_view_results)),
-             can_view_fees = GREATEST(parent_student_relationships.can_view_fees, VALUES(can_view_fees)),
+             can_view_results = LEAST(parent_student_relationships.can_view_results, VALUES(can_view_results)),
+             can_view_fees = LEAST(parent_student_relationships.can_view_fees, VALUES(can_view_fees)),
              status = IF(parent_student_relationships.status = 'active' OR VALUES(status) = 'active', 'active', 'inactive')`,
           [accountId, duplicateId]
         );
