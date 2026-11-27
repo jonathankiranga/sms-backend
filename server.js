@@ -279,16 +279,62 @@ async function runMigrationsIfNeeded() {
         name !== baseFile && name !== '20261127_global_identity_memberships.sql')
       .sort();
 
+    // These files describe destructive transitions from superseded schemas.
+    // The canonical full schema already contains their final structures.
+    const supersededFiles = new Set([
+      'migration_cbc.sql',
+      '20260906_terms_one_time_acceptance.sql',
+      '20260906_teacher_contact_role_scope.sql',
+      '20260912_exam_results_sub_strand.sql',
+      '2026_add_bursar_role.sql',
+      'migration_add_role.sql',
+      '20260724_add_email_to_teachers_and_otp_sessions.sql',
+      '20260724_add_password_auth.sql',
+      '20260801_add_marked_at_to_attendance.sql',
+      '20260906_otp_session_teacher.sql',
+      '2026_add_campaign_contact.sql',
+      '2026_add_class_rank.sql',
+      '2026_add_nemis_number.sql',
+      '2026_add_school_contact.sql',
+      'migration_ads_message.sql',
+      'migration_campaigns.sql',
+      'migration_push.sql',
+      'zz_20261126_add_school_admin_role.sql',
+      'zz_20261126_parent_profile_fields.sql'
+    ]);
+    const safeBaselineFiles = new Set([
+      '20260726_create_cbc_competencies.sql',
+      '20260726_create_lesson_plans.sql',
+      '20260727_add_mpesa_credentials.sql',
+      '20260727_create_exam_sessions_and_sub_areas.sql',
+      '20260728_core_features.sql',
+      '20260728_premium_subscriptions.sql',
+      '20260729_school_rubric.sql',
+      '20260807_add_mpesa_callback_key.sql',
+      '20260811_attendance_alert_dedup.sql',
+      '20260904_headteacher_terms.sql',
+      'migration_fees.sql',
+      'migration_merchants.sql',
+      'migration_settings.sql'
+    ]);
+
     for (const file of legacyFiles) {
       const [alreadyApplied] = await conn.query('SELECT name FROM migrations_history WHERE name=?', [file]);
       if (alreadyApplied.length) continue;
+
       if (file === '2026_add_sales_rep.sql' || file === '2026_add_sales_rep_commission.sql') {
         await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Sales representative schema provisioned by the startup schema bootstrap']);
         continue;
       }
+      if (supersededFiles.has(file)) {
+        await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Superseded by the canonical schema and safe bootstrap; destructive legacy SQL was not replayed']);
+        console.log('[MIGRATION] Superseded legacy migration safely skipped:', file);
+        continue;
+      }
+
       const commissionMigration = file === '2026_add_commission_payment_system.sql' || file === '2026_add_commission_wallet.sql';
       const competencySeed = file === '20260726_create_cbc_competencies.sql';
-      if (baselineWasEstablishedNow && !commissionMigration && !competencySeed) {
+      if (baselineWasEstablishedNow && !commissionMigration && !competencySeed && !safeBaselineFiles.has(file)) {
         await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [file, 'Superseded by the canonical full-schema baseline']);
         console.log('[MIGRATION] Historical migration covered by base schema:', file);
         continue;
