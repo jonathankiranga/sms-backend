@@ -100,76 +100,183 @@ if (process.env.DATABASE_URL) {
 }
 const pool = mysql.createPool(poolConfig);
 
-// Migration runner: if RUN_MIGRATIONS=true (and not blocked in production) the server will execute .sql files from backend/scripts in filename order.
-async function runMigrationsIfNeeded() {
-  try {
-    const runFlag = (process.env.RUN_MIGRATIONS || '').toLowerCase() === 'true';
-    if (!runFlag) return;
-    if (process.env.NODE_ENV === 'production' && (process.env.MIGRATE_ALLOW_PROD || '').toLowerCase() !== 'true') {
-      console.log('RUN_MIGRATIONS requested but MIGRATE_ALLOW_PROD not set — skipping migrations in production');
-      return;
+// Database migrations complete before the HTTP listener starts.
+// Set RUN_MIGRATIONS=false only when intentionally disabling migrations.
+// Production deployments must explicitly permit schema changes.
+function splitSqlStatements(source) {
+  const statements = [];
+  let delimiter = ';', buffer = '', quote = null, lineComment = false, blockComment = false;
+  for (const line of source.split(/\r?\n/)) {
+    if (!quote && !lineComment && !blockComment) {
+      const directive = line.match(/^\s*DELIMITER\s+(\S+)\s*$/i);
+      if (directive) { delimiter = directive[1]; continue; }
     }
-
-    const fs = require('fs').promises;
-    const path = require('path');
-    const scriptsDir = path.join(__dirname, 'scripts');
-    const files = await fs.readdir(scriptsDir);
-    const sqlFiles = files.filter(f => f.endsWith('.sql') && (/^\d{4}/.test(f) || /^migration_/i.test(f) || f === 'tidb_full_schema.sql' || /^zz_\d{8}_/.test(f))).sort();
-    if (sqlFiles.length === 0) { console.log('No SQL migration files found in', scriptsDir); return; }
-
-    // Use a dedicated connection with multipleStatements for running migration SQL files
-    const migrationPool = mysql.createPool({
-      ...poolConfig,
-      waitForConnections: true,
-      connectionLimit: 1,
-      queueLimit: 0,
-      multipleStatements: true
-    });
-    const conn = await migrationPool.getConnection();
-    try {
-      // Ensure migrations history table exists
-      await conn.query(`CREATE TABLE IF NOT EXISTS migrations_history (
-        name VARCHAR(255) PRIMARY KEY,
-        applied_at DATETIME NOT NULL
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`);
-
-      for (const file of sqlFiles) {
-        // This migration creates MySQL triggers and must be imported manually
-        // after the base schema and a full backup. The cPanel/phpMyAdmin import
-        // path understands DELIMITER; mysql2's multi-statement runner does not.
-        if (file === '20261127_global_identity_memberships.sql') {
-          console.log('Skipping manual-only identity migration:', file);
-          continue;
-        }
-        const [rows] = await conn.query('SELECT name FROM migrations_history WHERE name = ?', [file]);
-        if (rows && rows.length > 0) {
-          console.log('Skipping already-applied migration:', file);
-          continue;
-        }
-        const filePath = path.join(scriptsDir, file);
-        console.log('Applying migration:', filePath);
-        const sql = await fs.readFile(filePath, 'utf8');
-        if (!sql.trim()) {
-          console.log('Empty migration file, skipping:', file);
-          continue;
-        }
-        // Execute the SQL file (may contain multiple statements)
-        await conn.query(sql);
-        await conn.query('INSERT INTO migrations_history (name, applied_at) VALUES (?, NOW())', [file]);
-        console.log('Applied migration:', file);
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i], next = line[i + 1];
+      if (lineComment) { buffer += ch; continue; }
+      if (blockComment) {
+        buffer += ch;
+        if (ch === '*' && next === '/') { buffer += next; i++; blockComment = false; }
+        continue;
       }
-    } finally {
-      conn.release();
-      await migrationPool.end();
+      if (quote) {
+        buffer += ch;
+        if (ch === '\\' && quote !== '\`' && next !== undefined) { buffer += next; i++; }
+        else if (ch === quote) {
+          if (next === quote) { buffer += next; i++; } else quote = null;
+        }
+        continue;
+      }
+      if (ch === '-' && next === '-' && (i + 2 >= line.length || /\s/.test(line[i + 2]))) {
+        buffer += ch + next; i++; lineComment = true; continue;
+      }
+      if (ch === '#') { buffer += ch; lineComment = true; continue; }
+      if (ch === '/' && next === '*') { buffer += ch + next; i++; blockComment = true; continue; }
+      if (ch === "'" || ch === '"' || ch === '\`') { quote = ch; buffer += ch; continue; }
+      if (line.startsWith(delimiter, i)) {
+        if (buffer.trim()) statements.push(buffer.trim());
+        buffer = ''; i += delimiter.length - 1; continue;
+      }
+      buffer += ch;
     }
-  } catch (err) {
-    console.error('Migration runner failed:', err);
-    // Do not crash the server on migration errors; surface the error and continue
+    buffer += '\n';
+    lineComment = false;
+  }
+  if (buffer.trim()) statements.push(buffer.trim());
+  return statements.filter(s => s.replace(/^(?:\s|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)+/g, '').trim());
+}
+
+async function executeSqlFile(connection, filePath) {
+  const source = await require('fs').promises.readFile(filePath, 'utf8');
+  const statements = splitSqlStatements(source);
+  for (let i = 0; i < statements.length; i++) {
+    try { await connection.query(statements[i]); }
+    catch (error) {
+      error.message = 'SQL statement ' + (i + 1) + '/' + statements.length + ' failed: ' + error.message;
+      error.sqlFile = filePath;
+      throw error;
+    }
+  }
+  return statements.length;
+}
+
+async function verifyIdentitySchema(connection) {
+  const requiredTables = ['staff_accounts','staff_account_contacts','teacher_school_memberships','parent_accounts','parent_account_contacts','parent_student_relationships'];
+  const requiredTriggers = ['trg_parent_profile_before_insert','trg_parent_profile_after_insert','trg_parent_profile_after_update','trg_student_parent_after_insert','trg_student_parent_after_delete','trg_teacher_before_insert','trg_teacher_after_insert','trg_teacher_after_update'];
+  const [tables] = await connection.query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()");
+  const tableSet = new Set(tables.map(r => r.TABLE_NAME));
+  const [triggers] = await connection.query("SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()");
+  const triggerSet = new Set(triggers.map(r => r.TRIGGER_NAME));
+  const [columns] = await connection.query("SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND ((TABLE_NAME='teachers' AND COLUMN_NAME='staff_account_id') OR (TABLE_NAME='parent_profiles' AND COLUMN_NAME='parent_account_id') OR (TABLE_NAME='otp_sessions' AND COLUMN_NAME IN ('school_id','login_role','parent_account_id')))");
+  const columnSet = new Set(columns.map(r => r.TABLE_NAME + '.' + r.COLUMN_NAME));
+  const requiredColumns = ['teachers.staff_account_id','parent_profiles.parent_account_id','otp_sessions.school_id','otp_sessions.login_role','otp_sessions.parent_account_id'];
+  const missing = [
+    ...requiredTables.filter(x => !tableSet.has(x)).map(x => 'table ' + x),
+    ...requiredTriggers.filter(x => !triggerSet.has(x)).map(x => 'trigger ' + x),
+    ...requiredColumns.filter(x => !columnSet.has(x)).map(x => 'column ' + x)
+  ];
+  if (missing.length) throw new Error('Identity schema is incomplete: ' + missing.join(', '));
+}
+
+async function runSqlChecks(connection, filePath, finalStatementIsInventory) {
+  const source = await require('fs').promises.readFile(filePath, 'utf8');
+  const statements = splitSqlStatements(source);
+  const checkCount = finalStatementIsInventory ? Math.max(0, statements.length - 1) : statements.length;
+  const failures = [];
+  for (let i = 0; i < statements.length; i++) {
+    const [rows] = await connection.query(statements[i]);
+    if (i < checkCount && Array.isArray(rows) && rows.length) failures.push({ statement: i + 1, rows });
+    if (finalStatementIsInventory && i === statements.length - 1) console.log('[MIGRATION] Post-migration row counts:', rows);
+  }
+  if (failures.length) {
+    const error = new Error('Migration checks returned exception rows. Review the preflight/validation SQL before proceeding.');
+    error.validationFailures = failures;
+    throw error;
   }
 }
 
-// Start migrations (but do not await here so server starts promptly)
-runMigrationsIfNeeded();
+async function runMigrationsIfNeeded() {
+  if ((process.env.RUN_MIGRATIONS || 'true').toLowerCase() === 'false') {
+    console.log('[MIGRATION] Automatic migrations explicitly disabled.');
+    return;
+  }
+  if (process.env.NODE_ENV === 'production' && (process.env.MIGRATE_ALLOW_PROD || '').toLowerCase() !== 'true') {
+    throw new Error('Set MIGRATE_ALLOW_PROD=true after taking a database backup, or explicitly set RUN_MIGRATIONS=false.');
+  }
+
+  const fs = require('fs').promises;
+  const path = require('path');
+  const dir = path.join(__dirname, 'scripts');
+  const migrationPool = mysql.createPool({ ...poolConfig, waitForConnections: true, connectionLimit: 1, queueLimit: 0, multipleStatements: false });
+  let conn;
+  try {
+    conn = await migrationPool.getConnection();
+    await conn.query('SELECT 1');
+    await conn.query("CREATE TABLE IF NOT EXISTS migrations_history (name VARCHAR(255) NOT NULL PRIMARY KEY, applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, details VARCHAR(500) NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    const baseFile = 'tidb_full_schema.sql';
+    const basePath = path.join(dir, baseFile);
+    const baseSql = await fs.readFile(basePath, 'utf8');
+    const expectedTables = [...baseSql.matchAll(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\x60]?([a-zA-Z0-9_]+)/gi)].map(m => m[1]);
+    if (!expectedTables.length) throw new Error('No CREATE TABLE definitions found in ' + baseFile);
+    const [baseDone] = await conn.query('SELECT name FROM migrations_history WHERE name=?', [baseFile]);
+    const [actualRows] = await conn.query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_TYPE='BASE TABLE' AND TABLE_NAME<>'migrations_history'");
+    const actualTables = new Set(actualRows.map(r => r.TABLE_NAME));
+
+    if (!baseDone.length) {
+      if (actualTables.size === 0) {
+        console.log('[MIGRATION] Empty database: installing base schema.');
+        const count = await executeSqlFile(conn, basePath);
+        await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [baseFile, count + ' SQL statements executed']);
+      } else {
+        const missing = expectedTables.filter(x => !actualTables.has(x));
+        if (missing.length) throw new Error('Non-empty database is missing base tables: ' + missing.join(', ') + '. Base schema import was blocked.');
+        await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [baseFile, 'Existing complete base schema recognised; import skipped']);
+        console.log('[MIGRATION] Existing base schema recognised; import skipped.');
+      }
+    } else {
+      const missing = expectedTables.filter(x => !actualTables.has(x));
+      if (missing.length) throw new Error('Base schema history exists but tables are missing: ' + missing.join(', '));
+    }
+
+    const identityFile = '20261127_global_identity_memberships.sql';
+    const identityPath = path.join(dir, identityFile);
+    const [identityDone] = await conn.query('SELECT name FROM migrations_history WHERE name=?', [identityFile]);
+    if (identityDone.length) {
+      await verifyIdentitySchema(conn);
+      console.log('[MIGRATION] Previously applied identity migration verified.');
+    } else {
+      const [objects] = await conn.query("SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ('staff_accounts','staff_account_contacts','teacher_school_memberships','parent_accounts','parent_account_contacts','parent_student_relationships')");
+      const [triggerObjects] = await conn.query("SELECT COUNT(*) AS n FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME IN ('trg_parent_profile_before_insert','trg_parent_profile_after_insert','trg_parent_profile_after_update','trg_student_parent_after_insert','trg_student_parent_after_delete','trg_teacher_before_insert','trg_teacher_after_insert','trg_teacher_after_update')");
+      if (Number(objects[0].n) || Number(triggerObjects[0].n)) {
+        throw new Error('Partial/unrecorded identity migration detected (' + objects[0].n + '/6 tables, ' + triggerObjects[0].n + '/8 triggers). Automatic retry blocked; restore the pre-migration backup or reconcile manually.');
+      }
+
+      const [teacherCount] = await conn.query('SELECT COUNT(*) AS n FROM teachers');
+      const [parentCount] = await conn.query('SELECT COUNT(*) AS n FROM parent_profiles');
+      if (Number(teacherCount[0].n) || Number(parentCount[0].n)) {
+        console.log('[MIGRATION] Running read-only identity preflight checks.');
+        await runSqlChecks(conn, path.join(dir, 'preflight_global_identity_migration.sql'), false);
+      }
+
+      console.log('[MIGRATION] Applying', identityFile);
+      const count = await executeSqlFile(conn, identityPath);
+      await runSqlChecks(conn, path.join(dir, 'validate_global_identity_migration.sql'), true);
+      await verifyIdentitySchema(conn);
+      await conn.query('INSERT INTO migrations_history (name,details) VALUES (?,?)', [identityFile, count + ' SQL statements executed; validation passed']);
+      console.log('[MIGRATION] Identity migration applied and verified.');
+    }
+    console.log('[MIGRATION] Database schema is up to date.');
+  } catch (error) {
+    console.error('[MIGRATION] Startup migration failed:', error);
+    throw error;
+  } finally {
+    if (conn) conn.release();
+    await migrationPool.end();
+  }
+}
+
+// The HTTP listener is started only after this migration routine succeeds.
 
 app.use((req, res, next) => {
   req.db = pool;
@@ -504,7 +611,14 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`SMS Backend running on port ${PORT}`);
-  console.log(`DB: ${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`);
+async function startServer() {
+  await runMigrationsIfNeeded();
+  app.listen(PORT, () => {
+    console.log(`SMS Backend running on port ${PORT}`);
+    console.log(`DB: ${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`);
+  });
+}
+startServer().catch(error => {
+  console.error('[STARTUP] Server was not started because database initialisation failed:', error);
+  process.exit(1);
 });
