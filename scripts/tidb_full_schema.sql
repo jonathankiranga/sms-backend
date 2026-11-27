@@ -503,7 +503,7 @@ CREATE TABLE IF NOT EXISTS migrations_history (
 -- ── SEED DATA ────────────────────────────────────────────────
 
 INSERT IGNORE INTO app_settings (setting_key, setting_value) VALUES
-  ('premium_price', '100');
+  ('premium_price', '200');
 
 INSERT IGNORE INTO core_competencies (competency_id, competency_name, category, description) VALUES
   (1,  'Communication and Collaboration',    'competency', 'Ability to express ideas and work with others'),
