@@ -15,39 +15,53 @@ function normalizePhone(raw) {
 }
 
 router.post('/request-otp', wrap(async (req, res) => {
-  const { phone, email } = req.body;
-  if (!phone && !email) return res.status(400).json({ error: 'Phone number or email required' });
-  const normPhone = phone ? normalizePhone(phone) : null;
+  const normPhone = req.body.phone ? normalizePhone(req.body.phone) : '';
+  const email = req.body.email ? String(req.body.email).trim().toLowerCase() : '';
+  if (!normPhone && !email) return res.status(400).json({ error: 'Phone number or email required' });
 
-  // Email login: resolve to the registered parent profile's phone up-front,
-  // so every downstream phone-keyed flow keeps working after verification.
-  let resolvedPhone = '';
-  if (!normPhone && email) {
-    const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
-    resolvedPhone = pp[0]?.parent_phone || '';
+  // Resolve both identifiers to one global parent account. Never silently
+  // combine two accounts when the supplied phone and email disagree.
+  const conditions = [];
+  const params = [];
+  if (normPhone) { conditions.push("(contact_type = 'phone' AND contact_value = ?)"); params.push(normPhone); }
+  if (email) { conditions.push("(contact_type = 'email' AND contact_value = ?)"); params.push(email); }
+  const [matches] = await req.db.execute(
+    `SELECT DISTINCT a.parent_account_id, a.canonical_parent_phone
+     FROM parent_account_contacts c
+     JOIN parent_accounts a ON a.parent_account_id = c.parent_account_id
+     WHERE ${conditions.join(' OR ')}`,
+    params
+  );
+
+  if (!matches.length) {
+    return res.status(404).json({ error: 'This contact is not registered with a parent account. Ask the school to register or link your contact details.' });
+  }
+  if (matches.length > 1) {
+    return res.status(409).json({ error: 'Your email and telephone number are associated with different parent accounts. Contact the school to reconcile the records before signing in.' });
   }
 
-  const code = Math.floor(1000 + Math.random() * 9000).toString();
+  const account = matches[0];
+  const code = crypto.randomInt(1000, 10000).toString();
   const sessionId = crypto.randomBytes(32).toString('hex');
-
   await req.db.execute(
-    'INSERT INTO otp_sessions (session_id, phone, email, code, expires_at) VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))',
-    [sessionId, normPhone || resolvedPhone || '', email || null, code]
+    `INSERT INTO otp_sessions
+      (session_id, phone, email, code, expires_at, verified, parent_account_id)
+     VALUES (?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE), FALSE, ?)`,
+    [sessionId, account.canonical_parent_phone, email || null, code, account.parent_account_id]
   );
 
   try {
-    if (email && !normPhone) {
-      const messaging = require('../services/messaging');
-      if (messaging.sendEmailOtp) await messaging.sendEmailOtp(email, code);
-      else console.log('=== Email OTP for', email, ':', code, '===');
+    const messaging = require('../services/messaging');
+    if (email) {
+      if (!messaging.sendEmailOtp) throw new Error('Email OTP delivery is not configured');
+      await messaging.sendEmailOtp(email, code);
     } else {
-      const { sendOtp } = require('../services/messaging');
-      await sendOtp(normPhone, code);
+      await messaging.sendOtp(normPhone, code);
     }
-  } catch (e) {
-    console.error('OTP send failed (non-blocking):', e.message);
-    if (email && !normPhone) console.log('=== Email OTP for', email, ':', code, '===');
-    else if (process.env.NODE_ENV !== 'production') console.log('=== OTP for', normPhone, ':', code, '===');
+  } catch (err) {
+    console.error('[PARENT OTP] Delivery failed:', err.message);
+    await req.db.execute('DELETE FROM otp_sessions WHERE session_id = ?', [sessionId]);
+    return res.status(503).json({ error: 'Unable to send the verification code. Please try again.' });
   }
 
   res.json({ session_id: sessionId, message: 'OTP sent' });
@@ -58,59 +72,54 @@ router.post('/verify-otp', wrap(async (req, res) => {
   if (!session_id || !code) return res.status(400).json({ error: 'Missing session_id or code' });
 
   const [rows] = await req.db.execute(
-    'SELECT phone, email FROM otp_sessions WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE',
+    `SELECT phone, email, parent_account_id
+     FROM otp_sessions
+     WHERE session_id = ? AND code = ? AND expires_at > NOW() AND verified = FALSE
+     LIMIT 1`,
     [session_id, code]
   );
-
-  if (rows.length === 0) {
-    const [expiredRows] = await req.db.execute(
-      'SELECT phone FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE',
+  if (!rows.length) {
+    const [expired] = await req.db.execute(
+      'SELECT session_id FROM otp_sessions WHERE session_id = ? AND code = ? AND verified = FALSE LIMIT 1',
       [session_id, code]
     );
-    if (expiredRows.length > 0) {
-      return res.status(410).json({ error: 'Code expired - tap Resend to get a new one' });
-    }
-    return res.status(401).json({ error: 'Invalid or expired code' });
+    return res.status(expired.length ? 410 : 401).json({
+      error: expired.length ? 'Code expired - tap Resend to get a new one' : 'Invalid or expired code'
+    });
   }
 
-  await req.db.execute('UPDATE otp_sessions SET verified = TRUE WHERE session_id = ?', [session_id]);
+  const accountId = rows[0].parent_account_id;
+  if (!accountId) return res.status(403).json({ error: 'This OTP session is not linked to a parent account. Request a new code.' });
 
-  const phone = rows[0].phone || '';
-  const email = rows[0].email || null;
+  const [accounts] = await req.db.execute(
+    'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+    [accountId]
+  );
+  if (!accounts.length) return res.status(404).json({ error: 'Parent account not found' });
 
-  // Resolve the canonical parent phone (email-only sessions map through parent_profiles.email)
-  let effectivePhone = phone;
-  if (!effectivePhone && email) {
-    const [pp] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE email = ? LIMIT 1', [email]);
-    effectivePhone = pp[0]?.parent_phone || '';
-  }
+  const account = accounts[0];
+  await req.db.execute(
+    'UPDATE otp_sessions SET verified = TRUE, phone = ?, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?',
+    [account.canonical_parent_phone, session_id]
+  );
 
-  // Bind email-based OTP sessions to the canonical registered parent phone.
-  if (effectivePhone) {
-    await req.db.execute('UPDATE otp_sessions SET phone = ? WHERE session_id = ?', [effectivePhone, session_id]);
-  }
+  const [countRows] = await req.db.execute(
+    `SELECT COUNT(DISTINCT r.student_id) AS cnt
+     FROM parent_student_relationships r
+     JOIN students s ON s.student_id = r.student_id
+     WHERE r.parent_account_id = ? AND r.status = 'active' AND s.enrollment_status = 'Active'`,
+    [accountId]
+  );
 
-  // Compare against registered parent profiles (by phone or email) so the client can inform the user
-  let registered = false;
-  if (effectivePhone || email) {
-    const [parentRows] = await req.db.execute(
-      'SELECT parent_phone FROM parent_profiles WHERE parent_phone = ? OR (email IS NOT NULL AND email = ?)',
-      [effectivePhone || '__none__', email || '__none__']
-    );
-    registered = parentRows.length > 0;
-  }
-
-  // Report how many active children are linked to this parent's phone
-  let linkedChildren = 0;
-  if (effectivePhone) {
-    const [childrenCountRows] = await req.db.execute(
-      'SELECT COUNT(*) AS cnt FROM student_parent_map m JOIN students s ON m.student_id = s.student_id WHERE m.parent_phone = ? AND s.enrollment_status = ?',
-      [effectivePhone, 'Active']
-    );
-    linkedChildren = childrenCountRows[0]?.cnt || 0;
-  }
-
-  res.json({ session_id, phone: effectivePhone, email: email || undefined, verified: true, registered, linked_children: linkedChildren });
+  res.json({
+    session_id,
+    parent_account_id: accountId,
+    phone: account.canonical_parent_phone,
+    parent_name: account.full_name,
+    verified: true,
+    registered: true,
+    linked_children: Number(countRows[0]?.cnt || 0)
+  });
 }));
 
 // Protect parent records with the verified OTP session, not a caller-supplied phone.
@@ -122,7 +131,7 @@ async function requireParentSession(req, res, next) {
     if (!sessionId) return res.status(401).json({ error: 'Invalid session' });
 
     const [sessions] = await req.db.execute(
-      'SELECT phone, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
+      'SELECT phone, parent_account_id, verified, expires_at FROM otp_sessions WHERE session_id = ? LIMIT 1',
       [sessionId]
     );
     const session = sessions[0];
@@ -131,14 +140,27 @@ async function requireParentSession(req, res, next) {
     }
 
     const sessionPhone = normalizePhone(session.phone);
-    if (!sessionPhone) return res.status(403).json({ error: 'Verified parent phone is not linked to this session' });
+    const accountId = session.parent_account_id || null;
+    if (!accountId && !sessionPhone) return res.status(403).json({ error: 'Verified parent identity is not linked to this session' });
 
     const suppliedPhone = req.params.phone || (req.body && req.body.phone) || req.query.phone;
-    if (suppliedPhone && normalizePhone(suppliedPhone) !== sessionPhone) {
-      return res.status(403).json({ error: 'This session cannot access another parent account' });
+    if (suppliedPhone) {
+      const supplied = normalizePhone(suppliedPhone);
+      if (accountId) {
+        const [contact] = await req.db.execute(
+          "SELECT contact_id FROM parent_account_contacts WHERE parent_account_id = ? AND contact_type = 'phone' AND contact_value = ? LIMIT 1",
+          [accountId, supplied]
+        );
+        if (!contact.length && supplied !== sessionPhone) {
+          return res.status(403).json({ error: 'This session cannot access another parent account' });
+        }
+      } else if (supplied !== sessionPhone) {
+        return res.status(403).json({ error: 'This session cannot access another parent account' });
+      }
     }
 
     req.parentPhone = sessionPhone;
+    req.parentAccountId = accountId;
     next();
   } catch (err) {
     next(err);
