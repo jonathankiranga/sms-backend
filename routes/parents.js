@@ -36,7 +36,7 @@ router.post('/request-otp', wrap(async (req, res) => {
   if (!matches.length) {
     return res.status(404).json({ error: 'This contact is not registered with a parent account. Ask the school to register or link your contact details.' });
   }
-  if (matches.length > 1 && (normPhone || !email)) {
+  if (matches.length > 1 && normPhone && email) {
     return res.status(409).json({ error: 'Your email and telephone number are associated with different parent accounts. Sign in using the email alone to verify and consolidate the matching parent records.' });
   }
 
@@ -100,60 +100,66 @@ router.post('/verify-otp', wrap(async (req, res) => {
   try {
     await connection.beginTransaction();
 
-    // An email can be present on multiple legacy parent profiles. Only after
-    // successful email OTP verification do we consolidate those identities.
+    // Consolidate legacy accounts only after the parent proves control of
+    // the contact used for this OTP. Both verified email and verified phone
+    // can identify the same parent across school registrations.
     const verifiedEmail = rows[0].email ? String(rows[0].email).trim().toLowerCase() : '';
-    if (verifiedEmail) {
-      const [emailAccounts] = await connection.execute(
-        `SELECT parent_account_id
-         FROM parent_account_contacts
-         WHERE contact_type = 'email' AND contact_value = ?
-         ORDER BY parent_account_id
-         FOR UPDATE`,
-        [verifiedEmail]
-      );
-      const accountIds = emailAccounts.map(row => Number(row.parent_account_id));
-      if (accountIds.length) {
-        accountId = Math.min(...accountIds);
-        for (const duplicateId of accountIds.filter(id => id !== accountId)) {
-          await connection.execute(
-            `INSERT IGNORE INTO parent_student_relationships
-               (parent_account_id, student_id, school_id, relationship_type, is_primary,
-                can_view_results, can_view_fees, status)
-             SELECT ?, student_id, school_id, relationship_type, is_primary,
-                    can_view_results, can_view_fees, status
-             FROM parent_student_relationships
-             WHERE parent_account_id = ?`,
-            [accountId, duplicateId]
-          );
-          await connection.execute(
-            `INSERT IGNORE INTO parent_account_contacts
-               (parent_account_id, contact_type, contact_value, is_primary, verified_at)
-             SELECT ?, contact_type, contact_value, is_primary, verified_at
-             FROM parent_account_contacts
-             WHERE parent_account_id = ?`,
-            [accountId, duplicateId]
-          );
-          await connection.execute(
-            'UPDATE parent_profiles SET parent_account_id = ? WHERE parent_account_id = ?',
-            [accountId, duplicateId]
-          );
-          await connection.execute(
-            'UPDATE otp_sessions SET parent_account_id = ? WHERE parent_account_id = ?',
-            [accountId, duplicateId]
-          );
-          await connection.execute('DELETE FROM parent_student_relationships WHERE parent_account_id = ?', [duplicateId]);
-          await connection.execute('DELETE FROM parent_account_contacts WHERE parent_account_id = ?', [duplicateId]);
-          await connection.execute('DELETE FROM parent_accounts WHERE parent_account_id = ?', [duplicateId]);
-        }
+    const verifiedPhone = normalizePhone(rows[0].phone);
+    const verifiedContactType = verifiedEmail ? 'email' : 'phone';
+    const rawPhone = String(rows[0].phone || '').trim();
+    const contactValue1 = verifiedEmail || verifiedPhone;
+    const contactValue2 = verifiedEmail || rawPhone || verifiedPhone;
+
+    const [matchingAccounts] = await connection.execute(
+      `SELECT parent_account_id
+       FROM parent_account_contacts
+       WHERE contact_type = ? AND contact_value IN (?, ?)
+       ORDER BY parent_account_id
+       FOR UPDATE`,
+      [verifiedContactType, contactValue1, contactValue2]
+    );
+    const accountIds = [...new Set(matchingAccounts.map(row => Number(row.parent_account_id)))];
+    if (accountIds.length) {
+      accountId = Math.min(...accountIds);
+      for (const duplicateId of accountIds.filter(id => id !== accountId)) {
+        await connection.execute(
+          `INSERT IGNORE INTO parent_student_relationships
+             (parent_account_id, student_id, school_id, relationship_type, is_primary,
+              can_view_results, can_view_fees, status)
+           SELECT ?, student_id, school_id, relationship_type, is_primary,
+                  can_view_results, can_view_fees, status
+           FROM parent_student_relationships
+           WHERE parent_account_id = ?`,
+          [accountId, duplicateId]
+        );
+        await connection.execute(
+          `INSERT IGNORE INTO parent_account_contacts
+             (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+           SELECT ?, contact_type, contact_value, is_primary, verified_at
+           FROM parent_account_contacts
+           WHERE parent_account_id = ?`,
+          [accountId, duplicateId]
+        );
+        await connection.execute(
+          'UPDATE parent_profiles SET parent_account_id = ? WHERE parent_account_id = ?',
+          [accountId, duplicateId]
+        );
+        await connection.execute(
+          'UPDATE otp_sessions SET parent_account_id = ? WHERE parent_account_id = ?',
+          [accountId, duplicateId]
+        );
+        await connection.execute('DELETE FROM parent_student_relationships WHERE parent_account_id = ?', [duplicateId]);
+        await connection.execute('DELETE FROM parent_account_contacts WHERE parent_account_id = ?', [duplicateId]);
+        await connection.execute('DELETE FROM parent_accounts WHERE parent_account_id = ?', [duplicateId]);
       }
-      await connection.execute(
-        `UPDATE parent_account_contacts
-         SET verified_at = COALESCE(verified_at, NOW())
-         WHERE parent_account_id = ? AND contact_type = 'email' AND contact_value = ?`,
-        [accountId, verifiedEmail]
-      );
     }
+
+    await connection.execute(
+      `UPDATE parent_account_contacts
+       SET verified_at = COALESCE(verified_at, NOW())
+       WHERE parent_account_id = ? AND contact_type = ? AND contact_value IN (?, ?)`,
+      [accountId, verifiedContactType, contactValue1, contactValue2]
+    );
 
     const [accounts] = await connection.execute(
       'SELECT parent_account_id, canonical_parent_phone, full_name FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
@@ -161,22 +167,6 @@ router.post('/verify-otp', wrap(async (req, res) => {
     );
     if (!accounts.length) throw new Error('Parent account not found');
     account = accounts[0];
-
-    if (verifiedEmail) {
-      await connection.execute(
-        `UPDATE parent_account_contacts
-         SET verified_at = COALESCE(verified_at, NOW())
-         WHERE parent_account_id = ? AND contact_type = 'email' AND contact_value = ?`,
-        [accountId, verifiedEmail]
-      );
-    } else {
-      await connection.execute(
-        `UPDATE parent_account_contacts
-         SET verified_at = COALESCE(verified_at, NOW())
-         WHERE parent_account_id = ? AND contact_type = 'phone' AND contact_value = ?`,
-        [accountId, account.canonical_parent_phone]
-      );
-    }
 
     await connection.execute(
       'UPDATE otp_sessions SET parent_account_id = ?, verified = TRUE, phone = ?, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?',
