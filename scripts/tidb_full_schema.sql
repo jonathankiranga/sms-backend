@@ -1,11 +1,7 @@
--- ============================================================
--- FreeSchool — Full TiDB Cloud Schema
--- Run once against a fresh database:
---   mysql -u 'sdDXWmBQaen2i6n.root' \
---         -h gateway01.ap-southeast-1.prod.aws.tidbcloud.com \
---         -P 4000 -D 'freeschool' \
---         --ssl-mode=VERIFY_IDENTITY --ssl-ca=<CA_PATH> \
---         -p'lpw5un07fubKcMuC' < tidb_full_schema.sql
+-- FreeSchool — Full TiDB-compatible MySQL schema.
+-- Run against a newly created empty database only.
+-- Keep all database credentials in environment variables or a secret manager;
+-- never place connection strings or passwords in this SQL file or Git history.
 --
 -- TiDB notes:
 --   • Foreign keys are parsed but not enforced (Vitess-based)
