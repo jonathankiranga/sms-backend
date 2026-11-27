@@ -737,10 +737,9 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   }
 
   // Simulated upgrade — dev only — mark premium immediately (used when M-Pesa not configured in dev)
-  const { getNextTermStart } = require('../lib/config');
-  const { getCurrentTermLabel } = require('../lib/subscriptions');
+  const { getNextTermStart, getCurrentTerm } = require('../lib/config');
   const expiresAt = await getNextTermStart(req.db, school_id);
-  const currentTerm = getCurrentTermLabel();
+  const currentTerm = await getCurrentTerm(req.db, school_id);
   const currentYear = new Date().getFullYear();
 
   const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [billingPhone]);
