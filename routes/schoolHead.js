@@ -173,8 +173,13 @@ router.delete('/:schoolId/teachers/:teacherId', async (req, res) => {
   if (t.length === 0) return res.status(404).json({ error: 'Teacher not found' });
   if (t[0].role === 'head') return res.status(403).json({ error: 'Cannot remove school head' });
 
-  await req.db.execute('DELETE FROM teachers WHERE teacher_id = ?', [req.params.teacherId]);
-  res.json({ deleted: true });
+  // Preserve the global staff identity and historical records. Removing a
+  // school membership deactivates it rather than deleting the identity row.
+  await req.db.execute(
+    "UPDATE teachers SET active = 0 WHERE teacher_id = ? AND school_id = ?",
+    [req.params.teacherId, req.params.schoolId]
+  );
+  res.json({ deleted: true, archived: true, membership_status: 'inactive' });
 });
 
 // Update a teacher (only headteacher of that school). Headteachers may toggle
