@@ -485,7 +485,12 @@ router.get('/dashboard/:phone', requireParentSession, wrap(async (req, res) => {
     filterSchoolId ? [phone, filterSchoolId] : [phone]
   );
 
-  const schoolId = children.length > 0 ? children[0].school_id : null;
+  const childSchoolIds = [...new Set(children.map(child => String(child.school_id)))];
+  // A legacy all-schools dashboard has no single billing context. Only auto-use
+  // prepaid credit when the parent filtered to one school or has one school total.
+  const schoolId = children.length > 0
+    ? (filterSchoolId || (childSchoolIds.length === 1 ? childSchoolIds[0] : null))
+    : null;
 
   const [parent] = await req.db.execute(
     'SELECT full_name AS parent_name, is_premium, premium_expires_at, prepaid_balance FROM parent_profiles WHERE parent_phone = ?',
@@ -494,7 +499,7 @@ router.get('/dashboard/:phone', requireParentSession, wrap(async (req, res) => {
 
   // Auto-activate from prepaid balance when it covers a term and the parent is
   // otherwise not active.
-  if ((!parent[0]?.is_premium || (parent[0]?.premium_expires_at && new Date(parent[0].premium_expires_at) <= new Date()))
+  if (schoolId && (!parent[0]?.is_premium || (parent[0]?.premium_expires_at && new Date(parent[0].premium_expires_at) <= new Date()))
       && parseFloat(parent[0]?.prepaid_balance || 0) > 0) {
     const { autoActivateFromPrepaid } = require('../lib/subscriptions');
     await autoActivateFromPrepaid(req.db, phone, schoolId);
@@ -797,10 +802,9 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
   // If the parent has a prepaid balance that covers the term price, auto-activate
   // the current term (consuming one term from the credit) so they don't have to pay again.
   const prepaid = rows.length > 0 ? parseFloat(rows[0].prepaid_balance || 0) : 0;
-  if (rows.length > 0 && !schoolPays && prepaid > 0) {
+  if (rows.length > 0 && !schoolPays && prepaid > 0 && childSchools.length === 1) {
     const { autoActivateFromPrepaid } = require('../lib/subscriptions');
-    const l = childSchools.length > 0 ? childSchools[0].school_id : null;
-    await autoActivateFromPrepaid(req.db, phone, l);
+    await autoActivateFromPrepaid(req.db, phone, childSchools[0].school_id);
   }
 
   const premiumTotal = schoolPays ? 0 : premiumPrice * Math.max(childCount, 1);
