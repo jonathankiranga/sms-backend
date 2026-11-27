@@ -123,9 +123,9 @@ SELECT staff_account_id, teacher_id, school_id, role,
 FROM teachers
 WHERE staff_account_id IS NOT NULL;
 
--- Parents have one global account. Existing profiles with the same normalized
--- email are grouped together; profiles without email remain phone-keyed.
--- This lets a parent registered in multiple schools see all linked children.
+-- Parent profiles start as phone-keyed identities. Accounts sharing a verified
+-- email or normalized phone are consolidated only after that contact completes
+-- OTP authentication, preserving school-entered but unverified contact data.
 CREATE TABLE parent_accounts (
   parent_account_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   identity_key VARCHAR(160) NOT NULL,
@@ -138,9 +138,9 @@ CREATE TABLE parent_accounts (
   UNIQUE KEY uq_parent_account_phone (canonical_parent_phone)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Do not merge parent records merely because an unverified email matches.
--- Each existing phone profile starts as a separate account. The accounts are
--- consolidated only after the parent proves control of the shared email by OTP.
+-- Do not merge parent records merely because an unverified contact matches.
+-- Each existing phone profile starts as a separate account. The backend merges
+-- matching accounts only after successful OTP verification of email or phone.
 INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
 SELECT CONCAT('phone:', parent_phone), parent_phone, MAX(full_name)
 FROM parent_profiles
