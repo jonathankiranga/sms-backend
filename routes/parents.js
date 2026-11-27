@@ -201,7 +201,7 @@ router.post('/verify-otp', wrap(async (req, res) => {
           (total, profile) => total + Number(profile.prepaid_balance || 0), 0
         );
         if (transferredBalance > 0) {
-          await connection.execute(
+          const [walletUpdate] = await connection.execute(
             `UPDATE parent_profiles
              SET prepaid_balance = prepaid_balance + ?
              WHERE parent_phone = (
@@ -209,6 +209,9 @@ router.post('/verify-otp', wrap(async (req, res) => {
              )`,
             [transferredBalance, accountId]
           );
+          if (!walletUpdate.affectedRows) {
+            throw new Error('Unable to transfer prepaid balance to the canonical parent profile');
+          }
           await connection.execute(
             'UPDATE parent_profiles SET prepaid_balance = 0 WHERE parent_account_id = ?',
             [duplicateId]
