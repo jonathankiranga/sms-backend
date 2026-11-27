@@ -3,11 +3,18 @@ const router = express.Router();
 const fs = require('fs');
 const path = require('path');
 
-const MIGRATE_SECRET = process.env.MIGRATE_SECRET || 'migrate2024';
+const MIGRATE_SECRET = process.env.MIGRATE_SECRET || '';
+
+function migrationAuthorized(req) {
+  if (process.env.NODE_ENV === 'production') return false;
+  if (!MIGRATE_SECRET) return false;
+  const supplied = req.get('x-migrate-secret') || '';
+  return supplied.length > 0 && supplied === MIGRATE_SECRET;
+}
 
 // GET /api/migrate/check?secret=... — read-only schema diagnostic for the schools table
 router.get('/check', async (req, res) => {
-  if (req.query.secret !== MIGRATE_SECRET) {
+  if (!migrationAuthorized(req)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
@@ -29,7 +36,7 @@ router.get('/check', async (req, res) => {
 });
 
 router.post('/run', async (req, res) => {
-  if (req.query.secret !== MIGRATE_SECRET) {
+  if (!migrationAuthorized(req)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
