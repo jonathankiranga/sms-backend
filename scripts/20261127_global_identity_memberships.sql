@@ -4,7 +4,9 @@
 
 ALTER TABLE otp_sessions
   ADD COLUMN school_id CHAR(9) NULL AFTER teacher_id,
-  ADD KEY idx_otp_sessions_school (school_id);
+  ADD COLUMN login_role VARCHAR(30) NULL AFTER school_id,
+  ADD KEY idx_otp_sessions_school (school_id),
+  ADD KEY idx_otp_sessions_login_role (login_role);
 
 -- A person has one staff identity and may hold memberships in multiple schools.
 CREATE TABLE staff_accounts (
@@ -179,3 +181,11 @@ ON DUPLICATE KEY UPDATE
 -- FROM parent_account_contacts
 -- GROUP BY contact_type, contact_value
 -- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
