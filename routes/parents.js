@@ -105,7 +105,7 @@ router.post('/verify-otp', wrap(async (req, res) => {
     const verifiedEmail = rows[0].email ? String(rows[0].email).trim().toLowerCase() : '';
     if (verifiedEmail) {
       const [emailAccounts] = await connection.execute(
-        `SELECT DISTINCT parent_account_id
+        `SELECT parent_account_id
          FROM parent_account_contacts
          WHERE contact_type = 'email' AND contact_value = ?
          ORDER BY parent_account_id
@@ -161,6 +161,22 @@ router.post('/verify-otp', wrap(async (req, res) => {
     );
     if (!accounts.length) throw new Error('Parent account not found');
     account = accounts[0];
+
+    if (verifiedEmail) {
+      await connection.execute(
+        `UPDATE parent_account_contacts
+         SET verified_at = COALESCE(verified_at, NOW())
+         WHERE parent_account_id = ? AND contact_type = 'email' AND contact_value = ?`,
+        [accountId, verifiedEmail]
+      );
+    } else {
+      await connection.execute(
+        `UPDATE parent_account_contacts
+         SET verified_at = COALESCE(verified_at, NOW())
+         WHERE parent_account_id = ? AND contact_type = 'phone' AND contact_value = ?`,
+        [accountId, account.canonical_parent_phone]
+      );
+    }
 
     await connection.execute(
       'UPDATE otp_sessions SET parent_account_id = ?, verified = TRUE, phone = ?, expires_at = DATE_ADD(NOW(), INTERVAL 4 HOUR) WHERE session_id = ?',
