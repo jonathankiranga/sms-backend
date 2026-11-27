@@ -596,6 +596,33 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
     return res.status(400).json({ error: 'Select the school for this subscription payment' });
   }
 
+  // The session phone is normalized for authentication, but legacy parent
+  // profiles may retain their original 07... / 01... value. Use the stored
+  // canonical profile phone for all foreign-keyed payment records.
+  let billingPhone = phone;
+  if (req.parentAccountId) {
+    const [accountRows] = await req.db.execute(
+      'SELECT canonical_parent_phone FROM parent_accounts WHERE parent_account_id = ? LIMIT 1',
+      [req.parentAccountId]
+    );
+    if (!accountRows.length) return res.status(403).json({ error: 'Parent account could not be resolved' });
+    billingPhone = accountRows[0].canonical_parent_phone;
+  } else {
+    const rawStoredPhone = "REPLACE(REPLACE(REPLACE(TRIM(parent_phone), ' ', ''), '-', ''), '+', '')";
+    const normalizedStoredPhone = `CASE
+      WHEN CHAR_LENGTH(${rawStoredPhone}) = 10 AND LEFT(${rawStoredPhone}, 1) = '0'
+        THEN CONCAT('254', SUBSTRING(${rawStoredPhone}, 2))
+      WHEN CHAR_LENGTH(${rawStoredPhone}) = 9 AND LEFT(${rawStoredPhone}, 1) IN ('1', '7')
+        THEN CONCAT('254', ${rawStoredPhone})
+      ELSE ${rawStoredPhone}
+    END`;
+    const [profileRows] = await req.db.execute(
+      `SELECT parent_phone FROM parent_profiles WHERE ${normalizedStoredPhone} = ? LIMIT 1`,
+      [phone]
+    );
+    if (profileRows.length) billingPhone = profileRows[0].parent_phone;
+  }
+
   // Every subscription payment is scoped to one school, including legacy
   // sessions. A global parent must never be charged for children elsewhere.
   const scopeSql = ' AND s.school_id = ?';
@@ -646,14 +673,14 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   const txnRef = 'TXN' + Date.now().toString(36).toUpperCase();
 
   // Ensure parent profile exists (payment_ledger FK requires it)
-  await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [phone]);
+  await req.db.execute('INSERT IGNORE INTO parent_profiles (parent_phone) VALUES (?)', [billingPhone]);
 
   // Store the pending upgrade tagged with the target school so the STK callback
   // allocates the subscription to the correct school
   const [insertResult] = await req.db.execute(
     `INSERT INTO payment_ledger (transaction_reference, amount, parent_phone, student_reference, payment_method, logged_at, notes, school_id)
      VALUES (?, ?, ?, ?, 'M-Pesa-Pending', NOW(), 'STK_PENDING', ?)`,
-    [txnRef, totalDue, phone, txnRef, school_id || null]
+    [txnRef, totalDue, billingPhone, txnRef, school_id]
   );
   const accountRef = String(insertResult.insertId).padStart(10, '0');
 
@@ -697,16 +724,16 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
   const currentTerm = getCurrentTermLabel();
   const currentYear = new Date().getFullYear();
 
-  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [phone]);
+  const [existing] = await req.db.execute('SELECT parent_phone FROM parent_profiles WHERE parent_phone = ?', [billingPhone]);
   if (existing.length > 0) {
     await req.db.execute(
       'UPDATE parent_profiles SET is_premium = TRUE, premium_expires_at = ? WHERE parent_phone = ?',
-      [expiresAt, phone]
+      [expiresAt, billingPhone]
     );
   } else {
     await req.db.execute(
       'INSERT INTO parent_profiles (parent_phone, full_name, is_premium, premium_expires_at) VALUES (?, ?, TRUE, ?)',
-      [phone, null, expiresAt]
+      [billingPhone, null, expiresAt]
     );
   }
 
@@ -716,7 +743,7 @@ router.post('/upgrade', requireParentSession, wrap(async (req, res) => {
      VALUES (?, ?, ?, ?, 'parent', 'paid', ?, NOW(), ?)
      ON DUPLICATE KEY UPDATE payment_status = 'paid', activated_at = NOW(),
        expires_at = VALUES(expires_at), amount = VALUES(amount)`,
-    [school_id, phone, currentTerm, currentYear, totalDue, expiresAt]
+    [school_id, billingPhone, currentTerm, currentYear, totalDue, expiresAt]
   );
   await req.db.execute(
     "UPDATE payment_ledger SET notes = 'STK_COMPLETED' WHERE transaction_reference = ? AND notes = 'STK_PENDING'",
