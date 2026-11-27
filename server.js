@@ -249,8 +249,12 @@ async function runMigrationsIfNeeded() {
     // commission subsystem. Provision its parent table and columns safely here,
     // then apply the two CREATE TABLE IF NOT EXISTS commission migrations below.
     await conn.query("CREATE TABLE IF NOT EXISTS sales_reps (rep_id VARCHAR(20) PRIMARY KEY, full_name VARCHAR(120) NOT NULL, phone VARCHAR(20) NULL, email VARCHAR(120) NULL, commission_type ENUM('percent','flat') NOT NULL DEFAULT 'percent', commission_value DECIMAL(10,2) NOT NULL DEFAULT 0, created_at DATETIME DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
-    const [salesRepColumn] = await conn.query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='schools' AND COLUMN_NAME='sales_rep_id'");
-    if (!salesRepColumn.length) await conn.query('ALTER TABLE schools ADD COLUMN sales_rep_id VARCHAR(20) NULL AFTER region');
+    const [salesRepColumns] = await conn.query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='sales_reps'");
+    const salesRepColumnSet = new Set(salesRepColumns.map(row => row.COLUMN_NAME));
+    if (!salesRepColumnSet.has('commission_type')) await conn.query("ALTER TABLE sales_reps ADD COLUMN commission_type ENUM('percent','flat') NOT NULL DEFAULT 'percent'");
+    if (!salesRepColumnSet.has('commission_value')) await conn.query('ALTER TABLE sales_reps ADD COLUMN commission_value DECIMAL(10,2) NOT NULL DEFAULT 0');
+    const [salesRepSchoolColumn] = await conn.query("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='schools' AND COLUMN_NAME='sales_rep_id'");
+    if (!salesRepSchoolColumn.length) await conn.query('ALTER TABLE schools ADD COLUMN sales_rep_id VARCHAR(20) NULL AFTER region');
 
     // Preserve the existing dated and migration_*.sql upgrade files. On first
     // adoption, the full schema is the canonical baseline; optional commission
