@@ -180,6 +180,5278 @@ SELECT a.parent_account_id, 'phone', p.parent_phone, 1, NULL
 FROM parent_profiles p
 JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
 
+-- Also index Kenyan local-format numbers by their normalized international
+-- value, so 0712..., 712... and +254712... resolve to the same identity.
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'phone',
+       CASE
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^0[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  DECLARE v_normalized_phone VARCHAR(20);
+  DECLARE v_existing_account BIGINT UNSIGNED DEFAULT NULL;
+
+  SET v_normalized_phone = CASE
+    WHEN REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^0[17][0-9]{8}
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (
+    NEW.parent_account_id,
+    'phone',
+    CASE
+      WHEN REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^0[17][0-9]{8}    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+      THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+    WHEN REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+      THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''))
+    ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '')
+  END;
+
+  SELECT parent_account_id INTO v_existing_account
+  FROM parent_account_contacts
+  WHERE contact_type = 'phone' AND contact_value = v_normalized_phone
+  ORDER BY parent_account_id
+  LIMIT 1;
+
+  IF v_existing_account IS NOT NULL THEN
+    SET NEW.parent_account_id = v_existing_account;
+  ELSE
+    INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+    VALUES (CONCAT('phone:', v_normalized_phone), NEW.parent_phone, NEW.full_name)
+    ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+    SET NEW.parent_account_id = LAST_INSERT_ID();
+  END IF;
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+        THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+      WHEN REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+      THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+    WHEN REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+      THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''))
+    ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '')
+  END;
+
+  SELECT parent_account_id INTO v_existing_account
+  FROM parent_account_contacts
+  WHERE contact_type = 'phone' AND contact_value = v_normalized_phone
+  ORDER BY parent_account_id
+  LIMIT 1;
+
+  IF v_existing_account IS NOT NULL THEN
+    SET NEW.parent_account_id = v_existing_account;
+  ELSE
+    INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+    VALUES (CONCAT('phone:', v_normalized_phone), NEW.parent_phone, NEW.full_name)
+    ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+    SET NEW.parent_account_id = LAST_INSERT_ID();
+  END IF;
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+        THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''))
+      ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '')
+    END,
+    0
+  );
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+      THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+    WHEN REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+      THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', ''))
+    ELSE REPLACE(REPLACE(REPLACE(TRIM(NEW.parent_phone), ' ', ''), '-', ''), '+', '')
+  END;
+
+  SELECT parent_account_id INTO v_existing_account
+  FROM parent_account_contacts
+  WHERE contact_type = 'phone' AND contact_value = v_normalized_phone
+  ORDER BY parent_account_id
+  LIMIT 1;
+
+  IF v_existing_account IS NOT NULL THEN
+    SET NEW.parent_account_id = v_existing_account;
+  ELSE
+    INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+    VALUES (CONCAT('phone:', v_normalized_phone), NEW.parent_phone, NEW.full_name)
+    ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+    SET NEW.parent_account_id = LAST_INSERT_ID();
+  END IF;
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', SUBSTRING(REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''), 2))
+         WHEN REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '') REGEXP '^[17][0-9]{8}
+INSERT IGNORE INTO parent_account_contacts
+  (parent_account_id, contact_type, contact_value, is_primary, verified_at)
+SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id
+WHERE NULLIF(TRIM(p.email), '') IS NOT NULL;
+
+CREATE TABLE parent_student_relationships (
+  relationship_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  parent_account_id BIGINT UNSIGNED NOT NULL,
+  student_id CHAR(9) NOT NULL,
+  school_id CHAR(9) NOT NULL,
+  relationship_type VARCHAR(30) NULL,
+  is_primary TINYINT(1) NOT NULL DEFAULT 0,
+  can_view_results TINYINT(1) NOT NULL DEFAULT 1,
+  can_view_fees TINYINT(1) NOT NULL DEFAULT 1,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (relationship_id),
+  UNIQUE KEY uq_parent_student_relationship (parent_account_id, student_id),
+  KEY idx_parent_relationship_school (school_id, status),
+  CONSTRAINT fk_parent_relationship_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id),
+  CONSTRAINT fk_parent_relationship_student FOREIGN KEY (student_id)
+    REFERENCES students(student_id),
+  CONSTRAINT fk_parent_relationship_school FOREIGN KEY (school_id)
+    REFERENCES schools(school_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO parent_student_relationships
+  (parent_account_id, student_id, school_id, relationship_type)
+SELECT p.parent_account_id, m.student_id, s.school_id, m.relationship
+FROM student_parent_map m
+JOIN parent_profiles p ON p.parent_phone = m.parent_phone
+JOIN students s ON s.student_id = m.student_id
+WHERE p.parent_account_id IS NOT NULL
+ON DUPLICATE KEY UPDATE
+  school_id = VALUES(school_id),
+  relationship_type = VALUES(relationship_type);
+
+-- Review duplicate parent contact values before allowing a contact to resolve
+-- to an account. This should return no rows after the email-based consolidation.
+-- SELECT contact_type, contact_value, COUNT(DISTINCT parent_account_id) AS accounts
+-- FROM parent_account_contacts
+-- GROUP BY contact_type, contact_value
+-- HAVING COUNT(DISTINCT parent_account_id) > 1;
+
+ALTER TABLE otp_sessions
+  ADD COLUMN parent_account_id BIGINT UNSIGNED NULL AFTER login_role,
+  ADD KEY idx_otp_sessions_parent_account (parent_account_id);
+
+ALTER TABLE otp_sessions
+  ADD CONSTRAINT fk_otp_parent_account FOREIGN KEY (parent_account_id)
+    REFERENCES parent_accounts(parent_account_id);
+
+
+-- Keep the identity layer synchronized with legacy registration/payment code.
+-- New parent_profiles rows automatically receive a global account and contacts.
+CREATE TRIGGER trg_parent_profile_before_insert
+BEFORE INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_accounts (identity_key, canonical_parent_phone, full_name)
+  VALUES (CONCAT('phone:', NEW.parent_phone), NEW.parent_phone, NEW.full_name)
+  ON DUPLICATE KEY UPDATE parent_account_id = LAST_INSERT_ID(parent_account_id);
+  SET NEW.parent_account_id = LAST_INSERT_ID();
+END;
+
+CREATE TRIGGER trg_parent_profile_after_insert
+AFTER INSERT ON parent_profiles
+FOR EACH ROW
+BEGIN
+  INSERT IGNORE INTO parent_account_contacts
+    (parent_account_id, contact_type, contact_value, is_primary)
+  VALUES (NEW.parent_account_id, 'phone', NEW.parent_phone, 1);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- If a school updates a parent's email, add it as an unverified contact alias.
+-- It is not merged with other parent accounts until an OTP is verified.
+CREATE TRIGGER trg_parent_profile_after_update
+AFTER UPDATE ON parent_profiles
+FOR EACH ROW
+BEGIN
+  IF COALESCE(LOWER(TRIM(NEW.email)), '') <> COALESCE(LOWER(TRIM(OLD.email)), '')
+     AND NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO parent_account_contacts
+      (parent_account_id, contact_type, contact_value, is_primary)
+    VALUES (NEW.parent_account_id, 'email', LOWER(TRIM(NEW.email)), 1);
+  END IF;
+END;
+
+-- All existing and new student-parent links feed the consolidated relationship
+-- table, so older school registration endpoints remain compatible.
+CREATE TRIGGER trg_student_parent_after_insert
+AFTER INSERT ON student_parent_map
+FOR EACH ROW
+BEGIN
+  INSERT INTO parent_student_relationships
+    (parent_account_id, student_id, school_id, relationship_type)
+  SELECT pp.parent_account_id, NEW.student_id, s.school_id, NEW.relationship
+  FROM parent_profiles pp
+  JOIN students s ON s.student_id = NEW.student_id
+  WHERE pp.parent_phone = NEW.parent_phone
+    AND pp.parent_account_id IS NOT NULL
+  ON DUPLICATE KEY UPDATE
+    school_id = VALUES(school_id),
+    relationship_type = VALUES(relationship_type),
+    status = 'active';
+END;
+
+
+CREATE TRIGGER trg_student_parent_after_delete
+AFTER DELETE ON student_parent_map
+FOR EACH ROW
+BEGIN
+  UPDATE parent_student_relationships r
+  JOIN parent_profiles pp ON pp.parent_account_id = r.parent_account_id
+  SET r.status = 'inactive'
+  WHERE pp.parent_phone = OLD.parent_phone
+    AND r.student_id = OLD.student_id
+    AND NOT EXISTS (
+      SELECT 1
+      FROM student_parent_map remaining_map
+      JOIN parent_profiles remaining_parent
+        ON remaining_parent.parent_phone = remaining_map.parent_phone
+      WHERE remaining_map.student_id = OLD.student_id
+        AND remaining_parent.parent_account_id = r.parent_account_id
+    );
+END;
+
+
+-- Future teacher registrations automatically create/reuse a global staff
+-- identity and create the corresponding school membership.
+CREATE TRIGGER trg_teacher_before_insert
+BEFORE INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  DECLARE v_email_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_phone_account BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_account_id BIGINT UNSIGNED DEFAULT NULL;
+  DECLARE v_identity_key VARCHAR(160);
+
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_email_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'email' AND contact_value = LOWER(TRIM(NEW.email))
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    SELECT staff_account_id INTO v_phone_account
+    FROM staff_account_contacts
+    WHERE contact_type = 'phone' AND contact_value = TRIM(NEW.phone)
+    ORDER BY staff_account_id LIMIT 1;
+  END IF;
+
+  IF v_email_account IS NOT NULL AND v_phone_account IS NOT NULL
+     AND v_email_account <> v_phone_account THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Teacher email and phone belong to different staff identities; reconcile contacts first';
+  END IF;
+
+  SET v_account_id = COALESCE(v_email_account, v_phone_account);
+  IF v_account_id IS NULL THEN
+    SET v_identity_key = CASE
+      WHEN NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN CONCAT('email:', LOWER(TRIM(NEW.email)))
+      WHEN NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN CONCAT('phone:', REPLACE(REPLACE(REPLACE(TRIM(NEW.phone), ' ', ''), '-', ''), '+', ''))
+      ELSE CONCAT('teacher:', NEW.teacher_id)
+    END;
+
+    INSERT INTO staff_accounts (identity_key, full_name, primary_email, primary_phone)
+    VALUES (v_identity_key, NEW.full_name, NULLIF(LOWER(TRIM(NEW.email)), ''), NULLIF(TRIM(NEW.phone), ''))
+    ON DUPLICATE KEY UPDATE staff_account_id = LAST_INSERT_ID(staff_account_id);
+    SET v_account_id = LAST_INSERT_ID();
+  END IF;
+
+  SET NEW.staff_account_id = v_account_id;
+END;
+
+CREATE TRIGGER trg_teacher_after_insert
+AFTER INSERT ON teachers
+FOR EACH ROW
+BEGIN
+  IF NULLIF(TRIM(NEW.email), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'email', LOWER(TRIM(NEW.email)));
+  END IF;
+  IF NULLIF(TRIM(NEW.phone), '') IS NOT NULL THEN
+    INSERT IGNORE INTO staff_account_contacts (staff_account_id, contact_type, contact_value)
+    VALUES (NEW.staff_account_id, 'phone', TRIM(NEW.phone));
+  END IF;
+
+  INSERT INTO teacher_school_memberships
+    (staff_account_id, teacher_id, school_id, role, status)
+  VALUES (
+    NEW.staff_account_id, NEW.teacher_id, NEW.school_id, NEW.role,
+    CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  );
+END;
+
+CREATE TRIGGER trg_teacher_after_update
+AFTER UPDATE ON teachers
+FOR EACH ROW
+BEGIN
+  UPDATE teacher_school_memberships
+  SET staff_account_id = NEW.staff_account_id,
+      school_id = NEW.school_id,
+      role = NEW.role,
+      status = CASE WHEN NEW.active = 1 THEN 'active' ELSE 'inactive' END
+  WHERE teacher_id = NEW.teacher_id;
+END;
+
+           THEN CONCAT('254', REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', ''))
+         ELSE REPLACE(REPLACE(REPLACE(TRIM(p.parent_phone), ' ', ''), '-', ''), '+', '')
+       END,
+       0, NULL
+FROM parent_profiles p
+JOIN parent_accounts a ON a.parent_account_id = p.parent_account_id;
+
 INSERT IGNORE INTO parent_account_contacts
   (parent_account_id, contact_type, contact_value, is_primary, verified_at)
 SELECT a.parent_account_id, 'email', LOWER(TRIM(p.email)), 1, NULL
