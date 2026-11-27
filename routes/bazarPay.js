@@ -37,8 +37,12 @@ async function requireBursar(req, res) {
 }
 
 router.use(async (req, res, next) => {
-  req.bursar = await requireBursar(req, res);
-  if (req.bursar) next();
+  try {
+    req.bursar = await requireBursar(req, res);
+    if (req.bursar) next();
+  } catch (err) {
+    next(err);
+  }
 });
 
 // GET /api/bazar-pay/fee-structures/:school_id — list fee items for a school
