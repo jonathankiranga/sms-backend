@@ -505,7 +505,7 @@ router.get('/dashboard/:phone', requireParentSession, wrap(async (req, res) => {
   }
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const premiumPrice = parseInt(setting[0]?.setting_value || '100');
+  const premiumPrice = parseInt(setting[0]?.setting_value || '200');
 
   // Multi-school support: summarize every school the parent has children in
   const schoolMap = new Map();
@@ -736,7 +736,7 @@ router.get('/premium-status/:phone', wrap(async (req, res) => {
   const childCount = childCountRows[0]?.child_count || 0;
 
   const [setting] = await req.db.execute("SELECT setting_value FROM app_settings WHERE setting_key = 'premium_price'");
-  const premiumPrice = parseInt(setting[0]?.setting_value || '100');
+  const premiumPrice = parseInt(setting[0]?.setting_value || '200');
 
   // Check if any linked school pays for premium
   let schoolPays = false;
